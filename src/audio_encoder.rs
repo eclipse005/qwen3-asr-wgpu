@@ -1,9 +1,5 @@
-//! CPU audio encoder for Qwen3-ASR — f32 compute, f16 weight storage.
-//!
-//! Mirrors `src/gpu_audio_encoder.rs` 1:1 but uses `gemm` + hand-written f32
-//! loops (no cudarc, no half SIMD). Weights are stored as f16 and converted
-//! to f32 on-the-fly before GEMM — halves memory vs f32 storage with minimal
-//! overhead (~2-3% of prefill time).
+//! CPU audio encoder for Qwen3-ASR — f32 GEMM (`gemm` crate + rayon).
+//! Safetensors weights are f16; converted once at load.
 //!
 //! Architecture:
 //!   mel [T_mel, 128]  →  conv2d stem (3 × {im2col + gemm + bias + GELU})

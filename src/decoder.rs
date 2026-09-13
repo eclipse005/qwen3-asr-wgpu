@@ -1414,18 +1414,9 @@ impl WgpuTextDecoder {
                 (hs / 128) as u32, (mp / 128) as u32, 1
             );
 
-            // TDR guard: queueing the whole multi-second prefill as one deep
-            // async submission device-lost the driver on Pascal/WDDM (1.7B @
-            // 2307 positions, q17_180s_en).  Empirically the active ingredient
-            // is draining the queue: per-layer submit+poll survived repeated
-            // runs, while every time-budgeted split WITHOUT poll (100/500/1000
-            // ms, i.e. 3-25 submits) still died.  So for long prefills, submit
-            // and poll at every layer boundary (short prefills keep the single
-            // submit; the poll tax measured +56% on the 4.9 s worst case and
-            // only bites where a single submit cannot survive anyway).
-            // Drain every 4 layers on long prefills (Pascal/WDDM TDR). Every
-            // layer was safe but ~4× the submit tax; 4-layer batches still
-            // stay under the TDR window while cutting poll count 28→7.
+            // Long prefills (s>=512) must submit+poll or Pascal/WDDM TDR
+            // device-loses. Every 4 layers is enough; every layer is safer
+            // but ~4× the poll tax.
             if s >= 512 && (li + 1) % 4 == 0 {
                 drop(cp);
                 gpu.queue.submit([enc.finish()]);
