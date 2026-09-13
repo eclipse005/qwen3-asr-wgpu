@@ -24,7 +24,7 @@ use crate::weights::RawTensor;
 // ─── Linear + LayerNorm primitives ─────────────────────────────────
 
 pub(crate) struct CpuAudioLinear {
-    pub w: CpuWeightF16,
+    pub w_f32: crate::cpu_tensor::CpuWeight,
     pub bias: Option<Vec<f32>>,
 }
 
@@ -48,13 +48,13 @@ impl CpuAudioLinear {
         } else {
             None
         };
-        Ok(Self { w: CpuWeightF16 { data, rows, cols }, bias })
+        let w_f16 = CpuWeightF16 { data, rows, cols };
+        Ok(Self { w_f32: w_f16.to_f32(), bias })
     }
 
     /// x: [..., in_features] → [..., out_features]  (bias added if present)
     pub(crate) fn forward(&self, x: &CpuTensor) -> Result<CpuTensor> {
-        let w_f32 = self.w.to_f32();
-        let mut y = linear(x, &w_f32);
+        let mut y = linear(x, &self.w_f32);
         if let Some(b) = &self.bias {
             let last = y.shape.last().unwrap();
             y.data.par_chunks_mut(*last).for_each(|row| {
@@ -160,9 +160,9 @@ pub(crate) fn im2col_3x3_s2p1(x: &[f32], b: usize, c_in: usize, h: usize, w: usi
 
 #[allow(dead_code)]
 pub(crate) struct CpuConvStem {
-    c1_w: CpuWeightF16, c1_b: Vec<f32>,
-    c2_w: CpuWeightF16, c2_b: Vec<f32>,
-    c3_w: CpuWeightF16, c3_b: Vec<f32>,
+    c1_w: crate::cpu_tensor::CpuWeight, c1_b: Vec<f32>,
+    c2_w: crate::cpu_tensor::CpuWeight, c2_b: Vec<f32>,
+    c3_w: crate::cpu_tensor::CpuWeight, c3_b: Vec<f32>,
     co: CpuAudioLinear,
     pe: Vec<f32>,        // [max_pos, d_model] f32
     d_model: usize,
@@ -175,11 +175,11 @@ impl CpuConvStem {
         prefix: &str,
         config: &AudioEncoderConfig,
     ) -> Result<Self> {
-        let c1_w = load_conv_weight(weights, &format!("{}.conv2d1.weight", prefix))?;
+        let c1_w = load_conv_weight(weights, &format!("{}.conv2d1.weight", prefix))?.to_f32();
         let c1_b = load_bias(weights, &format!("{}.conv2d1.bias", prefix))?;
-        let c2_w = load_conv_weight(weights, &format!("{}.conv2d2.weight", prefix))?;
+        let c2_w = load_conv_weight(weights, &format!("{}.conv2d2.weight", prefix))?.to_f32();
         let c2_b = load_bias(weights, &format!("{}.conv2d2.bias", prefix))?;
-        let c3_w = load_conv_weight(weights, &format!("{}.conv2d3.weight", prefix))?;
+        let c3_w = load_conv_weight(weights, &format!("{}.conv2d3.weight", prefix))?.to_f32();
         let c3_b = load_bias(weights, &format!("{}.conv2d3.bias", prefix))?;
         let co = CpuAudioLinear::load(weights, &format!("{}.conv_out", prefix))?;
 
@@ -213,8 +213,6 @@ impl CpuConvStem {
         let c1_out = self.c1_w.rows;
         let c2_out = self.c2_w.rows;
 
-        // Three conv2d (kernel=3, stride=2, pad=1) with bias + GELU.
-        // Input: [b_chunks, 1, n_mels, cs] — 1 channel, n_mels height, cs width.
         let (x1, h1, w1) = self.conv_block(mel_chunks, b_chunks, 1, n_mels, cs, &self.c1_w, &self.c1_b)?;
         let (x2, h2, w2) = self.conv_block(&x1, b_chunks, c1_out, h1, w1, &self.c2_w, &self.c2_b)?;
         let (x3, h3, w3) = self.conv_block(&x2, b_chunks, c2_out, h2, w2, &self.c3_w, &self.c3_b)?;
@@ -266,7 +264,7 @@ impl CpuConvStem {
         &self,
         x: &[f32],
         b: usize, c_in: usize, h: usize, w: usize,
-        w_w: &CpuWeightF16, w_b: &[f32],
+        w_w: &crate::cpu_tensor::CpuWeight, w_b: &[f32],
     ) -> Result<(Vec<f32>, usize, usize)> {
         let c_out = w_w.rows;
         assert_eq!(x.len(), b * c_in * h * w, "conv_block input size mismatch");
@@ -274,35 +272,34 @@ impl CpuConvStem {
         let col_count = b * h_out * w_out;
         let k = c_in * 9;
         assert_eq!(w_w.cols, k, "conv_block weight cols={} != c_in*9={}", w_w.cols, k);
-        // Convert f16 → f32 for GEMM.
-        let w_f32 = w_w.to_f32();
-        // GEMM: out[c_out, col_count] = weight[c_out, k] @ cols^T[k, col_count]
         let mut out = vec![0.0f32; c_out * col_count];
         unsafe {
             gemm(
                 c_out, col_count, k,
                 out.as_mut_ptr(), 1, col_count as isize,
                 false,
-                w_f32.data.as_ptr(), 1, k as isize,
+                w_w.data.as_ptr(), 1, k as isize,
                 cols.as_ptr(), k as isize, 1,
                 0.0, 1.0, false, false, false,
                 Parallelism::Rayon(0),
             );
         }
-        // out is [c_out, col_count]. Reshape to [b, c_out, h_out, w_out] + bias + GELU fused.
-        // Layout: innermost dim is w_out, so can't par_chunks by c_out. Keep sequential.
+        // out is [c_out, col_count] (oc-major). Scatter to NCHW [b, c_out, h_out, w_out]
+        // with fused bias+GELU. Parallel over output channels (each owns a contiguous plane).
         let mut out4d = vec![0.0f32; b * c_out * h_out * w_out];
-        for ib in 0..b {
-            for ho in 0..h_out {
-                for wo in 0..w_out {
-                    for oc in 0..c_out {
-                        let col = (ib * h_out + ho) * w_out + wo;
-                        let v = out[oc * col_count + col] + w_b[oc];
-                        out4d[((ib * c_out + oc) * h_out + ho) * w_out + wo] = gelu(v);
-                    }
+        let plane = h_out * w_out;
+        out4d
+            .par_chunks_mut(plane)
+            .enumerate()
+            .for_each(|(plane_idx, dst)| {
+                let ib = plane_idx / c_out;
+                let oc = plane_idx % c_out;
+                let bias = w_b[oc];
+                let src_row = oc * col_count + ib * plane;
+                for i in 0..plane {
+                    dst[i] = gelu(out[src_row + i] + bias);
                 }
-            }
-        }
+            });
         Ok((out4d, h_out, w_out))
     }
 }
@@ -423,12 +420,10 @@ fn attention_window(
             let ib = idx / nh;
             let ih = idx % nh;
             let head_off = ih * hd;
-            // Process each query position in [st, st+len).
+            let mut scores = vec![0.0f32; len];
             for qi in 0..len {
                 let q_pos = st + qi;
                 let q_base = (ib * s + q_pos) * dm + head_off;
-                // Compute scores for all key positions in [st, st+len).
-                let mut scores = vec![0.0f32; len];
                 let mut max_s = f32::NEG_INFINITY;
                 for ki in 0..len {
                     let k_pos = st + ki;
@@ -617,7 +612,6 @@ impl CpuAudioEncoder {
             h = layer.forward(h, Some(ws))?;
         }
 
-        // Final projections.
         let h = self.ln_post.forward(&h);
         let mut h = self.proj1.forward(&h)?;
         gelu_inplace(&mut h);

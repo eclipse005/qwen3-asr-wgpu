@@ -1423,7 +1423,10 @@ impl WgpuTextDecoder {
             // and poll at every layer boundary (short prefills keep the single
             // submit; the poll tax measured +56% on the 4.9 s worst case and
             // only bites where a single submit cannot survive anyway).
-            if s >= 512 {
+            // Drain every 4 layers on long prefills (Pascal/WDDM TDR). Every
+            // layer was safe but ~4× the submit tax; 4-layer batches still
+            // stay under the TDR window while cutting poll count 28→7.
+            if s >= 512 && (li + 1) % 4 == 0 {
                 drop(cp);
                 gpu.queue.submit([enc.finish()]);
                 if let Err(e) = gpu.device.poll(wgpu::PollType::wait_indefinitely()) {
