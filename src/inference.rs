@@ -17,14 +17,16 @@ use crate::mrope::{compute_mrope_cos_sin, text_positions};
 use crate::prompt::{self, TranscribeResult, ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID};
 use crate::weights;
 
+/// KV + MRoPE size; 180s prompt (~2355) + 1024 new tokens fits with margin.
+const DECODER_MAX_SEQ: usize = 4096;
+
 pub struct WgpuAsr {
-    gpu_adapter: Option<String>,
-    model_dir: std::path::PathBuf,
     config: AsrConfig,
     tokenizer: Tokenizer,
     encoder: CpuAudioEncoder,
     mel: MelExtractor,
     tensors: std::collections::HashMap<String, weights::RawTensor>,
+    decoder: WgpuTextDecoder,
 }
 
 impl WgpuAsr {
@@ -40,23 +42,43 @@ impl WgpuAsr {
             &config.thinker_config.audio_config,
         )?;
         let n_mels = config.thinker_config.audio_config.num_mel_bins;
+        let gpu = pollster::block_on(Gpu::new(adapter))?;
+        let text_cfg = TextConfig::from_model_dir(model_dir)?;
+        let decoder = WgpuTextDecoder::load(
+            gpu,
+            model_dir,
+            "thinker.model",
+            text_cfg,
+            DECODER_MAX_SEQ,
+            DECODER_MAX_SEQ,
+        )?;
+        let text = &config.thinker_config.text_config;
+        let (cos, sin) = compute_mrope_cos_sin(
+            &text_positions(DECODER_MAX_SEQ),
+            text.head_dim,
+            text.rope_theta,
+            &text.mrope_section(),
+            text.mrope_interleaved(),
+        );
+        let cos_f16: Vec<f16> = cos.iter().copied().map(f16::from_f32).collect();
+        let sin_f16: Vec<f16> = sin.iter().copied().map(f16::from_f32).collect();
+        decoder.set_rope_tables(&cos_f16, &sin_f16);
         Ok(Self {
-            gpu_adapter: adapter.map(|s| s.to_string()),
-            model_dir: model_dir.to_path_buf(),
             config,
             tokenizer,
             encoder,
             mel: MelExtractor::new(N_FFT, HOP_LENGTH, n_mels, MEL_SAMPLE_RATE),
             tensors,
+            decoder,
         })
     }
 
-    pub fn transcribe(&self, wav: &Path, max_new_tokens: usize) -> Result<TranscribeResult> {
+    pub fn transcribe(&mut self, wav: &Path, max_new_tokens: usize) -> Result<TranscribeResult> {
         self.transcribe_with_dump(wav, max_new_tokens, None)
     }
 
     pub fn transcribe_with_dump(
-        &self,
+        &mut self,
         wav: &Path,
         max_new_tokens: usize,
         dump_dir: Option<&Path>,
@@ -73,12 +95,12 @@ impl WgpuAsr {
         self.transcribe_samples_with_dump(&samples, max_new_tokens, dump_dir)
     }
 
-    pub fn transcribe_samples(&self, samples: &[f32], max_new_tokens: usize) -> Result<TranscribeResult> {
+    pub fn transcribe_samples(&mut self, samples: &[f32], max_new_tokens: usize) -> Result<TranscribeResult> {
         self.transcribe_samples_with_dump(samples, max_new_tokens, None)
     }
 
     pub fn transcribe_from_mel(
-        &self,
+        &mut self,
         mel: &[f32],
         n_mels: usize,
         n_frames: usize,
@@ -98,7 +120,7 @@ impl WgpuAsr {
     }
 
     pub fn transcribe_from_embeds(
-        &self,
+        &mut self,
         audio_embeds: &[f32],
         max_new_tokens: usize,
         dump_dir: Option<&Path>,
@@ -107,7 +129,7 @@ impl WgpuAsr {
     }
 
     pub fn transcribe_samples_with_dump(
-        &self,
+        &mut self,
         samples: &[f32],
         max_new_tokens: usize,
         dump_dir: Option<&Path>,
@@ -150,7 +172,7 @@ impl WgpuAsr {
     }
 
     fn decode_from_audio_embeds(
-        &self,
+        &mut self,
         audio_embeds: &[f32],
         max_new_tokens: usize,
         dump_dir: Option<&Path>,
@@ -177,18 +199,11 @@ impl WgpuAsr {
             None,
         )?;
         let seq_len = input_ids.len();
-        let max_seq = seq_len + max_new_tokens + 8;
-
-        let gpu = pollster::block_on(Gpu::new(self.gpu_adapter.as_deref()))?;
-        let text_cfg = TextConfig::from_model_dir(&self.model_dir)?;
-        let mut decoder = WgpuTextDecoder::load(
-            gpu,
-            &self.model_dir,
-            "thinker.model",
-            text_cfg,
-            max_seq,
-            max_seq,
-        )?;
+        anyhow::ensure!(
+            seq_len + max_new_tokens + 8 <= self.decoder.max_seq,
+            "seq {seq_len} + max_new {max_new_tokens} exceeds decoder max_seq {}",
+            self.decoder.max_seq
+        );
 
         let (embed, eshape) = weights::get_f16(&self.tensors, "thinker.model.embed_tokens.weight")?;
         anyhow::ensure!(eshape.len() == 2 && eshape[1] == hs, "embed shape {eshape:?}");
@@ -208,25 +223,13 @@ impl WgpuAsr {
         }
         anyhow::ensure!(hidden.len() == seq_len * hs);
 
-        let text = &self.config.thinker_config.text_config;
-        let (cos, sin) = compute_mrope_cos_sin(
-            &text_positions(max_seq),
-            text.head_dim,
-            text.rope_theta,
-            &text.mrope_section(),
-            text.mrope_interleaved(),
-        );
-        let cos_f16: Vec<f16> = cos.iter().copied().map(f16::from_f32).collect();
-        let sin_f16: Vec<f16> = sin.iter().copied().map(f16::from_f32).collect();
-        decoder.set_rope_tables(&cos_f16, &sin_f16);
-
         let mut hidden_bytes = Vec::with_capacity(hidden.len() * 2);
         for h in &hidden {
             hidden_bytes.extend_from_slice(&h.to_bits().to_le_bytes());
         }
 
         let t2 = Instant::now();
-        let first = decoder.prefill(&hidden_bytes, seq_len, 0)?;
+        let first = self.decoder.prefill(&hidden_bytes, seq_len, 0)?;
         let t_prefill = t2.elapsed();
 
         let eos = [ENDOFTEXT_TOKEN_ID as i32, IM_END_TOKEN_ID as i32];
@@ -235,7 +238,7 @@ impl WgpuAsr {
         if !eos.contains(&first) {
             generated.push(first as u32);
             for _ in 1..max_new_tokens {
-                let tok = decoder.step()?;
+                let tok = self.decoder.step()?;
                 if eos.contains(&tok) {
                     break;
                 }

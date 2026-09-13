@@ -32,7 +32,7 @@ fn main() -> Result<()> {
     println!("model: {}", model.display());
     println!("wav:   {}", wav.display());
     let t_load = Instant::now();
-    let asr = WgpuAsr::load(&model, adapter.as_deref())?;
+    let mut asr = WgpuAsr::load(&model, adapter.as_deref())?;
     println!("loaded in {:.1}s", t_load.elapsed().as_secs_f64());
 
     let dump = arg(&args, "--dump").map(PathBuf::from);
