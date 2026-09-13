@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "cuda-prefill-ref"
+version = "0.1.0"
+edition = "2021"
+description = "cuBLAS prefill-GEMM baseline for the qwen3-asr wgpu feasibility study"
+
+[dependencies]
+cudarc = { version = "0.19", features = ["cublas", "f16", "cuda-version-from-build-system", "cuda-12080"] }
+half = "2"
+
+[profile.release]
+debug = false

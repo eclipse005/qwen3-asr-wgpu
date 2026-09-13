@@ -1,0 +1,3 @@
+[env]
+# Vendored soxr CMakeLists is 3.5; newer CMake still honors this floor.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
