@@ -58,9 +58,12 @@ conda 环境：`asr`（transformers 5.17、librosa 0.11、soxr 1.0）。隔离�
 
 下一刀（按杠杆）：
 
-1. **Audio encoder 上 GPU**（180s 里 GPU 空转 3s+；conv stem 的 im2col 在 c2/c3 会涨到 GB 级，是 CPU 热点）。
+1. **Audio encoder 上 GPU，必须用 im2col+GEMM（或等价 tiling），不要逐输出点扫 cin×9。**
+   已试过朴素 WGSL conv（每线程扫 cin×3×3）：0.6B 15s **MATCH** 但 enc 293ms→1257ms，已撤回。
+   c2 的 cin=480，朴素循环在 GPU 上也比 CPU `gemm` 慢。
 2. **Decode split-K**（长上下文 ~16.6 ms/token；短上下文 GPU-bound ~8.3 ms vs CUDA ~6.6 ms）。
-3. **Prefill GEMM tile**（`gemm_bench` 扫过，生产 kernel 仍是第一版）。
+   greedy 不能把 step i+1 排进 GPU 再等 token i：`embed` 读的是同一个 `token_buf`。
+3. **Prefill GEMM**：`gemm_bench` 在 m=2304 k=1024 n=4096 上 8×8 约 1.96 TFLOP/s，8×8 软件流水 2.06，换 tile 几乎没增益。要涨只能改微内核，不是换 TM/TN。
 
 Pascal 无 `shaderFloat16`：f16 一律 `unpack2x16float` / `pack2x16float`。不要改 decode kernel 的加法顺序（会打文本）。
 
