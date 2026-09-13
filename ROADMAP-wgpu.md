@@ -6,11 +6,14 @@ driver 572.75); repro commands regenerate every figure.
 
 ---
 
-## Status: stage 3 started — e2e transcribe vs **Python `-hf`**, not Rust CUDA
+## Status: stage 3 — **12/12 MATCH** python-hf; RTFx vs CUDA 手写
 
-Text decoder (prefill + decode) is on wgpu. Audio encoder is still the CPU reference
-(same as qwen3-asr-rs) so we can assemble a full pipeline against
-`D:\Qwen3-ASR\models\Qwen3-ASR-*-hf`.
+Live handoff (paths, git, next RTFx cut): **`HANDOFF.md`**. This file keeps
+measured stage records. Text decoder is on wgpu; audio encoder is still CPU.
+
+`WgpuAsr::load` uploads the text decoder once (`max_seq=4096`). Inference
+RTFx on 0.6B `15s_en` is ~11× vs CUDA handwritten ~31×; `180s_en` ~10× vs ~18×
+(decode ~9.7s + CPU encode ~3.4s + prefill ~3s).
 
 ```text
 cargo run --release --bin transcribe -- \
@@ -327,11 +330,11 @@ python wgpu/tools/ref_prefill.py --tag q06_15s_en
 4. wgpu implicit layouts are pipeline-exclusive → explicit family layouts.
 5. WGSL reserved word `meta`, const-context `bitcast` (caught by error scopes).
 
-## Next: stage 3 remaining
+## Next: RTFx (see HANDOFF.md)
 
-- Port the **audio encoder to wgpu** (currently CPU; 15s encode ~0.8 s, 90s ~3 s).
-  Transcripts are aligned; this is RTFx.
-- Prefill GEMM is still the untuned first version (`gemm_bench` before tuning).
+- GPU audio encoder (180s CPU encode ~3.4s while the NVIDIA GPU is idle).
+- Decode split-K on long context (~16.6 ms/token).
+- Prefill GEMM tile (`gemm_bench` already swept; production kernel is still v1).
 
 ## In progress: bit-exact expf for the decode chain (kills the dead-tie flip)
 

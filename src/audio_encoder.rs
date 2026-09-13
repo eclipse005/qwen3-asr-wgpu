@@ -268,38 +268,46 @@ impl CpuConvStem {
     ) -> Result<(Vec<f32>, usize, usize)> {
         let c_out = w_w.rows;
         assert_eq!(x.len(), b * c_in * h * w, "conv_block input size mismatch");
-        let (cols, h_out, w_out) = im2col_3x3_s2p1(x, b, c_in, h, w);
-        let col_count = b * h_out * w_out;
+        let h_out = (h + 2 - 3) / 2 + 1;
+        let w_out = (w + 2 - 3) / 2 + 1;
         let k = c_in * 9;
         assert_eq!(w_w.cols, k, "conv_block weight cols={} != c_in*9={}", w_w.cols, k);
-        let mut out = vec![0.0f32; c_out * col_count];
-        unsafe {
-            gemm(
-                c_out, col_count, k,
-                out.as_mut_ptr(), 1, col_count as isize,
-                false,
-                w_w.data.as_ptr(), 1, k as isize,
-                cols.as_ptr(), k as isize, 1,
-                0.0, 1.0, false, false, false,
-                Parallelism::Rayon(0),
-            );
-        }
-        // out is [c_out, col_count] (oc-major). Scatter to NCHW [b, c_out, h_out, w_out]
-        // with fused bias+GELU. Parallel over output channels (each owns a contiguous plane).
-        let mut out4d = vec![0.0f32; b * c_out * h_out * w_out];
         let plane = h_out * w_out;
-        out4d
-            .par_chunks_mut(plane)
-            .enumerate()
-            .for_each(|(plane_idx, dst)| {
+        let in_plane = c_in * h * w;
+        let mut out4d = vec![0.0f32; b * c_out * plane];
+        // Tile batch so conv2/conv3 im2col stays cache-sized (full-b c2 is ~GB).
+        const TILE: usize = 8;
+        for b0 in (0..b).step_by(TILE) {
+            let nb = TILE.min(b - b0);
+            let (cols, ho, wo) = im2col_3x3_s2p1(
+                &x[b0 * in_plane..(b0 + nb) * in_plane],
+                nb, c_in, h, w,
+            );
+            debug_assert_eq!((ho, wo), (h_out, w_out));
+            let col_count = nb * plane;
+            let mut gemm_out = vec![0.0f32; c_out * col_count];
+            unsafe {
+                gemm(
+                    c_out, col_count, k,
+                    gemm_out.as_mut_ptr(), 1, col_count as isize,
+                    false,
+                    w_w.data.as_ptr(), 1, k as isize,
+                    cols.as_ptr(), k as isize, 1,
+                    0.0, 1.0, false, false, false,
+                    Parallelism::Rayon(0),
+                );
+            }
+            let dst = &mut out4d[b0 * c_out * plane..(b0 + nb) * c_out * plane];
+            dst.par_chunks_mut(plane).enumerate().for_each(|(plane_idx, plane_dst)| {
                 let ib = plane_idx / c_out;
                 let oc = plane_idx % c_out;
                 let bias = w_b[oc];
                 let src_row = oc * col_count + ib * plane;
                 for i in 0..plane {
-                    dst[i] = gelu(out[src_row + i] + bias);
+                    plane_dst[i] = gelu(gemm_out[src_row + i] + bias);
                 }
             });
+        }
         Ok((out4d, h_out, w_out))
     }
 }
