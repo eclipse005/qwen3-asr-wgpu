@@ -325,6 +325,11 @@ pub struct WgpuTextDecoder {
     pub max_seq: usize,
     /// Positions already in the KV cache — the next step attends at `cur_len = pos + 1`.
     pub pos: usize,
+    /// Host-side time accumulated by [`Self::step`]: (uniform + encode + submit,
+    /// token readback).  Purely diagnostic — what the batched-submission idea
+    /// below would remove.
+    pub host_submit_ms: f64,
+    pub host_read_ms: f64,
 
     embed_table: wgpu::Buffer,
     layers: Vec<Layer>,
@@ -727,6 +732,8 @@ impl WgpuTextDecoder {
             cfg,
             max_seq,
             pos: 0,
+            host_submit_ms: 0.0,
+            host_read_ms: 0.0,
             embed_table,
             layers,
             pipes,
@@ -921,11 +928,15 @@ impl WgpuTextDecoder {
     /// wrote into `token_buf[0]` (which the *next* step will embed).
     pub fn step(&mut self) -> Result<i32> {
         let pos = self.pos;
+        let t_host = std::time::Instant::now();
         self.write_step_uniforms(pos);
         let mut enc = self.gpu.device.create_command_encoder(&Default::default());
         self.encode_step(&mut enc, pos);
         self.gpu.queue.submit([enc.finish()]);
+        self.host_submit_ms += t_host.elapsed().as_secs_f64() * 1000.0;
+        let t_read = std::time::Instant::now();
         let v = self.read_token()?;
+        self.host_read_ms += t_read.elapsed().as_secs_f64() * 1000.0;
         self.pos += 1;
         Ok(v)
     }

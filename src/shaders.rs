@@ -964,15 +964,26 @@ fn gqa(@builtin(workgroup_id) wgid: vec3<u32>,
     let inv_sum = 1.0 / red_sum[0];
     workgroupBarrier();
 
-    // Stage 4 — partial[t_idx][j] then cross-t_chunk merge
-    let j_idx = lid.x % D;
-    let t_idx = lid.x / D;
-    var acc = 0.0;
-    for (var t = t_idx; t < cfg.cur_len; t = t + TCH) {{
-        let row = kbase + t * D2;
-        acc = acc + sc[t] * half_at(unpack2x16float(VC[row + (j_idx >> 1u)]), j_idx);
+    // Stage 4 — partial[t_idx][j] then cross-t_chunk merge.  One thread owns a
+    // *pair* of dims: both halves sit in the same f16 word, so a single LDS and
+    // a single unpack feed two FMAs instead of one.  Each dim still walks the
+    // same stride-`TCH` key set in the same order, so every accumulator keeps its
+    // original summation order — only the instruction count per element drops
+    // (the block's second half has no pair left to own and idles here).
+    let jp = lid.x % D2;
+    let t_idx = lid.x / D2;
+    if (t_idx < TCH) {{
+        var a0 = 0.0;
+        var a1 = 0.0;
+        for (var t = t_idx; t < cfg.cur_len; t = t + TCH) {{
+            let row = kbase + t * D2;
+            let v = unpack2x16float(VC[row + jp]);
+            a0 = a0 + sc[t] * v.x;
+            a1 = a1 + sc[t] * v.y;
+        }}
+        partial[t_idx * D + jp * 2u] = a0;
+        partial[t_idx * D + jp * 2u + 1u] = a1;
     }}
-    partial[t_idx * D + j_idx] = acc;
     workgroupBarrier();
 
     // CUDA writes one element per thread; writing whole f16 words here keeps the
@@ -1158,15 +1169,24 @@ fn gqa_split_p1(@builtin(workgroup_id) wgid: vec3<u32>,
     let chunk_sum = red_sum[0];
     workgroupBarrier();
 
-    // Stage 4 — partial numerator, unnormalized; V read at the global position
-    let j_idx = lid.x % D;
-    let t_idx = lid.x / D;
-    var acc = 0.0;
-    for (var t = t_idx; t < chunk_len; t = t + T_SPLIT) {{
-        let row = kbase + (t_start + t) * D2;
-        acc = acc + sc[t] * half_at(unpack2x16float(VC[row + (j_idx >> 1u)]), j_idx);
+    // Stage 4 — partial numerator, unnormalized; V read at the global position.
+    // Same dim-pair split as the single-block kernel: one thread owns two dims
+    // that share an f16 word, so one LDS + one unpack feed two FMAs, and every
+    // dim keeps its original stride-`T_SPLIT` key order (bit-identical).
+    let jp = lid.x % D2;
+    let t_idx = lid.x / D2;
+    if (t_idx < T_SPLIT) {{
+        var a0 = 0.0;
+        var a1 = 0.0;
+        for (var t = t_idx; t < chunk_len; t = t + T_SPLIT) {{
+            let row = kbase + (t_start + t) * D2;
+            let v = unpack2x16float(VC[row + jp]);
+            a0 = a0 + sc[t] * v.x;
+            a1 = a1 + sc[t] * v.y;
+        }}
+        partial[t_idx * D + jp * 2u] = a0;
+        partial[t_idx * D + jp * 2u + 1u] = a1;
     }}
-    partial[t_idx * D + j_idx] = acc;
     workgroupBarrier();
 
     if (lid.x < D) {{

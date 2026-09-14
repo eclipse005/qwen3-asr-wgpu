@@ -117,6 +117,127 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
 }}
 ";
 
+/// Experimental: `X` (the activation row, shared by every warp of the block) is
+/// unpacked once into f32 shared memory instead of being unpacked per warp per
+/// row.  The values are the very same f16→f32 conversions, and the FMA chains
+/// consume them in the same order, so the result is bit-identical.
+const XSMEM_WGSL: &str = "\
+@group(0) @binding(0) var<storage, read>       Wt: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read>       X:  array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read_write> Y:  array<u32>;
+
+const KG: u32 = {kg}u;
+const TILES: u32 = {tiles}u;
+const XW: u32 = {xw}u;
+
+var<workgroup> xs:     array<vec4<f32>, {xw2}u>;
+var<workgroup> rows_out: array<f32, 8>;
+var<workgroup> bt0: array<f32, 256>;
+var<workgroup> bt1: array<f32, 256>;
+
+fn bfly(v: f32, lid: u32, lane: u32) -> f32 {{
+    let wb = lid & 0xFFFFFFE0u;
+    bt0[lid] = v;
+    workgroupBarrier();
+    var t = bt0[lid] + bt0[wb + (lane ^ 16u)];
+    bt1[lid] = t;
+    workgroupBarrier();
+    t = bt1[lid] + bt1[wb + (lane ^ 8u)];
+    bt0[lid] = t;
+    workgroupBarrier();
+    t = bt0[lid] + bt0[wb + (lane ^ 4u)];
+    bt1[lid] = t;
+    workgroupBarrier();
+    t = bt1[lid] + bt1[wb + (lane ^ 2u)];
+    bt0[lid] = t;
+    workgroupBarrier();
+    t = bt0[lid] + bt0[wb + (lane ^ 1u)];
+    bt1[lid] = t;
+    workgroupBarrier();
+    return t;
+}}
+
+@compute @workgroup_size(256)
+fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let lane = lid.x & 31u;
+    let warp = lid.x >> 5u;
+    let row = wgid.x * 8u + warp;
+
+    for (var i = lid.x; i < XW; i = i + 256u) {{
+        let v = X[i];
+        let lo = unpack2x16float(v.x);
+        let hi = unpack2x16float(v.y);
+        let lo2 = unpack2x16float(v.z);
+        let hi2 = unpack2x16float(v.w);
+        xs[2u * i] = vec4<f32>(lo.x, lo.y, hi.x, hi.y);
+        xs[2u * i + 1u] = vec4<f32>(lo2.x, lo2.y, hi2.x, hi2.y);
+    }}
+    workgroupBarrier();
+
+    let wbase = row * KG;
+    var a0 = 0.0; var a1 = 0.0; var a2 = 0.0; var a3 = 0.0;
+    var i = lane;
+    for (var g = 0u; g < TILES; g = g + 4u) {{
+        let wv0 = Wt[wbase + i];
+        let x0 = xs[2u * i];
+        let x1 = xs[2u * i + 1u];
+        let wv1 = Wt[wbase + i + 32u];
+        let x2 = xs[2u * (i + 32u)];
+        let x3 = xs[2u * (i + 32u) + 1u];
+        let wv2 = Wt[wbase + i + 64u];
+        let x4 = xs[2u * (i + 64u)];
+        let x5 = xs[2u * (i + 64u) + 1u];
+        let wv3 = Wt[wbase + i + 96u];
+        let x6 = xs[2u * (i + 96u)];
+        let x7 = xs[2u * (i + 96u) + 1u];
+        let w00 = unpack2x16float(wv0.x);
+        let w01 = unpack2x16float(wv0.y);
+        let w02 = unpack2x16float(wv0.z);
+        let w03 = unpack2x16float(wv0.w);
+        a0 = fma(w00.x, x0.x, fma(w00.y, x0.y, a0));
+        a1 = fma(w01.x, x0.z, fma(w01.y, x0.w, a1));
+        a2 = fma(w02.x, x1.x, fma(w02.y, x1.y, a2));
+        a3 = fma(w03.x, x1.z, fma(w03.y, x1.w, a3));
+        let w10 = unpack2x16float(wv1.x);
+        let w11 = unpack2x16float(wv1.y);
+        let w12 = unpack2x16float(wv1.z);
+        let w13 = unpack2x16float(wv1.w);
+        a0 = fma(w10.x, x2.x, fma(w10.y, x2.y, a0));
+        a1 = fma(w11.x, x2.z, fma(w11.y, x2.w, a1));
+        a2 = fma(w12.x, x3.x, fma(w12.y, x3.y, a2));
+        a3 = fma(w13.x, x3.z, fma(w13.y, x3.w, a3));
+        let w20 = unpack2x16float(wv2.x);
+        let w21 = unpack2x16float(wv2.y);
+        let w22 = unpack2x16float(wv2.z);
+        let w23 = unpack2x16float(wv2.w);
+        a0 = fma(w20.x, x4.x, fma(w20.y, x4.y, a0));
+        a1 = fma(w21.x, x4.z, fma(w21.y, x4.w, a1));
+        a2 = fma(w22.x, x5.x, fma(w22.y, x5.y, a2));
+        a3 = fma(w23.x, x5.z, fma(w23.y, x5.w, a3));
+        let w30 = unpack2x16float(wv3.x);
+        let w31 = unpack2x16float(wv3.y);
+        let w32 = unpack2x16float(wv3.z);
+        let w33 = unpack2x16float(wv3.w);
+        a0 = fma(w30.x, x6.x, fma(w30.y, x6.y, a0));
+        a1 = fma(w31.x, x6.z, fma(w31.y, x6.w, a1));
+        a2 = fma(w32.x, x7.x, fma(w32.y, x7.y, a2));
+        a3 = fma(w33.x, x7.z, fma(w33.y, x7.w, a3));
+        i = i + 128u;
+    }}
+    let acc = (a0 + a1) + (a2 + a3);
+    let r = bfly(acc, lid.x, lane);
+    if (lane == 0u) {{ rows_out[warp] = r; }}
+    workgroupBarrier();
+    if (lid.x == 0u) {{
+        let wordbase = (wgid.x * 8u) >> 1u;
+        for (var w = 0u; w < 4u; w = w + 1u) {{
+            Y[wordbase + w] = pack2x16float(vec2<f32>(rows_out[2u * w], rows_out[2u * w + 1u]));
+        }}
+    }}
+}}
+";
+
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
 }
@@ -149,12 +270,12 @@ fn main() -> Result<()> {
     let iters = 50usize;
 
     println!(
-        "{:<11} {:>10} {:>16} {:>16} {:>9}",
-        "gemv", "weight(MB)", "prod GB/s", "unroll4 GB/s", "u4/prod"
+        "{:<11} {:>10} {:>14} {:>14} {:>14} {:>9}",
+        "gemv", "weight(MB)", "prod GB/s", "unroll4", "xsmem", "p/s"
     );
     println!("{}", "-".repeat(70));
 
-    let mut totals = [0.0f64; 2];
+    let mut totals = [0.0f64; 3];
     let mut bytes_total = 0usize;
     for (name, rows, cols) in shapes {
         let bytes = rows * cols * 2;
@@ -235,26 +356,48 @@ fn main() -> Result<()> {
         });
         let ms_u = run(&pipe_u, &bg_u)?;
 
+        // xsmem kernel: X pre-unpacked into f32 shared memory
+        let srcs = XSMEM_WGSL
+            .replace("{kg}u", &format!("{kg}u"))
+            .replace("{tiles}u", &format!("{tiles}u"))
+            .replace("{xw2}u", &format!("{}u", cols / 4))
+            .replace("{xw}u", &format!("{}u", cols / 8));
+        let pipe_s = gpu.pipeline("xsmem", &srcs, "gemv", None)?;
+        let bg_s = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("xsmem"),
+            layout: &pipe_s.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: w.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: y.as_entire_binding() },
+            ],
+        });
+        let ms_s = run(&pipe_s, &bg_s)?;
+
         let bw = |ms: f64| bytes as f64 / 1e9 / (ms / 1000.0);
         println!(
-            "{:<11} {:>10.1} {:>16.1} {:>16.1} {:>9.2}",
+            "{:<11} {:>10.1} {:>14.1} {:>14.1} {:>14.1} {:>9.2}",
             name,
             bytes as f64 / 1048576.0,
             bw(ms_p),
             bw(ms_u),
-            ms_p / ms_u
+            bw(ms_s),
+            ms_p / ms_s
         );
         totals[0] += ms_p;
         totals[1] += ms_u;
+        totals[2] += ms_s;
         bytes_total += bytes;
     }
     println!("{}", "-".repeat(70));
     println!(
-        "aggregate: prod {:.3} ms ({:.1} GB/s) | unroll4 {:.3} ms ({:.1} GB/s) | CUDA kernel ref 289 GB/s",
+        "aggregate: prod {:.3} ms ({:.1} GB/s) | unroll4 {:.3} ms ({:.1} GB/s) | xsmem {:.3} ms ({:.1} GB/s)",
         totals[0],
         bytes_total as f64 / 1e9 / (totals[0] / 1000.0),
         totals[1],
         bytes_total as f64 / 1e9 / (totals[1] / 1000.0),
+        totals[2],
+        bytes_total as f64 / 1e9 / (totals[2] / 1000.0),
     );
     Ok(())
 }

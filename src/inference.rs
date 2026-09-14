@@ -1242,11 +1242,13 @@ impl WgpuAsr {
         }
         let t_decode = t3.elapsed();
         eprintln!(
-            "mel={:.0}ms enc={:.0}ms prefill={:.0}ms decode={:.0}ms tokens={} seq={}",
+            "mel={:.0}ms enc={:.0}ms prefill={:.0}ms decode={:.0}ms [host submit {:.0} / read {:.0}] tokens={} seq={}",
             t_mel_ms,
             t_enc_ms,
             t_prefill.as_secs_f64() * 1000.0,
             t_decode.as_secs_f64() * 1000.0,
+            self.decoder.host_submit_ms,
+            self.decoder.host_read_ms,
             generated.len(),
             seq_len,
         );
