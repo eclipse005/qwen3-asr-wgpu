@@ -238,6 +238,126 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
 }}
 ";
 
+/// Experimental: two rows per warp.  The X loads are shared by both rows (one
+/// activation row per warp instead of one per row) and each lane keeps eight W
+/// loads in flight instead of four, which is the knob that matters when the
+/// shape is too small to fill the machine.  Per row the FMA chains and the
+/// reduction tree are untouched, so the result is bit-identical.
+const ROWS2_WGSL: &str = "\
+@group(0) @binding(0) var<storage, read>       Wt: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read>       X:  array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read_write> Y:  array<u32>;
+
+const KG: u32 = {kg}u;
+const TILES: u32 = {tiles}u;
+
+var<workgroup> bt0: array<vec2<f32>, 256>;
+var<workgroup> bt1: array<vec2<f32>, 256>;
+var<workgroup> rows_out: array<vec2<f32>, 8>;
+
+fn bfly2(v: vec2<f32>, lid: u32, lane: u32) -> vec2<f32> {{
+    let wb = lid & 0xFFFFFFE0u;
+    bt0[lid] = v;
+    workgroupBarrier();
+    var t = bt0[lid] + bt0[wb + (lane ^ 16u)];
+    bt1[lid] = t;
+    workgroupBarrier();
+    t = bt1[lid] + bt1[wb + (lane ^ 8u)];
+    bt0[lid] = t;
+    workgroupBarrier();
+    t = bt0[lid] + bt0[wb + (lane ^ 4u)];
+    bt1[lid] = t;
+    workgroupBarrier();
+    t = bt1[lid] + bt1[wb + (lane ^ 2u)];
+    bt0[lid] = t;
+    workgroupBarrier();
+    t = bt0[lid] + bt0[wb + (lane ^ 1u)];
+    bt1[lid] = t;
+    workgroupBarrier();
+    return t;
+}}
+
+fn acc4(w0: vec4<u32>, w1: vec4<u32>, w2: vec4<u32>, w3: vec4<u32>,
+        x0: vec4<u32>, x1: vec4<u32>, x2: vec4<u32>, x3: vec4<u32>,
+        carry: vec4<f32>) -> vec4<f32> {{
+    var a = carry;
+    let s0 = unpack2x16float(w0.x); let t0 = unpack2x16float(x0.x);
+    let s1 = unpack2x16float(w0.y); let t1 = unpack2x16float(x0.y);
+    let s2 = unpack2x16float(w0.z); let t2 = unpack2x16float(x0.z);
+    let s3 = unpack2x16float(w0.w); let t3 = unpack2x16float(x0.w);
+    a.x = fma(s0.x, t0.x, fma(s0.y, t0.y, a.x));
+    a.y = fma(s1.x, t1.x, fma(s1.y, t1.y, a.y));
+    a.z = fma(s2.x, t2.x, fma(s2.y, t2.y, a.z));
+    a.w = fma(s3.x, t3.x, fma(s3.y, t3.y, a.w));
+    let u0 = unpack2x16float(w1.x); let v0 = unpack2x16float(x1.x);
+    let u1 = unpack2x16float(w1.y); let v1 = unpack2x16float(x1.y);
+    let u2 = unpack2x16float(w1.z); let v2 = unpack2x16float(x1.z);
+    let u3 = unpack2x16float(w1.w); let v3 = unpack2x16float(x1.w);
+    a.x = fma(u0.x, v0.x, fma(u0.y, v0.y, a.x));
+    a.y = fma(u1.x, v1.x, fma(u1.y, v1.y, a.y));
+    a.z = fma(u2.x, v2.x, fma(u2.y, v2.y, a.z));
+    a.w = fma(u3.x, v3.x, fma(u3.y, v3.y, a.w));
+    let p0 = unpack2x16float(w2.x); let q0 = unpack2x16float(x2.x);
+    let p1 = unpack2x16float(w2.y); let q1 = unpack2x16float(x2.y);
+    let p2 = unpack2x16float(w2.z); let q2 = unpack2x16float(x2.z);
+    let p3 = unpack2x16float(w2.w); let q3 = unpack2x16float(x2.w);
+    a.x = fma(p0.x, q0.x, fma(p0.y, q0.y, a.x));
+    a.y = fma(p1.x, q1.x, fma(p1.y, q1.y, a.y));
+    a.z = fma(p2.x, q2.x, fma(p2.y, q2.y, a.z));
+    a.w = fma(p3.x, q3.x, fma(p3.y, q3.y, a.w));
+    let r0 = unpack2x16float(w3.x); let z0 = unpack2x16float(x3.x);
+    let r1 = unpack2x16float(w3.y); let z1 = unpack2x16float(x3.y);
+    let r2 = unpack2x16float(w3.z); let z2 = unpack2x16float(x3.z);
+    let r3 = unpack2x16float(w3.w); let z3 = unpack2x16float(x3.w);
+    a.x = fma(r0.x, z0.x, fma(r0.y, z0.y, a.x));
+    a.y = fma(r1.x, z1.x, fma(r1.y, z1.y, a.y));
+    a.z = fma(r2.x, z2.x, fma(r2.y, z2.y, a.z));
+    a.w = fma(r3.x, z3.x, fma(r3.y, z3.y, a.w));
+    return a;
+}}
+
+@compute @workgroup_size(256)
+fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let lane = lid.x & 31u;
+    let warp = lid.x >> 5u;
+    let row0 = wgid.x * 16u + warp * 2u;
+    let wb0 = row0 * KG;
+    let wb1 = (row0 + 1u) * KG;
+
+    var a = vec4<f32>(0.0);
+    var b = vec4<f32>(0.0);
+    var i = lane;
+    for (var g = 0u; g < TILES; g = g + 4u) {{
+        let x0 = X[i];
+        let x1 = X[i + 32u];
+        let x2 = X[i + 64u];
+        let x3 = X[i + 96u];
+        let wa0 = Wt[wb0 + i];
+        let wa1 = Wt[wb0 + i + 32u];
+        let wa2 = Wt[wb0 + i + 64u];
+        let wa3 = Wt[wb0 + i + 96u];
+        let wc0 = Wt[wb1 + i];
+        let wc1 = Wt[wb1 + i + 32u];
+        let wc2 = Wt[wb1 + i + 64u];
+        let wc3 = Wt[wb1 + i + 96u];
+        a = acc4(wa0, wa1, wa2, wa3, x0, x1, x2, x3, a);
+        b = acc4(wc0, wc1, wc2, wc3, x0, x1, x2, x3, b);
+        i = i + 128u;
+    }}
+    // row0: (a.x + a.y) + (a.z + a.w); row1 likewise -- same tree as prod.
+    let r = bfly2(vec2<f32>((a.x + a.y) + (a.z + a.w), (b.x + b.y) + (b.z + b.w)), lid.x, lane);
+    if (lane == 0u) {{ rows_out[warp] = r; }}
+    workgroupBarrier();
+    if (lid.x == 0u) {{
+        let wordbase = (wgid.x * 16u) >> 1u;
+        for (var w = 0u; w < 8u; w = w + 1u) {{
+            Y[wordbase + w] = pack2x16float(rows_out[w]);
+        }}
+    }}
+}}
+";
+
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
 }
@@ -270,12 +390,12 @@ fn main() -> Result<()> {
     let iters = 50usize;
 
     println!(
-        "{:<11} {:>10} {:>14} {:>14} {:>14} {:>9}",
-        "gemv", "weight(MB)", "prod GB/s", "unroll4", "xsmem", "p/s"
+        "{:<11} {:>10} {:>14} {:>12} {:>12} {:>12} {:>9}",
+        "gemv", "weight(MB)", "prod GB/s", "unroll4", "xsmem", "rows2", "p/2"
     );
     println!("{}", "-".repeat(70));
 
-    let mut totals = [0.0f64; 3];
+    let mut totals = [0.0f64; 4];
     let mut bytes_total = 0usize;
     for (name, rows, cols) in shapes {
         let bytes = rows * cols * 2;
@@ -374,30 +494,48 @@ fn main() -> Result<()> {
         });
         let ms_s = run(&pipe_s, &bg_s)?;
 
+        // rows2 kernel: two rows per warp, X shared
+        let src2 = ROWS2_WGSL
+            .replace("{kg}u", &format!("{kg}u"))
+            .replace("{tiles}u", &format!("{tiles}u"));
+        let pipe_2 = gpu.pipeline("rows2", &src2, "gemv", None)?;
+        let bg_2 = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rows2"),
+            layout: &pipe_2.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: w.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: y.as_entire_binding() },
+            ],
+        });
+        let ms_2 = run(&pipe_2, &bg_2)?;
+
         let bw = |ms: f64| bytes as f64 / 1e9 / (ms / 1000.0);
         println!(
-            "{:<11} {:>10.1} {:>14.1} {:>14.1} {:>14.1} {:>9.2}",
+            "{:<11} {:>10.1} {:>14.1} {:>12.1} {:>12.1} {:>12.1} {:>9.2}",
             name,
             bytes as f64 / 1048576.0,
             bw(ms_p),
             bw(ms_u),
             bw(ms_s),
-            ms_p / ms_s
+            bw(ms_2),
+            ms_p / ms_2
         );
         totals[0] += ms_p;
         totals[1] += ms_u;
         totals[2] += ms_s;
+        totals[3] += ms_2;
         bytes_total += bytes;
     }
     println!("{}", "-".repeat(70));
     println!(
-        "aggregate: prod {:.3} ms ({:.1} GB/s) | unroll4 {:.3} ms ({:.1} GB/s) | xsmem {:.3} ms ({:.1} GB/s)",
+        "aggregate: prod {:.3} ms ({:.1} GB/s) | unroll4 {:.1} | xsmem {:.1} | rows2 {:.3} ms ({:.1} GB/s)",
         totals[0],
         bytes_total as f64 / 1e9 / (totals[0] / 1000.0),
-        totals[1],
         bytes_total as f64 / 1e9 / (totals[1] / 1000.0),
-        totals[2],
         bytes_total as f64 / 1e9 / (totals[2] / 1000.0),
+        totals[3],
+        bytes_total as f64 / 1e9 / (totals[3] / 1000.0),
     );
     Ok(())
 }

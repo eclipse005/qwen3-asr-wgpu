@@ -853,6 +853,15 @@ impl WgpuTextDecoder {
         // the uniform's `gx` consistent with what the prefill writes.
         let silu_grid = grid_xy((cfg.intermediate_size / 2).div_ceil(256));
 
+        // Ablation hook for RTFx work: `QASR_DUP=<op>` dispatches that op twice.
+        // Every one of these ops is a pure function of its inputs writing the same
+        // buffer, so the second dispatch recomputes the same values: the token
+        // stream is unchanged and `t(dup) - t(base)` is that op's true cost —
+        // including its launch bubble, which op-by-op profiling cannot separate.
+        // Default: unset, zero effect.
+        let dup = std::env::var("QASR_DUP").unwrap_or_default();
+        let d = |name: &str| dup == name;
+
         let mut cp = enc.begin_compute_pass(&Default::default());
 
         cp.set_pipeline(&self.pipes.embed);
@@ -865,33 +874,57 @@ impl WgpuTextDecoder {
             cp.set_pipeline(&self.pipes.gemv_qkv_norm);
             cp.set_bind_group(0, &l.bg_gemv_qkv_norm, &[]);
             cp.dispatch_workgroups(gemv_grid(cfg.fused_qkv_cols()), 1, 1);
+            if d("qkv") {
+                cp.dispatch_workgroups(gemv_grid(cfg.fused_qkv_cols()), 1, 1);
+            }
 
             cp.set_pipeline(&self.pipes.extract);
             cp.set_bind_group(0, &l.bg_extract, &[]);
             cp.dispatch_workgroups(1, (cfg.num_attention_heads + cfg.num_key_value_heads) as u32, 1);
+            if d("extract") {
+                cp.dispatch_workgroups(1, (cfg.num_attention_heads + cfg.num_key_value_heads) as u32, 1);
+            }
 
             self.encode_gqa(&mut cp, l, cur_len);
+            if d("gqa") {
+                self.encode_gqa(&mut cp, l, cur_len);
+            }
 
             cp.set_pipeline(&self.pipes.gemv_o);
             cp.set_bind_group(0, &l.bg_gemv_o, &[]);
             cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
+            if d("o") {
+                cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
+            }
 
             cp.set_pipeline(&self.pipes.gemv_gu_norm);
             cp.set_bind_group(0, &l.bg_gemv_gu_norm, &[]);
             cp.dispatch_workgroups(gemv_grid(2 * cfg.intermediate_size), 1, 1);
+            if d("gu") {
+                cp.dispatch_workgroups(gemv_grid(2 * cfg.intermediate_size), 1, 1);
+            }
 
             cp.set_pipeline(&self.pipes.silu);
             cp.set_bind_group(0, &self.bg_silu, &[]);
             cp.dispatch_workgroups(silu_grid.0, silu_grid.1, 1);
+            if d("silu") {
+                cp.dispatch_workgroups(silu_grid.0, silu_grid.1, 1);
+            }
 
             cp.set_pipeline(&self.pipes.gemv_dp);
             cp.set_bind_group(0, &l.bg_gemv_dp, &[]);
             cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
+            if d("dp") {
+                cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
+            }
         }
 
         cp.set_pipeline(&self.pipes.gemv_lm_norm);
         cp.set_bind_group(0, &self.bg_gemv_lm_norm, &[]);
         cp.dispatch_workgroups(gemv_grid(cfg.vocab_size), 1, 1);
+        if d("lm") {
+            cp.dispatch_workgroups(gemv_grid(cfg.vocab_size), 1, 1);
+        }
 
         cp.set_pipeline(&self.pipes.argmax);
         cp.set_bind_group(0, &self.bg_argmax, &[]);
