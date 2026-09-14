@@ -3,98 +3,33 @@
 **新窗口请把工作区开在 `D:\qwen3-asr-wgpu`，把本文件全文交给 AI。**
 改完对齐或 RTFx 后同步更新本文。不要再写第二份启动提示词。
 
+> **本窗口（2026-09-14 第二轮）做完的事一句话**：**GPU 音频塔的 transformer 对齐了**。
+> conv stem 本来就是对的（上一窗口的结论没错，是诊断的 CPU 参考坏了，见 bug 23）；
+> 真正挡住 transformer 的是四个 bug：`enc.ex` uniform **从未写入**（extract 第一句就 return，
+> Q/K/V 全是 0 —— 而 oracle 拿 GPU 自己的 0 重算，于是「零对零」三行全绿，见 bug 20）、
+> attention GEMM 的 `bsc` 传成**字**而不是**元素**（batch=1 时看不出来；28 个 block 时
+> 相邻块互相覆盖、顺序不定，见 bug 21）、`win_pack` 里 `qp` 的**越行写入竞争**（bug 22）、
+> 以及诊断侧的 tile 偏移（bug 23）和一处比错阶段（bug 24）。
+> 修完后 **12/12 MATCH**（0.6B/1.7B × 6 fixture，与 python-hf 基线逐字相同），
+> 180s_en 的 RTFx **10.1 → 14.9**，enc 相位 **2720 → 1019 ms**；
+> GPU 塔成为**默认**（`--cpu-enc` 兜底）。
+> 随后同一窗口的 **RTFx 专项**又推到 **16.8**（15s_en 23.6、90s_ja 23.6）：
+> attention 的 K/V 改 `vec4` 读取（decode 11.66 → 9.86 ms/step）、**rms_norm 折进消费它的 GEMV**
+> （虚拟线程复刻 1024 线程的 reduction 树，逐位一致）、`embed_tokens` 不再整表物化、
+> soxr 补回被 cmake crate 吞掉的 `/O2`。12/12 全程复验。
+
 ---
 
 ## 机器上三个相关项目（不要混）
 
 | 目录 | 角色 | 怎么跑 |
 |---|---|---|
-| **`D:\Qwen3-ASR`** | 官方 Python 原项目（QwenLM/Qwen3-ASR）。文本 **gold** 从这里出。 | conda 环境 **`asr`**：`C:\Users\ADMIN\miniconda3\envs\asr`。`conda activate asr`。实测：transformers **5.17.0**、librosa **0.11.0**、soxr **1.0.0**、torch **2.8.0+cu128**。模型：`D:\Qwen3-ASR\models\Qwen3-ASR-0.6B-hf` 和 `...\Qwen3-ASR-1.7B-hf`。 |
-| **`D:\qwen3-asr-rs`** | Rust **CUDA + CPU** 移植。CUDA 手写是 RTFx **对照**，不是文本 oracle。 | 独立 git（origin `eclipse005/qwen3-asr-rs`）。**不要改 CUDA 后端。** fixture：`D:\qwen3-asr-rs\tests\fixtures\*.wav`。python-hf 冻结文本：`D:\qwen3-asr-rs\docs\baseline\texts\python-hf_{0.6B,1.7B}_*.txt`。CUDA RTFx 同目录 `cuda_*.txt`（0.6B 15s ~0.49s / 31×，180s_en ~9.87s / 18×）。 |
-| **`D:\qwen3-asr-wgpu`** | **本仓库。** wgpu 文本解码 + CPU 音频编码器。从 rs 的 `wgpu/` 拆出，自有 git。 | 见下文。新对话只开这个目录。 |
+| **`D:\Qwen3-ASR`** | 官方 Python 原项目（QwenLM/Qwen3-ASR）。文本 **gold** 从这里出。 | conda 环境 **`asr`**：`C:\Users\ADMIN\miniconda3\envs\asr`。实测：transformers **5.17.0**、librosa 0.11.0、soxr 1.0.0、torch 2.8.0+cu128。模型：`D:\Qwen3-ASR\models\Qwen3-ASR-0.6B-hf` / `...-1.7B-hf`。 |
+| **`D:\qwen3-asr-rs`** | Rust **CUDA + CPU** 移植。CUDA 手写是 RTFx **对照**，不是文本 oracle。 | 独立 git。**不要改 CUDA 后端。** fixture：`tests\fixtures\*.wav`。python-hf 冻结文本：`docs\baseline\texts\python-hf_*.txt`。CUDA RTFx：0.6B 15s ~0.49s/31×、180s_en ~9.87s/18×。 |
+| **`D:\qwen3-asr-wgpu`** | **本仓库。** wgpu 文本解码 + 音频编码器（GPU 默认 / `--cpu-enc` 可选）。 | 见下文。新对话只开这个目录。 |
 
-硬件：Windows 11，NVIDIA **P104-100** Pascal 8GB，Vulkan，wgpu 30.0.1，驱动 572.75。**同一时间只能有一个 GPU 作业**（不要并行 Python dump 和 wgpu transcribe）。
-
----
-
-## 本仓库当前 git
-
-```
-785ad13 docs: record dead-end RTFx probes in HANDOFF
-f25f56c docs: replace stale handoff; retire port kickoff prompt
-c833a84 perf: speed up CPU audio encoder conv/transformer
-acd3ac4 perf: load wgpu text decoder once in WgpuAsr::load
-75627d6 feat: align wgpu e2e transcribe with Python -hf greedy
-```
-
-对齐快照是 `75627d6`。其后是 RTFx + 文档。
-
----
-
-## 验收（已完成）
-
-**12/12 MATCH** vs python-hf greedy（0.6B + 1.7B × 15s_en / 30s_zh / 90s_en / 90s_ja / 180s_en / 180s_zh）。
-
-对齐要点（不要回退）：
-
-- 重采样：vendored `third_party/soxr`，**HQ**（`SOXR_20_BITQ=4`）。`soxr_oneshot` 默认 LQ，必须显式 HQ。
-- `180s_en.wav` 是 **44.1 kHz mono**，不是 48 kHz。15s/90s_en 是 48 kHz stereo；中日 16 kHz 多数不用重采样。
-- STFT：`torch.stft(center=True)` 反射 pad，**不要**先把波形补到 hop 整数倍。
-- Encoder GELU 是 **erf**（`F.gelu` / `ACT2FN["gelu"]`），不是 tanh。
-- Encoder 尾块仍用 `feo(tail)` 个 token。
-- Decoder 在 `WgpuAsr::load` 里只上 GPU 一次，`max_seq=4096`。`transcribe` 要 `&mut self`。
-
-跑：
-
-```text
-cd D:\qwen3-asr-wgpu
-cargo run --release --bin transcribe -- ^
-  --model D:\Qwen3-ASR\models\Qwen3-ASR-0.6B-hf ^
-  --wav D:\qwen3-asr-rs\tests\fixtures\15s_en.wav ^
-  --adapter nvidia --max-new 512 ^
-  --baseline D:\qwen3-asr-rs\docs\baseline\texts\python-hf_0.6B_15s_en.txt
-```
-
-隔离：`tools/dump_python_hf.py`（conda `asr`）+ `transcribe --mel` / `--embeds`。
-
----
-
-## RTFx（进行中，目标超过 CUDA 手写）
-
-口径：`elapsed` 是 load 之后的 inference。RTFx = audio_s / elapsed。
-
-| 0.6B clip | CUDA 手写（qwen3-asr-rs） | wgpu 当前 |
-|---|---|---|
-| 15s_en | 0.49s / **31×** | ~1.31s / **~11.4×** |
-| 180s_en | 9.87s / **18×** | ~17.1s / **~10.3×** |
-
-180s_en 构成（约）：**enc 2.7s CPU** + **prefill 3.0s** + **decode 9.9s**。decode 单独已经接近 CUDA 整条管线。
-
-下一刀：
-
-1. **Audio encoder 上 GPU，必须 im2col+GEMM（或等价 tiling），不要逐输出点扫 cin×9。**
-   已试朴素 WGSL conv：15s **MATCH** 但 enc 293ms→1257ms，已撤回。c2 的 cin=480。
-2. **Decode split-K**（长上下文 ~16.6 ms/token；短上下文 GPU-bound ~8.3 vs CUDA ~6.6）。
-   greedy 不能把 step i+1 排进 GPU 再等 token i：`embed` 读同一个 `token_buf`。
-3. **Prefill GEMM**：`gemm_bench` m=2304 k=1024 n=4096 上 8×8 ~1.96 TFLOP/s，软件流水 2.06。换 TM/TN 几乎没增益。
-
-Pascal 无 `shaderFloat16`：f16 走 `unpack2x16float` / `pack2x16float`。不要改 decode kernel 加法顺序。
-
-RTFx 改完至少复跑 0.6B `15s_en` + `180s_en` MATCH。
-
----
-
-## 本仓库文档
-
-| 文件 | 用途 |
-|---|---|
-| **HANDOFF.md**（本文件） | 唯一给下一任 AI 的实时入口 |
-| `ROADMAP-wgpu.md` | 阶段测量记录。状态以本文为准 |
-| `FEASIBILITY.md` | 2026-09-12 硬件实测（Pascal f16、GEMV 带宽）。不是任务清单 |
-
-已删：`PROMPT-wgpu-port.md`。
-
-不要提交：`align_dump/`、`golden/`、`target/`、`*.bin`。
+硬件：Windows 11，NVIDIA **P104-100** Pascal 8GB，Vulkan，wgpu 30.0.1，驱动 572.75。
+**同一时间只能有一个 GPU 作业。** 测试完确认 `nvidia-smi --query-gpu=memory.used` 回落。
 
 ---
 
@@ -102,4 +37,350 @@ RTFx 改完至少复跑 0.6B `15s_en` + `180s_en` MATCH。
 
 - 文本对齐 = **python-hf**（conda `asr` + `-hf` 权重），不是 Rust CUDA 文本。
 - 不要改 `D:\qwen3-asr-rs` 的 CUDA 后端。
-- 顺序用 GPU。
+- 顺序用 GPU，一次一个作业。
+- `180s_en` 必须 `--max-new 700`（585 token 才到 EOS；512 会截断并报假 MISMATCH）。
+- decode kernel 的加法顺序不能改（bit-exactness 是对齐的命根子）。
+- 工作区有未提交改动，**这是正常的**；不要 revert。
+- **默认走 GPU 音频塔**（12/12 复验过，连跑两次结果一致）；`--cpu-enc` 强制回 CPU
+  （A/B 与回归用），`--gpu-enc` 仍被接受（它已经是默认）。塔建不起来会打印原因并自动回落 CPU。
+
+---
+
+## 验收（本窗口复验过）
+
+```text
+cd D:\qwen3-asr-wgpu
+cargo run --release --bin transcribe -- --model D:\Qwen3-ASR\models\Qwen3-ASR-0.6B-hf ^
+  --wav D:\qwen3-asr-rs\tests\fixtures\15s_en.wav --adapter nvidia --max-new 512 ^
+  --baseline D:\qwen3-asr-rs\docs\baseline\texts\python-hf_0.6B_15s_en.txt
+```
+
+| 跑法 | 结果 |
+|---|---|
+| **默认（GPU 塔）** 0.6B `15s_en` | **MATCH**，RTFx **23.6**（elapsed 0.64s；mel 2 / enc 111 / prefill 147 / decode 349 ms） |
+| **默认（GPU 塔）** 0.6B `180s_en`（`--max-new 700`） | **MATCH**，RTFx **16.8**（elapsed 10.50s；mel 23 / enc 1026 / prefill 1790 / decode 6024 ms） |
+| `--cpu-enc` 0.6B `15s_en` / `180s_zh` | **MATCH**（CPU 参考路径，未回退） |
+
+**12/12（默认配置，与 `python-hf_*.txt` 逐字比对全 MATCH）**：
+
+| clip | 0.6B RTFx | 1.7B RTFx |
+|---|---|---|
+| 15s_en | 23.6 | 11.2 |
+| 30s_zh | 20.8 | 10.3 |
+| 90s_en | 19.2 | 10.8 |
+| 90s_ja | 23.6 | 12.9 |
+| 180s_en | 16.8 | 10.2 |
+| 180s_zh | 19.0 | 10.8 |
+
+`--cpu-enc` 抽查 `15s_en` / `180s_zh` 也 MATCH。
+`90s_ja` 连跑两次结果一致（bug 22 修掉之前这里是非确定性的）；
+（有一次连续跑 8 个 GPU 进程的批次在**收尾阶段**报了 `0xC0000005`，结果都已 MATCH 并打印；
+单独复跑不复现，怀疑是 Pascal/Vulkan 的进程销毁抖动。）
+
+对齐要点（不要回退）：重采样 vendored soxr **HQ**；`180s_en` 是 44.1 kHz mono；
+STFT `center=True` 反射 pad；Encoder GELU 是 **erf**；`WgpuAsr::load` 只上一次 GPU；
+decode 的 GEMV 归约树与 attention 的加法顺序（见「RTFx 优化」一节）。
+
+---
+
+## RTFx 现状
+
+| 相位（180s_en, 0.6B） | 最早（CPU 塔） | 上一轮 | 现在 | CUDA 手写 |
+|---|---|---|---|---|
+| **wav 读入 + soxr HQ 重采样** | ~1450 ms | ~1450 ms | ~1450 ms | ? |
+| mel (STFT) | 27 ms | 33 ms | 23 ms | 36 ms |
+| audio enc | 2720 ms | 1050 ms | 1026 ms | 803 ms |
+| prefill | 3009 ms | 1788 ms | 1790 ms | 1414 ms |
+| decode | 9609 ms | 6226 ms | **6024 ms** | 7316 ms |
+| 合计 | 17.46 s / 10.1× | 11.87 s / 14.9× | **10.50 s / 16.8×** | 9.87 s / 18.3× |
+
+1.7B `180s_en`：enc 1393 / prefill 3679 / decode 10534 ms，RTFx **10.2**（原 9.6）。
+**分相位之和现在与 elapsed 完全对得上**（`load_audio_wav` 以前是隐形的 1.4 s）。
+decode 已比 CUDA 手写快 **18%**，音频塔和 prefill 各还差 ~25%。
+
+### 对 CUDA 手写版（同机同时代口径）
+
+CUDA 的数字取自 `D:\qwen3-asr-rs\docs\baseline\texts\cuda_*.txt` 头部记录（其
+`baseline_snapshot` harness 的 `elapsed_s` 同样**包含 wav 读入 + 重采样**，且**无 warm-up**，
+与我们同口径）：
+
+| 模型 | 音频 | CUDA 手写 | 本仓库 wgpu | elapsed 比值 |
+|---|---|---|---|---|
+| 0.6B | 15s_en | 0.485 s / 30.9× | 0.635 s / 23.6× | **1.31** |
+| 0.6B | 30s_zh | 1.380 s / 21.7× | 1.446 s / 20.7× | 1.05 |
+| 0.6B | 90s_en | 3.896 s / 23.1× | 4.691 s / 19.2× | 1.20 |
+| 0.6B | 90s_ja | 4.101 s / 21.9× | 3.783 s / 23.8× | **0.92** |
+| 0.6B | 180s_en | 9.873 s / 18.2× | 10.503 s / 17.1× | 1.06 |
+| 0.6B | 180s_zh | 10.735 s / 16.8× | 9.481 s / 19.0× | **0.88** |
+| 1.7B | 15s_en | 1.212 s / 12.4× | 1.336 s / 11.2× | 1.10 |
+| 1.7B | 30s_zh | 2.727 s / 11.0× | 2.909 s / 10.3× | 1.07 |
+| 1.7B | 90s_en | 7.866 s / 11.4× | 8.338 s / 10.8× | 1.06 |
+| 1.7B | 90s_ja | 6.818 s / 13.2× | 6.899 s / 13.0× | 1.01 |
+| 1.7B | 180s_en | 16.416 s / 11.0× | 17.289 s / 10.4× | 1.05 |
+| 1.7B | 180s_zh | 17.503 s / 10.3× | 16.613 s / 10.8× | **0.95** |
+
+**12 组里赢 3 组（0.6B 90s_ja / 0.6B 180s_zh / 1.7B 180s_zh），其余落后 1%–31%。**
+口径提醒：他们 180s_en 记的 audio_s 是标称 180.000，实际文件 176.309（我们的 RTFx 按实际值算），
+所以上表按 **elapsed** 比才是公平的；按他们记的 RTFx 直接比会多算我们 2% 的亏。
+
+**差距在哪（有实测支撑）**：以 15s_en 0.6B 为例，我们 0.635 s = 前端 33 + enc 111 + prefill 147 +
+decode 349；他们 0.485 s 里 decode ≈ 0.336 s（其 ROADMAP 记的 6.58 ms/tok × 51）——
+**decode 我们反而快 4%**，差距全在 **enc + prefill（258 ms vs ~120–150 ms，1.7–2×）**，
+也就是那个共用的手写 `prefill_gemm`。这正是 `FEASIBILITY.md` 里写死的 go/no-go：
+cuBLAS 在同形状上是 4–5 TFLOP/s，我们 `gemm_bench` 的**最好变体**也只有 2.18（m=384）/ 2.44（m=2304）
+TFLOP/s，且已在 TM/TN/双缓冲/k 展开四个维度扫过（生产 kernel = 最优的「8x8 + 预取」变体）。
+瓶颈是**指令发射**：每 k-step 104 条指令里只有 64 条 FMA，LDS/ST 与 FMA 抢同一个发射槽
+（`issue_mix_probe.rs` 专门复现了这个配比）；WGSL 侧还缺 `cp.async`、寄存器控制与
+`__launch_bounds__`，所以「逼近 cuBLAS」的收益上限大约是 +15–20%（向量化 LDS/换 smem 布局）。
+
+**长音频那边还有一笔**：他们 180s_en 的分相位之和是 9569 ms，而其记录总时长 9873 ms ——
+**残差 ~300 ms 才是他们的音频前端**；我们的 `load_audio_wav`（hound + **soxr HQ**）要 **1450 ms**。
+即 **前端上我们白亏 ~1.15 s**，正好就是 180s_en 的总差距（10.503 vs 9.873）。
+原因是两边选了不同的重采样器：我们用 soxr HQ（为了与 librosa **逐位一致**，HANDOFF 的
+「不要回退」清单里有它），他们用 **`rubato::SincFixedIn`**（sinc_len 256 / oversampling 256）
+—— 更快，但不是逐位一致；他们的 12 组文本同样对得上 python-hf。
+⇒ 换重采样器能拿下 ~1.1 s（180s_en RTFx 16.8 → ~19.2，直接超过 CUDA 的 18.2），
+代价是放弃「mel 与 librosa 逐位一致」这条属性。**这是策略决定，没有用户点头不要动。**
+
+---
+
+## RTFx 优化（本窗口第二轮，全部 12/12 复验过）
+
+1. **`embed_tokens` 不再整表物化**（`inference.rs`）。`weights::get_f16` 每次调用都把整张表
+   重建成 `Vec<f16>`（0.6B 155 M 元素 / 1.7B 622 M），约 0.3–0.6 s + 几百 MB 抖动。
+   现在 `RawTensor::append_f16_row_le` 直接从 mmap 的字节里拷行（f16 是 memcpy，
+   其它 dtype 逐元素转换）。
+2. **soxr 的 Release 优化丢过一次**（`build.rs`）。`cmake` crate 是「替换」而不是「追加」
+   `CMAKE_C_FLAGS_RELEASE`，于是 CMake 默认的 `/O2` 没了，vendored soxr 一直是无优化编译。
+   补进 `CMAKE_C_FLAGS`（不会被同样的方式覆盖）。输出**逐位不变**（`wave16k.f32` MD5 相同）。
+   *试过但没用*：`WITH_OPENMP=ON` + `soxr_runtime_spec(N)` —— soxr 的 OpenMP 只在
+   `num_channels > 1` 时并行（`soxr.c`），我们是单声道，1 vs 8 线程同样 1.3 s 且逐位一致。
+3. **decode attention 的 K/V 读取改成 `vec4`**（`shaders.rs` 的 `gqa_decode_single` /
+   `gqa_decode_split_p1`）。原来每个 lane 走自己那一行 256 B，warp 内 32 个地址相隔 256 B，
+   一条 load 打散成 32 个 cache line（实测 ~30 GB/s，而同样大小的 GEMV 形状有 289 GB/s）。
+   改成一次读 4 个字，**每个字的解包与累加顺序一字不改** ⇒ 逐位一致。
+   180s 的 decode 从 **11.66 → 9.86 ms/step**。
+4. **rms_norm 折进消费它的 GEMV**（`shaders::gemv_norm`，用于 qkv / gu / lm_head 三处）。
+   那些 norm 是「1 个 workgroup」的 dispatch，每个在临界路径上值 ~30 µs（消融实测：两层
+   norm 全去掉省 1.1 ms/step）。两个必须一字不差的地方：
+   * **归约树**：`rms_norm` 用 `bs = block_for_reduction(hs) = 1024` 个线程，每个「虚拟线程」
+     的部分和是 `j = t, t+bs, …` 那些字的 `x²+y²`，然后 `red[t] += red[t+s]`（s 从 bs/2 减半）。
+     GEMV 只有 256 线程，于是每线程算 4 个虚拟部分和，并把前两轮**按同样的配对**并进本地加法。
+   * **被消费的值**：`rms_norm` 把归一化结果写成 f16，所以 GEMV 必须读
+     `pack2x16float(x * inv_rms * w)`（同样的乘法顺序），不能读 f32 中间量。共享内存里的
+     暂存就是这个表达式。
+   180s 的 decode 再降 **~0.4 ms/step**（6010 ms），12/12 复验仍然逐位一致。
+
+**decode 现在的时间分布**（180s_en，约 9.4 ms/step，用临时消融开关量的，已移除）：
+
+| 部分 | ms/step | 说明 |
+|---|---|---|
+| attention p1（scores+AV 扫描） | **4.2** | 指令吞吐受限：scores 每 key 约 350 条指令（unpack+2 FMA+add），AV 每 (key,dim) 约 6 条。Pascal 的 f16 是 1/64 速率，只能 f32 标量 |
+| mlp（gu+silu+dp） | 2.2 | 形状小 ⇒ 只有 105–156 GB/s（大形状 LM head 有 289 GB/s） |
+| qkv | 1.3 | 同上 |
+| extract | 1.0 | 24 个 workgroup；每层 57 µs 基本是前一个 kernel 的收尾 + 下一个的启动 |
+| merge | 0.9 | 16 个 workgroup，每层 48 µs，同上 |
+| lm_head | 0.7 | 297 MB，288 GB/s ✓ 已达带宽 |
+| o_proj | 0.1–0.6 | |
+| ~~rms_norm ×2/层~~ | ~~1.1~~ | **已折进 GEMV** |
+
+⇒ 剩下的两个方向：(a) AV 扫描的指令数——每 (key,dim) 6 条里只有 1 条是 FMA，但
+`T_SPLIT=2` 的分块方式限制了「一线程多 dim」的向量化（改了就不逐位一致）；
+(b) `extract`/`merge` 的启动气泡，需要把它们折进邻居 kernel（merge 折进 o_proj 的
+prologue 可行但会多读 40 KB/workgroup）。silu 折进 dp **不可行**：需要 7 KB smem，
+而且 exp 会按 workgroup 数（128）重复计算。
+
+---
+
+## 下一步（RTFx；对齐已无欠账）
+
+1. prefill 1788 ms（CUDA 1414 ms）：`gemm_bench` 已扫空 TM/TN，要动数据流而不是 tile。
+2. 音频塔 enc 1050 ms：conv stem 只占 ~63 ms，其余是 18 层 transformer 的 GEMM。
+3. decode 6024 ms：上面那张表就是清单（注意力 AV 的指令数 / extract+merge 的气泡）。
+4. `--diag-enc` 里 `layer 17` 还有 917/174720 个点超 5e-3（max 0.128）—— f16 逐层累积，预期内。
+
+---
+
+## ★ 本窗口修掉的四个真 bug（都验证过，别再重复怀疑）
+
+**20. `enc.ex` uniform 从未写入**（`audio_encoder_gpu.rs` 的 `layer()`）。
+`u_ex` 只被创建、绑定，没有任何 `write_buffer`，所以 `ExCfg.n_tokens = 0`，
+`audio_extract_qkv` 第一句 `if (tok >= cfg.n_tokens) { return; }` 让**每个线程立刻返回**，
+Q/K/V 保持分配时的 0。后果：scores/probs/av 全 0，attention 退化成 `out_proj` 的 bias。
+**最坑的是它看起来自洽**：oracle 是「拿 GPU 自己的 q/k/v 重算」，0·0=0、softmax(0) 也一致，
+所以 `scores/probs/av out` 三行全绿。现在 oracle 会打印 `max|q|/|k|/|v|`（必须非零）。
+
+**21. attention GEMM 的 `bsc` 传成「字」而不是「元素」**。
+`prefill_gemm` 的 epilogue 是 `C[(cbase + row·ldc + col) / 2]` —— `cbase` 按**元素**解释，
+所以 `bsc` 必须是**元素**（解码器一直是这么传的，`decoder.rs` 里有注释），
+而音频塔传的是 `wpad*wpad/2`（字）。batch=1 时 `cbase = wid.z·bsc = 0`，看不出来；
+attention 一批 28 个 block 时，除 block 0 外每个块都被写到**前半个块**的位置，
+相邻块因此互相覆盖，谁赢取决于 workgroup 跑的顺序 → **同一份输入两次运行结果不同**。
+修法：`bsc = wpad*wpad`（scores）/ `wpad*hd_pad`（AV）；`shaders::prefill_gemm` 的文档已写明单位。
+
+**22. `audio_win_pack` 的 `qp` 越行写入**。
+`jw`（head-dim 字下标）跑到 `hd2..pad_n/2` 时 `in_range == false`，读出来的是 0；
+vp 的行宽是 `pad_n/2`，写 0 正好是「head 维 padding」，没问题；
+但 `qp` 的行宽只有 `hd2`，同一个地址落到**下一个 token 的行**，
+和那一行自己的线程**抢着写**（真实值 vs 0）—— 哪边赢看调度。
+修法：`qp` 的两条写放进 `if (in_range)`。
+
+**23. 诊断侧 `conv_block_stages` 的 epilogue 忘了 tile 偏移**（`audio_encoder.rs`）。
+`want_raw` 路径下 `raw` 是整块 `[c_out][b·plane]`，epilogue 应读 `(b0+ib)·plane`，
+原来读 `ib·plane` → **第 2 个 tile 起，act 全是第 1 个 tile 的复制品**。
+单 chunk（一个 tile）时两者恰好重合，所以上一窗口的「单 chunk 复现」全绿，
+而 15s（15 chunk / 2 round）的 `conv{1,2,3} +bias/GELU` 三行全红（bad 30–45%），把 GPU 冤枉了两轮。
+修好后这三行是 0.001976 / 0.002727 / 0.001862 —— 与上一窗口记的数字逐位吻合。
+
+**24. 诊断把 `attn_flat` 和 `dbg_attn` 比**（`inference.rs`）。
+`enc.attn_flat` 是 **out_proj 之前**的张量，`dbg_attn` 是**之后**的（含 out_proj），两者永远对不上
+（max 2.27、bad 86%）。现在新增 `CpuAudioAttention::flat()` 与 `dbg_attn_flat()`，同口径比 → max 0.003，0 bad。
+
+---
+
+## 诊断怎么读（`--diag-enc`，默认就是 GPU 塔）
+
+15s_en 当前输出（全部干净，可作回归基线）：
+
+```text
+    conv1 operand        max|d| 0.000000  bad 0/432000        ([k][pos])
+    conv1 GEMM           max|d| 0.000976  bad 0/23040000
+    conv1 +bias/GELU     max|d| 0.001976  bad 0/23040000
+    conv2 operand        max|d| 0.000000  bad 0/51840000
+    conv2 GEMM           max|d| 0.003482  bad 24/5760000       <- 24 个点在 f16 边界上
+    conv2 +bias/GELU     max|d| 0.002727  bad 11/5760000
+    conv3 operand        max|d| 0.000000  bad 0/13478400
+    conv3 GEMM           max|d| 0.001710  bad 0/1497600
+    conv3 +bias/GELU     max|d| 0.001862  bad 0/1497600
+    head 0 win 0 z 0 (valid 104): operands qp 0.0000 kt 0.0000 vp 0.0000 | scores bad 0 | probs bad rows 0 | av bad rows 0
+    head 1 win 0 z 2 (valid 104): 同上（这一行以前是全红）
+    head 0 win 1 z 1 (valid  91): 同上
+    head 1 win 1 z 3 (valid  91): 同上
+    max|q| 4.9141  max|k| 7.3594  max|v| 2.9629  (must be non-zero)
+    attn residual        max|d| 0.002677  rms 0.000165  bad 0/174720
+    LN1 (normed)         max|d| 0.000968  bad 0/174720
+    fused QKV            max|d| 0.002124  bad 0/524160
+    attention block      max|d| 0.002973  bad 0/174720
+    scores / probs / av  max|d| 0.125 / 0.0006 / 0.0006  bad 0
+    layer 0              max|d| 0.005963  bad 1/174720
+    layer 17             max|d| 0.127735  bad 917/174720     <- f16 累积，预期内
+    packed / h           max|d| 0.006 / 0.0035  bad 4 / 0
+```
+
+**注意力 oracle 的方法学（血的教训）**：它只用 GPU 自己写出的 `q/k/v` 重算 dot/softmax/AV，
+所以只能证明「GPU 内部自洽」，**证明不了 q/k/v 本身是对的** —— bug 20 就是全 0 的 q/k/v 让三行全绿。
+现在它：① 覆盖 **head 0/1 × 首个/最后一个窗口**（head 与 win 两个下标都动到）；
+② 先比 **packed operand（qp/kt/vp）与主机的 q/k/v**（错在 repack 还是 GEMM 一眼可分）；
+③ 打印 `max|q|/|k|/|v|`，全 0 时那行写着 `(must be non-zero)`；
+④ `scores` 容差随幅值走（f16 在 |s|≈300 处的 ulp 就有 0.25）。
+
+---
+
+## 布局契约（单一来源，改代码前先读这里）
+
+`src/audio_encoder_gpu.rs` 的 **`ConvLevel`** 是唯一的几何来源；`LevelView` / `enc.level(i)`
+把它发布给诊断，所以**比较代码和 kernel 不可能各说各话**。`CONV_TILE = 8` 个 chunk 一轮。
+
+```text
+operand (im2col 输出 = transb GEMM 的 B)   [k_pad][n_all] f16
+    一个字 (k, 位置对) 在 k*(n_all/2) + col/2，col = chunk*plane_pad + p
+    通道寻址: 读 (chunk0+chunk)*in_chunk + ic*in_ic + tap，tap 来自 [plane*9] 的 tap 表
+    k >= c_in*9 / chunk >= 本轮 chunk 数 / p >= plane 一律**显式写 0**
+
+activation (GEMM 的 C)                     [c][pos] 通道优先（= CPU 参考的布局）
+    元素 (c, chunk, p) 在 c*n_all + chunk*plane_pad + p
+    m_pad = align(c_out, GEMM_BM) 行、n_all 列，ldc = n_all
+
+mel 输入                                   [chunk][mel_bin][frame]，行距 w0 = pad_even(cs)
+
+attention 的 per-(head,window) 分块          z = head*n_win + win
+    qp[z][wpad][hd]      A(scores)，行距 hd/2 字
+    kt[z][hd][wpad]      B(scores, transb)，行距 wpad/2 字
+    vp[z][wpad][hd_pad]  B(AV, transb)，行距 hd_pad/2 字
+    scores/probs[z][wpad][wpad]，attn_out[z][wpad][hd_pad]
+```
+
+* **哨兵只有一个**：`shaders::TAP_OOB`，由 Rust 注入 WGSL（`audio_im2col()` 里 `format!`）。
+  两边曾经不一致（Rust `0xFFFF_FFFF` / WGSL `0xFFFF`），后果是每个越界 tap 都被当成合法地址。
+* **k 必须按 `GEMM_BK`(=16) 对齐**，不只是 4：k 循环按整 16 宽 tile 走，`k=12` 时最后 4 个 k
+  会读到 operand 行外并把乘积**累加进输出**。`pad_k_tile()` 现在按 BK 对齐。
+* **bias 向量按元素打包**（两个字一组），GEMM 的 bias 变体一次读一对列正好是一个字；
+  `bias_gelu` 的 channel-major 模式要 `select` 取半字（把它当字下标会让通道翻倍）。
+* **每个"形状"一个 `ScaleCfg`**（`u_sc[5]`：c1/c2/c3/ffn/proj）。`queue.write_buffer`
+  在下一次 submit 才生效，共享 uniform 会让同一条命令缓冲里所有 `bias_gelu` 读到最后一次写入的值。
+* **每个 GEMM 一个 `GDims` slot**（`u_gd`，256 B 一槽 + 动态偏移），同上原因。
+* **batch 步长的单位**：`bsa`/`bsb` 是**字**，`bsc` 是**元素**（epilogue 除以 2）。见 bug 21。
+* 每个 round 单独 submit：`u_im` / `u_pm` 携带 per-round 值，同一 submit 里两个 round 会互相盖掉。
+
+---
+
+## 可用探针
+
+| 命令 | 用途 |
+|---|---|
+| `--diag-enc [--mel <f32>]` | 逐级 CPU vs GPU 比对 + 主机 attention oracle（4 个 block，含 operand 比对）+ 逐层比对（需 GPU 塔；`--cpu-enc` 下会报错） |
+| `--compare-enc` | 端到端 embedding 包络 + CPU/GPU 音频塔耗时 |
+| `QWEN3_ENC_PROFILE=1 <transcribe>` | CPU 音频塔相位耗时 |
+| `cargo run --bin conv_real_probe` | 真实权重 conv 几何 + 第一性原理重算 |
+| `cargo run --bin subgroup_bfly_bench` | butterfly A/B（含位一致性） |
+| `cargo run --bin feature_probe` | 本机 wgpu 能力 |
+| `cargo run --bin cpu_gemm_probe` | `gemm` crate 在编码器真实形状上的吞吐 |
+
+不要提交：`align_dump/`、`golden/`、`target/`、`*.bin`。
+
+---
+
+## 上一窗口的 bug 清单（保留备查）
+
+**conv stem（1–10）**
+
+1. `conv_taps` 传了**输出**维度当**输入**维度 → 三级 tap 表与位置数整体错一位
+   （pos1/2/3 = 800/208/56，应为 3200/800/208）。这是「im2col 输出全是 0」的真因之一。
+2. OOB 哨兵两边不一致（见上）。
+3. `k` 未按 BK 对齐（c1 的 k=12）。
+4. **一块缓冲两种布局**：GEMM 按 `[pos][c]` 写、im2col 按 `[c][pos]` 读、缓冲按第三种尺寸分配。
+   现在 `col`（operand）/ `raw`（pre-GELU）/ `act`（激活）各一块，尺寸都由 `ConvLevel` 推。
+5. `bias_gelu` 的覆盖数写成 `n/600`（每 workgroup 只做 512 个元素）→ 15% 的元素从没被处理。
+6. **conv3 的 bias+GELU 整段缺失**（CPU 参考三级都有）。
+7. `bias_gelu` 把偏置按"字"下标索引（通道翻倍）。
+8. erf 近似常数写成 `0.147`（A&S 7.1.26 应为 `0.3275911`）→ GELU 差 ~5%。
+9. `u_sc` 共享 uniform（见上）。
+10. 多 chunk 时 im2col 每个 chunk 都写同一区域（没有 chunk stride），GEMM 也只跑 batch=1。
+
+**permute / 投影（11–14）**
+
+11. permute 的补零分支用 tile 内行号（忘了 `+tok0`）→ 第 2 个 round 把 `packed` 的 91..151 行清零。
+12. PE 加在了 permute 的 `[c·f]` operand 上（宽 7680），而参考是加在 **conv_out 输出**（宽 896）上；
+    同时 `extract` 又加了一次。现在是 `audio_add_pe` 在 conv_out 之后加一次。
+13. `packed` 的行距写成了 `s_pad`（token 数）而不是 `conv_out.k`。
+14. 行覆盖不足（一个 16×16 workgroup 覆盖 256 字，permute 行 3840 字 / add_pe 行 448 字）。
+
+**transformer（15–17）**
+
+15. 两个 attention GEMM 的 grid 用整除（`wlen/128 = 0`）⇒ 它们从来没跑过。
+16. 分数块 stride 混用（每 head 的 `s_pad` vs 每窗口的 `wlen`），A operand 寻址永远对不上。
+17. `out_proj` / `fc2` 用普通 GEMM（`beta=0`）⇒ 残差被丢弃；`qkv/o/fc2/proj2` 的 bias 从未加过。
+
+**诊断自身（18–19，提醒：诊断的错会让 GPU 背锅）**
+
+18. 用 `n_pad` 算读长度、却按 `n` 分配缓冲 → wgpu 报 copy 越界、staging 保持全 0，
+    于是「c1_col 全是 0」是**读失败**，不是 kernel 没写。
+19. 比对时把 CPU 的 `raw` 行距用在 `act` 上（两者布局不同：`raw` 是 `[c][pos]`、
+    `act` 是 `[chunk][c][pos]`）；单 chunk 时两者恰好重合，所以只有多 chunk 才暴露。
+
+---
+
+## 已排除的死路（有数据，别再试）
+
+1. **decode GEMV 用 split-K** —— 会改 butterfly 归约树，不可能 bit-exact。
+2. **Pascal 的 f16 算术** —— GP104 (=P104-100) FP16 吞吐是 FP32 的 **1/64**（NVIDIA 官方）。
+   实测 2 TFLOP/s 已高出 fp16 上限 15×，说明 kernel 本来就在跑 fp32 算术；`pack/unpack` 是运输不是瓶颈。
+3. **prefill 换 TM/TN** —— `gemm_bench` 已扫空，全卡在 ~2.07 TFLOP/s。
+4. **`enable subgroups;`** —— naga 故意不实现（issue #5555）。要用能力位 `Features::SUBGROUP`（本机 YES）。
+5. **`smem_roof.rs` 式合成微基测** —— 会被强度削减，数不可信（已标 INCONCLUSIVE）。
+6. **在本仓库里改 decode kernel 的加法顺序** —— 对齐命根子。
+7. **把「用 GPU 自己的 operand 重算」当唯一 oracle** —— 见 bug 20：全 0 也能全绿。
+   oracle 必须打印输入幅值，或者拿 CPU 的 operand 来比。
+
+本窗口之前已验证并保留的优化：`shaders::gemv` 的 32-lane xor butterfly 用 `subgroupShuffleXor`
+（xor 顺序不变 ⇒ 归约树逐位不变；A/B 1.17–1.18×，0 个输出不同）。

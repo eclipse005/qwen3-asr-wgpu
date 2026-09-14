@@ -495,6 +495,10 @@ fn resample_soxr(mono: &[f32], sr: u32, target_sr: u32) -> anyhow::Result<Vec<f3
     // librosa.resample(..., fix=True) uses ceil, not trunc/round.
     let expected = (mono.len() as f64 * target_sr as f64 / sr as f64).ceil() as usize;
     let q = unsafe { soxr_quality_spec(SOXR_HQ, 0) };
+    // One thread on purpose: soxr's OpenMP path only splits work across
+    // *channels* (`num_channels > 1` in `soxr.c`), and this is mono, so a thread
+    // pool buys nothing.  Measured: 1 vs 8 threads, same 1.3 s and byte-identical
+    // output for a 3-minute 44.1 kHz clip.
     let rt = unsafe { soxr_runtime_spec(1) };
     let mut err: SoxrErrorT = std::ptr::null();
     let soxr = unsafe {

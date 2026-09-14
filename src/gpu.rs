@@ -57,11 +57,16 @@ impl Gpu {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("qwen3-asr-wgpu"),
-                // Timestamp queries gate the per-op step profiler; free when absent.
+                // Timestamp queries gate the per-op step profiler; SUBGROUP lets
+                // `gemv` use warp shuffles instead of shared-memory butterflies.
+                // All three are intersected with what the adapter reports, so an
+                // adapter without them still gets a device (callers branch on
+                // `Gpu::features`).  See `docs/wgpu-best-practices-audit.md`.
                 required_features: features
                     & (wgpu::Features::TIMESTAMP_QUERY
                         | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
-                        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES),
+                        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
+                        | wgpu::Features::SUBGROUP),
                 required_limits: limits.clone(),
                 ..Default::default()
             })

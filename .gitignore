@@ -14,3 +14,6 @@
 
 # probe dump bins (regenerable via examples/exp_probe.rs + src/bin/exp_probe.rs)
 exp_probe/*.bin
+
+# Command Code session state (taste memory, session logs)
+/.commandcode/

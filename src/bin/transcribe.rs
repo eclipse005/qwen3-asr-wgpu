@@ -10,10 +10,15 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
+use qwen3_asr_wgpu::inference::EncoderBackend;
 use qwen3_asr_wgpu::WgpuAsr;
 
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+}
+
+fn flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
 }
 
 fn main() -> Result<()> {
@@ -28,14 +33,45 @@ fn main() -> Result<()> {
     let max_new: usize = arg(&args, "--max-new")
         .and_then(|s| s.parse().ok())
         .unwrap_or(512);
+    // The GPU audio tower is the default: it is bit-aligned with the CPU
+    // reference on all 12 fixture/model pairs and ~2.7× faster on the encoder
+    // phase.  `--cpu-enc` forces the host path back (A/B and regression work);
+    // `--gpu-enc` is still accepted and is the default.  A device that cannot
+    // build the tower falls back to the CPU one on its own, with a reason.
+    let backend = if flag(&args, "--cpu-enc") {
+        EncoderBackend::Cpu
+    } else {
+        EncoderBackend::Gpu
+    };
 
     println!("model: {}", model.display());
     println!("wav:   {}", wav.display());
     let t_load = Instant::now();
-    let mut asr = WgpuAsr::load(&model, adapter.as_deref())?;
-    println!("loaded in {:.1}s", t_load.elapsed().as_secs_f64());
+    let mut asr = WgpuAsr::load_with(&model, adapter.as_deref(), backend)?;
+    println!(
+        "loaded in {:.1}s (audio tower: {})",
+        t_load.elapsed().as_secs_f64(),
+        if asr.gpu_encoder_active() { "gpu" } else { "cpu" }
+    );
 
     let dump = arg(&args, "--dump").map(PathBuf::from);
+    let compare_enc = flag(&args, "--compare-enc");
+    if flag(&args, "--diag-enc") {
+        if let Some(mel_path) = arg(&args, "--mel") {
+            let raw = std::fs::read(&mel_path)?;
+            let mel: Vec<f32> = raw
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let n_mels = 128usize;
+            let n_frames = mel.len() / n_mels;
+            println!("diag from mel: {n_mels}x{n_frames}");
+            asr.diagnose_encoder_mel(&mel, n_mels, n_frames)?;
+        } else {
+            asr.diagnose_encoder(&wav)?;
+        }
+        return Ok(());
+    }
     let t0 = Instant::now();
     let r = if let Some(mel_path) = arg(&args, "--mel") {
         let raw = std::fs::read(&mel_path)?;
@@ -48,7 +84,7 @@ fn main() -> Result<()> {
         anyhow::ensure!(mel.len() % n_mels == 0, "mel length");
         let n_frames = mel.len() / n_mels;
         println!("mel: {n_mels}x{n_frames} from {mel_path}");
-        asr.transcribe_from_mel(&mel, n_mels, n_frames, max_new, dump.as_deref())?
+        asr.transcribe_from_mel_cmp(&mel, n_mels, n_frames, max_new, dump.as_deref(), compare_enc)?
     } else if let Some(embeds_path) = arg(&args, "--embeds") {
         let raw = std::fs::read(&embeds_path)?;
         anyhow::ensure!(raw.len() % 4 == 0, "embeds not f32");
@@ -59,7 +95,7 @@ fn main() -> Result<()> {
         println!("embeds: {} from {embeds_path}", embeds.len());
         asr.transcribe_from_embeds(&embeds, max_new, dump.as_deref())?
     } else {
-        asr.transcribe_with_dump(&wav, max_new, dump.as_deref())?
+        asr.transcribe_file(&wav, max_new, dump.as_deref(), compare_enc)?
     };
     let elapsed = t0.elapsed().as_secs_f64();
     let audio_s = if arg(&args, "--mel").is_none() && arg(&args, "--embeds").is_none() {

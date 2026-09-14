@@ -88,7 +88,7 @@ fn rms_norm(@builtin(workgroup_id) wgid: vec3<u32>,
 ///
 /// `n` must be a multiple of 8 (all model shapes are) so no partial workgroup
 /// exists; `k/8` must be a multiple of 32 so the granule loop divides evenly.
-pub fn gemv(n: usize, k: usize, accum: bool) -> String {
+pub fn gemv(n: usize, k: usize, accum: bool, subgroup: bool) -> String {
     assert_eq!(n % 8, 0, "gemv: rows must be a multiple of 8");
     let kg = k / 8;
     assert_eq!(kg % 32, 0, "gemv: k/8 must be a multiple of 32");
@@ -96,24 +96,20 @@ pub fn gemv(n: usize, k: usize, accum: bool) -> String {
     let tiles = kg / 32;
     assert_eq!(tiles % 4, 0, "gemv: k/256 must be a multiple of 4 (unrolled x4)");
     let accum_lit = if accum { 1u32 } else { 0u32 };
-    format!(
-        "@group(0) @binding(0) var<storage, read>       Wt: array<vec4<u32>>;
-@group(0) @binding(1) var<storage, read>       X:  array<vec4<u32>>;
-@group(0) @binding(2) var<storage, read_write> Y:  array<u32>;
-
-const KG: u32 = {kg}u;
-const TILES: u32 = {tiles}u;
-const ACCUM: u32 = {accum_lit}u;
-
-var<workgroup> bt0: array<f32, 256>;
-var<workgroup> bt1: array<f32, 256>;
-var<workgroup> rows_out: array<f32, 8>;
-
-/// 5-round xor butterfly over the 32 lanes of one warp -- the exact tree
-/// `__shfl_xor_sync(acc, [16,8,4,2,1])` produces, done through shared memory
-/// because WGSL has no portable warp shuffle on this wgpu version.
-fn bfly(v: f32, lid: u32, lane: u32) -> f32 {{
-    let wb = lid & 0xFFFFFFE0u;
+    let subgroup_lit = if subgroup { 1u32 } else { 0u32 };
+    // The two bodies compute the SAME tree; see `bfly`'s doc comment.  The
+    // shared-memory form alternates two buffers so each round's read cannot
+    // observe another lane's write from the same round -- exactly as before.
+    let subgroup_body = if subgroup {
+        "    var t = v;
+    t = t + subgroupShuffleXor(t, 16u);
+    t = t + subgroupShuffleXor(t, 8u);
+    t = t + subgroupShuffleXor(t, 4u);
+    t = t + subgroupShuffleXor(t, 2u);
+    t = t + subgroupShuffleXor(t, 1u);
+    return t;"
+    } else {
+        "    let wb = lid & 0xFFFFFFE0u;
     bt0[lid] = v;
     workgroupBarrier();
     var t = bt0[lid] + bt0[wb + (lane ^ 16u)];
@@ -129,9 +125,42 @@ fn bfly(v: f32, lid: u32, lane: u32) -> f32 {{
     bt0[lid] = t;
     workgroupBarrier();
     t = bt0[lid] + bt0[wb + (lane ^ 1u)];
-    bt1[lid] = t;
-    workgroupBarrier();
-    return t;
+    return t;"
+    };
+    // The shared-memory form still needs its staging buffers declared.
+    let bfly_scratch = if subgroup {
+        ""
+    } else {
+        "var<workgroup> bt0: array<f32, 256>;
+var<workgroup> bt1: array<f32, 256>;
+"
+    };
+    format!(
+        "@group(0) @binding(0) var<storage, read>       Wt: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read>       X:  array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read_write> Y:  array<u32>;
+
+const KG: u32 = {kg}u;
+const TILES: u32 = {tiles}u;
+const ACCUM: u32 = {accum_lit}u;
+const SUBGROUP: u32 = {subgroup_lit}u;
+
+{bfly_scratch}var<workgroup> rows_out: array<f32, 8>;
+
+/// 5-round xor butterfly over the 32 lanes of one warp -- the exact tree
+/// `__shfl_xor_sync(acc, [16,8,4,2,1])` produces.
+///
+/// `SUBGROUP=1` emits `subgroupShuffleXor` (gated on `Features::SUBGROUP`,
+/// measured available on this Pascal/Vulkan stack); `SUBGROUP=0` runs the same
+/// tree through shared memory with 5 `workgroupBarrier()`s.
+///
+/// **Both forms are bit-identical**: the xor order is unchanged and every step
+/// is one f32 add of the same two operands, so the reduction tree -- and every
+/// bit of the result -- is preserved.  A/B measured 1.17-1.18x on both the
+/// 512-row and the 18992-row shape with 0 differing outputs
+/// (`cargo run --release --bin subgroup_bfly_bench`).
+fn bfly(v: f32, lid: u32, lane: u32) -> f32 {{
+{subgroup_body}
 }}
 
 @compute @workgroup_size(256)
@@ -213,6 +242,251 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
         kg = kg,
         tiles = tiles,
         accum_lit = accum_lit,
+        subgroup_lit = subgroup_lit,
+        subgroup_body = subgroup_body,
+        bfly_scratch = bfly_scratch,
+    )
+}
+
+/// [`gemv`] with the RMSNorm that feeds it folded into the workgroup prologue.
+///
+/// The norm is one 1-workgroup dispatch per site in the decode loop and each of
+/// those costs ~30 µs of critical path (measured by ablation: dropping the two
+/// per-layer norms saves 1.1 ms/step at a 180 s context), which is what this
+/// removes.  Two things have to be exactly right or the token stream changes:
+///
+/// * **The reduction tree.**  `rms_norm` runs `bs` (= `block_for_reduction(hs)`,
+///   1024 at both shipped sizes) threads, so each *virtual* thread's partial is
+///   `sum over j = t, t+bs, …` of that word's `x²+y²`, followed by
+///   `red[t] += red[t+s]` for `s = bs/2 … 1`.  Here a 256-thread workgroup
+///   computes `vc = bs/256` virtual partials per thread and folds the first
+///   `log2(vc)` rounds into local adds — the pairing and the add order are the
+///   arithmetic's, not an approximation of it.
+/// * **The value that is consumed.**  `rms_norm` writes the normalized row back
+///   as f16, so the GEMV must read `pack2x16float(x * inv_rms * w)` — not an
+///   f32 intermediate.  The staging loop below writes exactly that expression,
+///   in the same order, into shared memory.
+///
+/// Writes `Y` like `gemv` (same epilogue, same reduction), so the decode
+/// arithmetic is unchanged; only the 1-workgroup dispatches disappear.
+pub fn gemv_norm(
+    n: usize,
+    k: usize,
+    accum: bool,
+    subgroup: bool,
+    last: usize,
+    bs: usize,
+    eps: f32,
+) -> String {
+    assert_eq!(n % 8, 0, "gemv_norm: rows must be a multiple of 8");
+    let kg = k / 8;
+    assert_eq!(kg % 32, 0, "gemv_norm: k/8 must be a multiple of 32");
+    assert_eq!(k % 8, 0, "gemv_norm: k must be a multiple of 8");
+    let tiles = kg / 32;
+    assert_eq!(tiles % 4, 0, "gemv_norm: k/256 must be a multiple of 4");
+    let last2 = last / 2;
+    assert_eq!(last2, kg * 4, "gemv_norm: activation row {last2} words != k/2 {kg_expected}", kg_expected = k / 2);
+    let vc = bs / 256;
+    assert!(
+        [1usize, 2, 4].contains(&vc) && bs == vc * 256,
+        "gemv_norm: block size {bs} is not 256/512/1024"
+    );
+    let accum_lit = u32::from(accum);
+    let subgroup_lit = u32::from(subgroup);
+    // The folded tree rounds, in the reference's pairing.
+    let folded = match vc {
+        1 => "l0".to_string(),
+        2 => "l0 + l1".to_string(),
+        _ => "(l0 + l2) + (l1 + l3)".to_string(),
+    };
+    let mut locals = String::new();
+    for i in 0..vc {
+        if i == 0 {
+            locals.push_str("    var l0 = 0.0;\n");
+        } else {
+            locals.push_str(&format!("    var l{i} = 0.0;\n"));
+        }
+    }
+    let mut sums = String::new();
+    for i in 0..vc {
+        let off = i * 256;
+        sums.push_str(&format!(
+            "    for (var j = lid.x + {off}u; j < LAST2; j = j + BS) {{\n\
+             \x20       let v = unpack2x16float(Xr[j]);\n\
+             \x20       l{i} = l{i} + (v.x * v.x + v.y * v.y);\n\
+             \x20   }}\n"
+        ));
+    }
+    let subgroup_body = if subgroup {
+        "    var t = v;
+    t = t + subgroupShuffleXor(t, 16u);
+    t = t + subgroupShuffleXor(t, 8u);
+    t = t + subgroupShuffleXor(t, 4u);
+    t = t + subgroupShuffleXor(t, 2u);
+    t = t + subgroupShuffleXor(t, 1u);
+    return t;"
+    } else {
+        "    let wb = lid & 0xFFFFFFE0u;
+    bt0[lid] = v;
+    workgroupBarrier();
+    var t = bt0[lid] + bt0[wb + (lane ^ 16u)];
+    bt1[lid] = t;
+    workgroupBarrier();
+    t = bt1[lid] + bt1[wb + (lane ^ 8u)];
+    bt0[lid] = t;
+    workgroupBarrier();
+    t = bt0[lid] + bt0[wb + (lane ^ 4u)];
+    bt1[lid] = t;
+    workgroupBarrier();
+    t = bt1[lid] + bt1[wb + (lane ^ 2u)];
+    bt0[lid] = t;
+    workgroupBarrier();
+    t = bt0[lid] + bt0[wb + (lane ^ 1u)];
+    return t;"
+    };
+    let bfly_scratch = if subgroup {
+        ""
+    } else {
+        "var<workgroup> bt0: array<f32, 256>;
+var<workgroup> bt1: array<f32, 256>;
+"
+    };
+    format!(
+        "@group(0) @binding(0) var<storage, read>       Wt:  array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read>       Xr:  array<u32>;
+@group(0) @binding(2) var<storage, read_write> Y:   array<u32>;
+@group(0) @binding(3) var<storage, read>       NW:  array<u32>;
+
+const KG: u32 = {kg}u;
+const TILES: u32 = {tiles}u;
+const ACCUM: u32 = {accum_lit}u;
+const SUBGROUP: u32 = {subgroup_lit}u;
+const LAST: u32 = {last}u;
+const LAST2: u32 = {last2}u;
+const BS: u32 = {bs}u;
+const EPS: f32 = {eps:?}f;
+
+{bfly_scratch}var<workgroup> rows_out: array<f32, 8>;
+var<workgroup> red: array<f32, 256>;
+/// The normalized row, f16-packed exactly as `rms_norm` would have written it.
+var<workgroup> xs: array<vec4<u32>, {kg}u>;
+
+fn bfly(v: f32, lid: u32, lane: u32) -> f32 {{
+{subgroup_body}
+}}
+
+/// `rms_norm`'s output word `j`: the same two multiplies, in the same order,
+/// so the f16 rounding matches the buffer it used to go through.
+fn norm_word(j: u32, inv_rms: f32) -> u32 {{
+    let xv = unpack2x16float(Xr[j]);
+    let wv = unpack2x16float(NW[j]);
+    return pack2x16float(vec2<f32>(xv.x * inv_rms * wv.x, xv.y * inv_rms * wv.y));
+}}
+
+@compute @workgroup_size(256)
+fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let lane = lid.x & 31u;
+    let warp = lid.x >> 5u;
+    let row = wgid.x * 8u + warp;
+
+    // ── prologue: the RMSNorm this GEMV used to wait for ──
+{locals}{sums}    red[lid.x] = {folded};
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {{
+        if (lid.x < s) {{ red[lid.x] = red[lid.x] + red[lid.x + s]; }}
+        workgroupBarrier();
+    }}
+    let inv_rms = inverseSqrt(red[0] / f32(LAST) + EPS);
+    workgroupBarrier();
+    for (var w4 = lid.x; w4 < KG; w4 = w4 + 256u) {{
+        let b0 = norm_word(4u * w4, inv_rms);
+        let b1 = norm_word(4u * w4 + 1u, inv_rms);
+        let b2 = norm_word(4u * w4 + 2u, inv_rms);
+        let b3 = norm_word(4u * w4 + 3u, inv_rms);
+        xs[w4] = vec4<u32>(b0, b1, b2, b3);
+    }}
+    workgroupBarrier();
+
+    let wbase = row * KG;
+    var a0 = 0.0; var a1 = 0.0; var a2 = 0.0; var a3 = 0.0;
+    // Body identical to `gemv`; only the activation comes from `xs`.
+    var i = lane;
+    for (var g = 0u; g < TILES; g = g + 4u) {{
+        let wv0 = Wt[wbase + i];
+        let xv0 = xs[i];
+        let wv1 = Wt[wbase + i + 32u];
+        let xv1 = xs[i + 32u];
+        let wv2 = Wt[wbase + i + 64u];
+        let xv2 = xs[i + 64u];
+        let wv3 = Wt[wbase + i + 96u];
+        let xv3 = xs[i + 96u];
+        let w00 = unpack2x16float(wv0.x); let x00 = unpack2x16float(xv0.x);
+        let w01 = unpack2x16float(wv0.y); let x01 = unpack2x16float(xv0.y);
+        let w02 = unpack2x16float(wv0.z); let x02 = unpack2x16float(xv0.z);
+        let w03 = unpack2x16float(wv0.w); let x03 = unpack2x16float(xv0.w);
+        a0 = fma(w00.x, x00.x, fma(w00.y, x00.y, a0));
+        a1 = fma(w01.x, x01.x, fma(w01.y, x01.y, a1));
+        a2 = fma(w02.x, x02.x, fma(w02.y, x02.y, a2));
+        a3 = fma(w03.x, x03.x, fma(w03.y, x03.y, a3));
+        let w10 = unpack2x16float(wv1.x); let x10 = unpack2x16float(xv1.x);
+        let w11 = unpack2x16float(wv1.y); let x11 = unpack2x16float(xv1.y);
+        let w12 = unpack2x16float(wv1.z); let x12 = unpack2x16float(xv1.z);
+        let w13 = unpack2x16float(wv1.w); let x13 = unpack2x16float(xv1.w);
+        a0 = fma(w10.x, x10.x, fma(w10.y, x10.y, a0));
+        a1 = fma(w11.x, x11.x, fma(w11.y, x11.y, a1));
+        a2 = fma(w12.x, x12.x, fma(w12.y, x12.y, a2));
+        a3 = fma(w13.x, x13.x, fma(w13.y, x13.y, a3));
+        let w20 = unpack2x16float(wv2.x); let x20 = unpack2x16float(xv2.x);
+        let w21 = unpack2x16float(wv2.y); let x21 = unpack2x16float(xv2.y);
+        let w22 = unpack2x16float(wv2.z); let x22 = unpack2x16float(xv2.z);
+        let w23 = unpack2x16float(wv2.w); let x23 = unpack2x16float(xv2.w);
+        a0 = fma(w20.x, x20.x, fma(w20.y, x20.y, a0));
+        a1 = fma(w21.x, x21.x, fma(w21.y, x21.y, a1));
+        a2 = fma(w22.x, x22.x, fma(w22.y, x22.y, a2));
+        a3 = fma(w23.x, x23.x, fma(w23.y, x23.y, a3));
+        let w30 = unpack2x16float(wv3.x); let x30 = unpack2x16float(xv3.x);
+        let w31 = unpack2x16float(wv3.y); let x31 = unpack2x16float(xv3.y);
+        let w32 = unpack2x16float(wv3.z); let x32 = unpack2x16float(xv3.z);
+        let w33 = unpack2x16float(wv3.w); let x33 = unpack2x16float(xv3.w);
+        a0 = fma(w30.x, x30.x, fma(w30.y, x30.y, a0));
+        a1 = fma(w31.x, x31.x, fma(w31.y, x31.y, a1));
+        a2 = fma(w32.x, x32.x, fma(w32.y, x32.y, a2));
+        a3 = fma(w33.x, x33.x, fma(w33.y, x33.y, a3));
+        i = i + 128u;
+    }}
+    let acc = (a0 + a1) + (a2 + a3);
+    let r = bfly(acc, lid.x, lane);
+    if (lane == 0u) {{ rows_out[warp] = r; }}
+    workgroupBarrier();
+    if (lid.x == 0u) {{
+        let wordbase = (wgid.x * 8u) >> 1u;
+        for (var w = 0u; w < 4u; w = w + 1u) {{
+            var va = rows_out[2u * w];
+            var vb = rows_out[2u * w + 1u];
+            if (ACCUM == 1u) {{
+                let old = unpack2x16float(Y[wordbase + w]);
+                va = va + old.x;
+                vb = vb + old.y;
+            }}
+            Y[wordbase + w] = pack2x16float(vec2<f32>(va, vb));
+        }}
+    }}
+}}
+",
+        kg = kg,
+        tiles = tiles,
+        accum_lit = accum_lit,
+        subgroup_lit = subgroup_lit,
+        last = last,
+        last2 = last2,
+        bs = bs,
+        eps = eps,
+        locals = locals,
+        sums = sums,
+        folded = folded,
+        subgroup_body = subgroup_body,
+        bfly_scratch = bfly_scratch,
     )
 }
 
@@ -606,14 +880,15 @@ pub fn gqa_decode_single(nqh: usize, nkvh: usize, d: usize, bs: usize, cap: usiz
 {EXP_BT}
 struct Cfg {{ cur_len: u32, max_seq: u32, scale: f32, _p: f32 }};
 
-@group(0) @binding(0) var<storage, read>       Q:   array<u32>;
-@group(0) @binding(1) var<storage, read>       KC:  array<u32>;
+@group(0) @binding(0) var<storage, read>       Q4:  array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read>       KC4: array<vec4<u32>>;
 @group(0) @binding(2) var<storage, read>       VC:  array<u32>;
 @group(0) @binding(3) var<storage, read_write> Out: array<u32>;
 @group(0) @binding(4) var<uniform>             cfg: Cfg;
 
 const D: u32 = {d}u;
 const D2: u32 = {d2}u;
+const D4: u32 = {d4}u;
 const BS: u32 = {bs}u;
 const TCH: u32 = {tchunks}u;
 const REP: u32 = {rep}u;
@@ -632,14 +907,28 @@ fn gqa(@builtin(workgroup_id) wgid: vec3<u32>,
     let qbase = qh * D2;
     let kbase = kh * cfg.max_seq * D2;
 
-    // Stage 1 — scores[t] = (Q . K[t]) * scale
+    // Stage 1 — scores[t] = (Q . K[t]) * scale.  Same word order and the same
+    // f32 adds as the scalar form; four words per load instead of one (see the
+    // split kernel's stage 1 for why the transactions matter).
+    let q4 = qbase >> 2u;
     for (var t = lid.x; t < cfg.cur_len; t = t + BS) {{
         var dot = 0.0;
-        let row = kbase + t * D2;
-        for (var j2 = 0u; j2 < D2; j2 = j2 + 1u) {{
-            let qv = unpack2x16float(Q[qbase + j2]);
-            let kv = unpack2x16float(KC[row + j2]);
-            dot = dot + (qv.x * kv.x + qv.y * kv.y);
+        let row4 = (kbase + t * D2) >> 2u;
+        for (var j4 = 0u; j4 < D4; j4 = j4 + 1u) {{
+            let qv = Q4[q4 + j4];
+            let kv = KC4[row4 + j4];
+            let q0 = unpack2x16float(qv.x);
+            let k0 = unpack2x16float(kv.x);
+            dot = dot + (q0.x * k0.x + q0.y * k0.y);
+            let q1 = unpack2x16float(qv.y);
+            let k1 = unpack2x16float(kv.y);
+            dot = dot + (q1.x * k1.x + q1.y * k1.y);
+            let q2 = unpack2x16float(qv.z);
+            let k2 = unpack2x16float(kv.z);
+            dot = dot + (q2.x * k2.x + q2.y * k2.y);
+            let q3 = unpack2x16float(qv.w);
+            let k3 = unpack2x16float(kv.w);
+            dot = dot + (q3.x * k3.x + q3.y * k3.y);
         }}
         sc[t] = dot * cfg.scale;
     }}
@@ -700,6 +989,7 @@ fn gqa(@builtin(workgroup_id) wgid: vec3<u32>,
 }}
 ",
         d2 = d / 2,
+        d4 = d / 8,
         rep = nqh / nkvh,
     )
 }
@@ -758,8 +1048,8 @@ pub fn gqa_decode_split_p1(nqh: usize, nkvh: usize, d: usize, chunk: usize) -> S
 {EXP_BT}
 struct Cfg {{ cur_len: u32, max_seq: u32, scale: f32, n_chunks: u32 }};
 
-@group(0) @binding(0) var<storage, read>       Q:    array<u32>;
-@group(0) @binding(1) var<storage, read>       KC:   array<u32>;
+@group(0) @binding(0) var<storage, read>       Q4:   array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read>       KC4:  array<vec4<u32>>;
 @group(0) @binding(2) var<storage, read>       VC:   array<u32>;
 @group(0) @binding(3) var<storage, read_write> POut: array<f32>;
 @group(0) @binding(4) var<storage, read_write> PMax: array<f32>;
@@ -768,6 +1058,7 @@ struct Cfg {{ cur_len: u32, max_seq: u32, scale: f32, n_chunks: u32 }};
 
 const D: u32 = {d}u;
 const D2: u32 = {d2}u;
+const D4: u32 = {d4}u;
 const CHUNK: u32 = {chunk}u;
 const BS: u32 = 256u;
 const T_SPLIT: u32 = {t_split}u;
@@ -802,13 +1093,33 @@ fn gqa_split_p1(@builtin(workgroup_id) wgid: vec3<u32>,
     let chunk_len = min(CHUNK, cfg.cur_len - t_start);
 
     // Stage 1 — scores[t] = (Q . K[t_start + t]) * scale, chunk-local t
+    //
+    // Read through `vec4<u32>` (four words per instruction, 16 B per lane).
+    // The per-key *word order* is untouched — each loaded word is unpacked and
+    // accumulated in exactly the sequence the scalar loop used — so the f32
+    // reduction is bit-identical.  What changes is the transaction count: the
+    // scalar form had each lane walking its own 256 B row, so every warp load
+    // touched 32 different cache lines (measured ~30 GB/s effective on this
+    // Pascal part, against 289 GB/s for the vectorised GEMV shape).
+    let q4 = qbase >> 2u;
     for (var t = lid.x; t < chunk_len; t = t + BS) {{
         var dot = 0.0;
-        let row = kbase + (t_start + t) * D2;
-        for (var j2 = 0u; j2 < D2; j2 = j2 + 1u) {{
-            let qv = unpack2x16float(Q[qbase + j2]);
-            let kv = unpack2x16float(KC[row + j2]);
-            dot = dot + (qv.x * kv.x + qv.y * kv.y);
+        let row4 = (kbase + (t_start + t) * D2) >> 2u;
+        for (var j4 = 0u; j4 < D4; j4 = j4 + 1u) {{
+            let qv = Q4[q4 + j4];
+            let kv = KC4[row4 + j4];
+            let q0 = unpack2x16float(qv.x);
+            let k0 = unpack2x16float(kv.x);
+            dot = dot + (q0.x * k0.x + q0.y * k0.y);
+            let q1 = unpack2x16float(qv.y);
+            let k1 = unpack2x16float(kv.y);
+            dot = dot + (q1.x * k1.x + q1.y * k1.y);
+            let q2 = unpack2x16float(qv.z);
+            let k2 = unpack2x16float(kv.z);
+            dot = dot + (q2.x * k2.x + q2.y * k2.y);
+            let q3 = unpack2x16float(qv.w);
+            let k3 = unpack2x16float(kv.w);
+            dot = dot + (q3.x * k3.x + q3.y * k3.y);
         }}
         sc[t] = dot * cfg.scale;
     }}
@@ -869,6 +1180,7 @@ fn gqa_split_p1(@builtin(workgroup_id) wgid: vec3<u32>,
 }}
 ",
         d2 = d / 2,
+        d4 = d / 8,
         t_split = t_split,
         rep = nqh / nkvh,
     )
@@ -1027,13 +1339,51 @@ pub fn format_f32(v: f32) -> String {
 /// 8×8 micro-tile), BK=16, software-pipelined (next tile prefetched into
 /// registers during compute).  `beta=1` folds the residual add into the
 /// epilogue (mirrors cuBLAS beta=1: acc + f16(C_in), one rounding).
-/// `ldc` = C row stride in elements; `bsa/bsb/bsc` = per-batch strides with
-/// batch index wgid.z (batch of 1 for plain GEMMs).  `transb=1` reads W as a
-/// [k, n] f16 matrix instead of [n, k] (attention AV: V is [cur, d]).
+/// Tile of [`prefill_gemm`], as a single source of truth.
+///
+/// The kernel's own `BM`/`BN`/`BK` constants and **every caller's** padding and
+/// dispatch grids must agree.  They are exported here so a caller cannot drift:
+/// passing 64 where the kernel uses 128 leaves half of each axis uncomputed and
+/// the result is silently wrong rather than an error (this happened — see
+/// `ROADMAP-wgpu.md`, "GPU audio encoder 调查记录").
+pub const PREFILL_GEMM_TM: usize = 8;
+pub const PREFILL_GEMM_TN: usize = 8;
+pub const PREFILL_GEMM_BK: usize = 16;
+/// M tile width — `m` must be padded to a multiple of this.
+pub const PREFILL_GEMM_BM: usize = 16 * PREFILL_GEMM_TM;
+/// N tile width — `n` (the weight's row count) must be padded to a multiple.
+pub const PREFILL_GEMM_BN: usize = 16 * PREFILL_GEMM_TN;
+
+/// `bias = 1` adds the per-column `Bias` vector (binding 4) to every output
+/// before the `beta` residual — the audio tower's linears ship with biases and
+/// a plain GEMM silently drops them.
+///
+/// `ldc` = C row stride in elements; `bsa`/`bsb` = per-batch operand strides in
+/// **words** (the shader indexes `array<u32>` directly) and `bsc` = the per-batch
+/// C stride in **elements** (the epilogue divides the flat C index by 2).  Batch
+/// index is `wgid.z`; it is 1 for the plain GEMMs, where the units cannot show,
+/// and 28 for the audio tower's attention — where a `bsc` given as words shifted
+/// every block but the first by half a block.  `transb=1` reads W as a [k, n] f16
+/// matrix instead of [n, k] (attention AV: V is [cur, d]).
+///
+/// The tile geometry comes from the `PREFILL_GEMM_*` constants above; callers
+/// must pad `m`, `n` and the operand row strides with those same values.
 pub fn prefill_gemm(transb: bool, beta: bool) -> String {
-    let tm = 8usize;
-    let tn = 8usize;
-    let bk = 16usize;
+    prefill_gemm_impl(transb, beta, false)
+}
+
+/// As [`prefill_gemm`], plus the per-column bias add (binding 4).  A separate
+/// entry point rather than a flag on the shared one: the binding must be
+/// *declared* only for the variants that read it, and a declared-but-unbound
+/// binding fails pipeline validation even when the read is dead code.
+pub fn prefill_gemm_bias(transb: bool, beta: bool) -> String {
+    prefill_gemm_impl(transb, beta, true)
+}
+
+fn prefill_gemm_impl(transb: bool, beta: bool, bias: bool) -> String {
+    let tm = PREFILL_GEMM_TM;
+    let tn = PREFILL_GEMM_TN;
+    let bk = PREFILL_GEMM_BK;
     let bm = 16 * tm;
     let bn = 16 * tn;
     let pad = bk + 1;
@@ -1048,12 +1398,16 @@ pub fn prefill_gemm(transb: bool, beta: bool) -> String {
          @group(0) @binding(2) var<storage, read_write> C: array<u32>;\n\
          @group(0) @binding(3) var<uniform>             gd: GDims;\n",
     );
+    if bias {
+        s.push_str("@group(0) @binding(4) var<storage, read> Bias: array<u32>;\n");
+    }
     s.push_str(&format!(
         "const BM: u32 = {bm}u;\nconst BN: u32 = {bn}u;\nconst BK: u32 = {bk}u;\n\
          const PAD: u32 = {pad}u;\nconst TM: u32 = {tm}u;\nconst TN: u32 = {tn}u;\n\
-         const TRANSB: u32 = {}u;\nconst BETA: u32 = {}u;\n",
+         const TRANSB: u32 = {}u;\nconst BETA: u32 = {}u;\nconst BIAS: u32 = {}u;\n",
         u32::from(transb),
         u32::from(beta),
+        u32::from(bias),
     ));
     s.push_str(&format!("var<workgroup> As: array<f32, {}>;\n", bm * pad));
     s.push_str(&format!("var<workgroup> Bs: array<f32, {}>;\n", bn * pad));
@@ -1231,6 +1585,13 @@ pub fn prefill_gemm(transb: bool, beta: bool) -> String {
             s.push_str(&format!(
                 "var v{i}{e} = vec2<f32>(c{i}{je}, c{i}{jo});\n"
             ));
+            // `Bias` is the per-column vector, two columns per word: the pair a
+            // thread owns is exactly one word, so no half select is needed.
+            if bias {
+                s.push_str(&format!(
+                    "v{i}{e} = v{i}{e} + unpack2x16float(Bias[(n0 + tx * {tn}u + {je}u) / 2u]);\n"
+                ));
+            }
             s.push_str(&format!(
                 "if (BETA == 1u) {{\n  let old = unpack2x16float(C[we{i}_{e}]);\n  v{i}{e} = v{i}{e} + old;\n}}\n"
             ));
@@ -1358,4 +1719,569 @@ fn repeat_kv(@builtin(global_invocation_id) gid: vec3<u32>) {{
 ",
         nrep = nrep,
     )
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  GPU audio encoder
+//
+//  Every kernel here works on the packed-f16 `array<u32>` convention the text
+//  decoder established (`Gpu::storage` pads to 16 B, one `u32` = two halves).
+//  All GEMMs are the decoder's `prefill_gemm` tile, so no accumulation order is
+//  invented twice.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Out-of-plane tap sentinel.  **One definition for both sides** — it is
+/// interpolated into the WGSL below *and* written into the tap table by the
+/// Rust caller, because the two drifting apart is exactly how the gather
+/// silently read every out-of-bounds tap as a valid address (the shader
+/// compared against `0xFFFF` while the table held `0xFFFF_FFFF`).
+pub const TAP_OOB: u32 = 0xFFFF_FFFF;
+
+/// im2col for `conv2d(3×3, stride 2, pad 1)`: a gather driven by a precomputed
+/// tap table, so the inner loop has no divisions and no boundary tests.
+///
+/// **Layout contract** (the one place it is stated; `audio_encoder_gpu.rs`
+/// derives every buffer size and dispatch from the same quantities):
+///
+/// * The operand is `[k_pad][n]` f16 — `n` the position axis — with the row
+///   stride (in words) `n/2`.  That is what `prefill_gemm(transb = true)` reads
+///   as its `B` operand (`W[(k)*(gd.n/2) + n/2]`, half by `n & 1`), and the
+///   GEMM's `n` is the *whole tile*: every chunk's positions laid end to end,
+///   chunk `c` occupying `[c*plane_pad, c*plane_pad + plane)`.
+/// * A thread owns **one `k` and two adjacent positions**, writing one packed
+///   word: `Cols[k*(n/2) + col/2]`.  Consecutive `tx` therefore write
+///   consecutive words of one row — coalesced, with no chance of the
+///   position/k axes aliasing (which is what corrupted this kernel twice).
+/// * `k = ic*9 + kh*3 + kw`, the flattening `weight[c_out, c_in, 3, 3]` uses;
+///   `Taps[p*9 + tap]` is the source offset of that tap inside one input
+///   channel plane, `TAP_OOB` outside it.  The source is
+///   `in_chunk0*in_chunk + ic*in_ic + tap`, which covers both inputs:
+///   the mel (`ic == 0`, `in_chunk` = one chunk's whole image) and a previous
+///   activation (`in_chunk` = one chunk's positions, `in_ic` = the channel
+///   stride, i.e. `n_all` of that level).
+/// * Every element of the operand is **written**: `k >= k_real` (the pad rows
+///   the GEMM's 16-wide k-tile reads), `chunk >= n_chunks` (the chunks a short
+///   final round does not have) and `p >= plane` get an explicit zero, so the
+///   GEMM never accumulates bytes this kernel did not define.
+///
+/// Bindings: 0 = input, 1 = taps, 2 = operand, 3 = `Im2Cfg`.
+pub fn audio_im2col() -> String {
+    format!(
+        "struct Im2Cfg {{ taps: u32, k: u32, k_pad: u32, plane: u32, plane_pad: u32,
+                     n_chunks: u32, n_all: u32, in_chunk: u32, in_ic: u32,
+                     chunk0: u32, bpc: u32, _a: u32 }};
+
+@group(0) @binding(0) var<storage, read>       Input: array<u32>;
+@group(0) @binding(1) var<storage, read>       Taps:  array<u32>;
+@group(0) @binding(2) var<storage, read_write> Cols:  array<u32>;
+@group(0) @binding(3) var<uniform>             cfg:   Im2Cfg;
+
+/// `TAP_OOB` injected from the Rust table builder — see `TAP_OOB`.
+const OOB: u32 = {oob}u;
+
+fn scalar(addr: u32) -> f32 {{
+    let w = unpack2x16float(Input[addr / 2u]);
+    return select(w.x, w.y, (addr & 1u) == 1u);
+}}
+
+@compute @workgroup_size(16, 16)
+fn im2col(@builtin(workgroup_id) wid: vec3<u32>,
+          @builtin(local_invocation_id) lid: vec3<u32>) {{
+    // `bpc` = position-blocks per chunk, so `wid.x` splits into (chunk, block)
+    // with no division inside the element loop; the blocks past `chunks*bpc`
+    // are the tile's tail padding and write zeros.
+    // `wid.x` splits into (chunk, position block) — two *independent* axes.
+    // Treating the position as a single flat counter (`chunk` implicit in the
+    // column) is wrong whenever `plane_pad > plane`: the last block of the last
+    // chunk then looks like padding and gets zeroed.
+    let chunk = wid.x / cfg.bpc;
+    let p = (wid.x % cfg.bpc) * 32u + 2u * lid.x;
+    let col = chunk * cfg.plane_pad + p;
+    let k = wid.y * 16u + lid.y;
+    if (k >= cfg.k_pad || col >= cfg.n_all) {{ return; }}
+    let word = k * (cfg.n_all / 2u) + col / 2u;
+    if (k >= cfg.k || chunk >= cfg.n_chunks || p >= cfg.plane) {{
+        Cols[word] = 0u;
+        return;
+    }}
+    let ic = k / cfg.taps;
+    let base = p * cfg.taps + (k % cfg.taps);
+    let src = (cfg.chunk0 + chunk) * cfg.in_chunk + ic * cfg.in_ic;
+    let a = Taps[base];
+    let b = Taps[base + cfg.taps];
+    var x = vec2<f32>(0.0, 0.0);
+    if (a != OOB) {{ x.x = scalar(src + a); }}
+    if (b != OOB && p + 1u < cfg.plane) {{ x.y = scalar(src + b); }}
+    Cols[word] = pack2x16float(x);
+}}
+",
+        oob = TAP_OOB
+    )
+}
+
+/// `dst[i] = gelu(src[i] + bias[c])` over packed f16, two elements per thread.
+///
+/// `bias` is the per-*channel* vector, padded with zeros to the activation's
+/// channel count and packed as plain f16 (two channels per word) — **not** a
+/// broadcast image, and not one bias per word: reading `Bias[c]` for channel
+/// `c` doubles the channel, which is what made every conv activation wrong.
+/// `cfg.words` is the number of words per channel or per row, and `cfg.mode`
+/// selects `i / words` (channel-major conv activation: one channel per `n_all`
+/// positions, both halves the same channel) or `i % words` (token-major GEMM
+/// output: the halves are adjacent columns of one row).
+/// Broadcasting to an image instead would cost `rows · n_pad` per tensor, which
+/// at `MAX_TOKENS` rows is 117 MB *per FFN layer*.
+///
+/// WGSL has no `erf`, so GELU is the A&S 7.1.26 `tanh`-style rational
+/// approximation with `|ε| ≤ 1.5e-7` — two f32 ulp at the extremes of the
+/// argument range this tower produces, and far below the f16 rounding of the
+/// result.  (The *reference* uses erf-based GELU; matching it to the last f32
+/// bit is pointless when the operand itself is already an f16 GEMM output.)
+///
+/// `n` is the element count; it must be even so a thread's pair never straddles
+/// the channel vector's real/padding boundary.
+///
+/// Bindings: 0 = src, 1 = bias, 2 = dst, 3 = `ScaleCfg { n, words, mode }`.
+pub fn audio_bias_gelu() -> String {
+    "struct ScaleCfg { n: u32, words: u32, mode: u32, _a: u32 };
+
+@group(0) @binding(0) var<storage, read>       Src:  array<u32>;
+@group(0) @binding(1) var<storage, read>       Bias: array<u32>;
+@group(0) @binding(2) var<storage, read_write> Dst:  array<u32>;
+@group(0) @binding(3) var<uniform>             cfg:  ScaleCfg;
+
+const FRAC_1_SQRT_2: f32 = 0.70710678;
+// A&S 7.1.26's `p` = 1/(1 + p|x|).  It was `0.147`, which is not this
+// approximation's constant: the resulting erf was off by ~5 %, i.e. an order of
+// magnitude more than the f16 rounding of the operand it feeds.
+const C_A: f32 = 0.3275911;
+const C_2_SQRT_PI: f32 = 1.128379167;
+
+/// Abramowitz & Stegun 7.1.26: max abs error 1.5e-7.
+fn erf_approx(x: f32) -> f32 {
+    let a = abs(x);
+    let t = 1.0 / (1.0 + C_A * a);
+    let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t
+                   - 0.284496736) * t + 0.254829592) * t * exp(-a * a);
+    return select(-y, y, x >= 0.0);
+}
+
+fn gelu(x: f32) -> f32 {
+    return 0.5 * x * (1.0 + erf_approx(x * FRAC_1_SQRT_2));
+}
+
+@compute @workgroup_size(256)
+fn bias_gelu(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;                       // word index: two f16 per thread
+    if (i * 2u >= cfg.n) { return; }
+    let s = unpack2x16float(Src[i]);
+    var b = vec2<f32>(0.0, 0.0);
+    if (cfg.mode == 1u) {
+        // Channel-major: both halves of the word are the same channel, one
+        // channel per `words` words, and `Bias` is packed two channels per word
+        // — so the channel's element is one *half* of `Bias[c/2]`, not `Bias[c]`.
+        let c = i / cfg.words;
+        let w = unpack2x16float(Bias[c / 2u]);
+        let b0 = select(w.x, w.y, (c & 1u) == 1u);
+        b = vec2<f32>(b0, b0);
+    } else {
+        // Token-major: the halves are adjacent columns of one row, and the
+        // word's own two halves are exactly those two biases.
+        b = unpack2x16float(Bias[i % cfg.words]);
+    }
+    Dst[i] = pack2x16float(vec2<f32>(gelu(s.x + b.x), gelu(s.y + b.y)));
+}
+"
+    .to_string()
+}
+
+/// `LayerNorm` over the last dim, one workgroup per row.  Serial two-pass
+/// reduction in a single lane — bit-identical to the CPU reference's
+/// `mean`, then `var`, then `(x - mean) * inv_std * w + b`, which matters
+/// because the encoder feeds the decoder f16 embeddings that later layers
+/// amplify.
+///
+/// Bindings: 0 = src, 1 = weight, 2 = bias, 3 = `LnCfg { d, eps, ... }`,
+/// 4 = dst.  (Uniform before storage: wgpu requires the uniform last, so `Dst`
+/// takes binding 4 and the uniform stays at 3.)
+pub fn audio_layernorm() -> String {
+    "struct LnCfg { d: u32, eps: f32, _a: u32, _b: u32 };
+
+@group(0) @binding(0) var<storage, read>       Src: array<u32>;
+@group(0) @binding(1) var<storage, read>       Wgt: array<u32>;
+@group(0) @binding(2) var<storage, read>       Bia: array<u32>;
+@group(0) @binding(3) var<uniform>             cfg: LnCfg;
+@group(0) @binding(4) var<storage, read_write> Dst: array<u32>;
+
+fn half_at(v: vec2<f32>, i: u32) -> f32 { return select(v.x, v.y, (i & 1u) == 1u); }
+
+@compute @workgroup_size(1)
+fn layernorm(@builtin(workgroup_id) wid: vec3<u32>) {
+    let d = cfg.d;
+    let base = wid.x * (d / 2u);
+    var mean = 0.0;
+    for (var j: u32 = 0u; j < d; j = j + 1u) {
+        mean = mean + half_at(unpack2x16float(Src[base + j / 2u]), j);
+    }
+    mean = mean / f32(d);
+    var var_ = 0.0;
+    for (var j: u32 = 0u; j < d; j = j + 1u) {
+        let x = half_at(unpack2x16float(Src[base + j / 2u]), j) - mean;
+        var_ = var_ + x * x;
+    }
+    var_ = var_ / f32(d);
+    let inv = 1.0 / sqrt(var_ + cfg.eps);
+    for (var w: u32 = 0u; w < d / 2u; w = w + 1u) {
+        let j = w * 2u;
+        let s = unpack2x16float(Src[base + w]);
+        let g = unpack2x16float(Wgt[w]);
+        let b = unpack2x16float(Bia[w]);
+        Dst[base + w] = pack2x16float(vec2<f32>(
+            (s.x - mean) * inv * g.x + b.x,
+            (s.y - mean) * inv * g.y + b.y,
+        ));
+    }
+}
+"
+    .to_string()
+}
+
+/// Split the fused QKV projection into the attention layouts and add the
+/// sinusoidal positional embedding to Q.
+///
+/// `Qkv` is `[tok, 3·d_model]`; Q/K/V are written as `[tok, nh, hd]` (row
+/// stride `attn_cols`, head-major inside the row), which is exactly the
+/// `[head][tok][hd]` view the attention GEMMs index with a per-head batch
+/// stride.  PE row index is `tok % tpc` (`tpc = feo(n_window*2)`), matching the
+/// CPU reference's `it % t2` broadcast.
+///
+/// Bindings: 0 = qkv, 1 = Q, 2 = K, 3 = V, 5 = `ExCfg`.
+pub fn audio_extract_qkv() -> String {
+    "struct ExCfg { n_tokens: u32, nh: u32, hd: u32, tpc: u32,
+                row_stride: u32, attn_cols: u32, pe_stride: u32, dm: u32 };
+
+@group(0) @binding(0) var<storage, read>       Qkv: array<u32>;
+@group(0) @binding(1) var<storage, read_write> Q:   array<u32>;
+@group(0) @binding(2) var<storage, read_write> K:   array<u32>;
+@group(0) @binding(3) var<storage, read_write> V:   array<u32>;
+@group(0) @binding(5) var<uniform>             cfg: ExCfg;
+
+@compute @workgroup_size(256)
+fn extract(@builtin(global_invocation_id) gid: vec3<u32>) {
+    // gid.x = (token, head) pair; gid.y = word inside the head
+    let nh = cfg.nh;
+    let hd2 = cfg.hd / 2u;
+    let tok = gid.x / nh;
+    if (tok >= cfg.n_tokens) { return; }
+    let head = gid.x - tok * nh;
+    let w = gid.y;
+    if (w >= hd2) { return; }
+
+    let dm2 = cfg.dm / 2u;
+    let row = tok * (dm2 * 3u);
+    let col = head * hd2 + w;
+    let dst = tok * (cfg.attn_cols / 2u) + col;
+
+    // No positional embedding here: the reference adds it to the *conv_out
+    // output* (`audio_add_pe`), and adding it twice is not the reference's math.
+    Q[dst] = Qkv[row + col];
+    K[dst] = Qkv[row + dm2 + col];
+    V[dst] = Qkv[row + dm2 * 2u + col];
+}
+"
+    .to_string()
+}
+
+/// Re-pack the projected Q/K/V into the per-`(head, window)` blocks the two
+/// attention GEMMs read.
+///
+/// The projections come out token-major (`[tok][nh·hd]`), but `prefill_gemm`
+/// fixes both operand row strides from `k`: the `A` row stride is `k/2` words
+/// and a `transb` `B` row stride is `n/2`.  A head's slice of a token row is
+/// `nh·hd` halves wide, so neither GEMM can read it in place — this kernel is
+/// what makes the strides line up:
+///
+/// ```text
+///   qp[z][row][j]   row stride hd/2 words   (scores A, m = token)
+///   kt[z][j][row]   row stride wpad/2 words (scores B, transb, n = token)
+///   vp[z][row][j]   row stride 64 words     (AV B, transb, n = 128 = hd_pad)
+/// ```
+///
+/// `z = head·n_win + win` and rows are `win·wlen + row` in the global token
+/// axis; rows/keys past a short last window are **zeroed**, which is what lets
+/// the softmax mask them by a loop bound.  The `j` axis is padded to `hd_pad`
+/// (= `GEMM_BN`) because the AV GEMM's `n` must be a whole 128-wide tile.
+///
+/// Bindings: 0 = Q, 1 = K, 2 = V, 3 = qp, 4 = kt, 5 = vp, 6 = `WinCfg`.
+pub fn audio_win_pack() -> String {
+    "struct WinCfg { wlen: u32, wpad: u32, hd: u32, n_win: u32, s: u32, acols: u32,
+                pad_n: u32, _a: u32 };
+
+@group(0) @binding(0) var<storage, read>       Q:  array<u32>;
+@group(0) @binding(1) var<storage, read>       K:  array<u32>;
+@group(0) @binding(2) var<storage, read>       V:  array<u32>;
+@group(0) @binding(3) var<storage, read_write> Qp: array<u32>;
+@group(0) @binding(4) var<storage, read_write> Kt: array<u32>;
+@group(0) @binding(5) var<storage, read_write> Vp: array<u32>;
+@group(0) @binding(6) var<uniform>             cfg: WinCfg;
+
+@compute @workgroup_size(16, 16)
+fn win_pack(@builtin(workgroup_id) wid: vec3<u32>,
+            @builtin(local_invocation_id) lid: vec3<u32>) {
+    let z = wid.z;
+    let head = z / cfg.n_win;
+    let win = z - head * cfg.n_win;
+    let rp = wid.x * 16u + lid.x;          // token pair inside the window
+    let jw = wid.y * 16u + lid.y;          // head-dim word (two j values)
+    let hd2 = cfg.hd / 2u;
+    let wpad2 = cfg.wpad / 2u;
+    if (2u * rp >= cfg.wpad) { return; }
+    let valid = min(cfg.wlen, cfg.s - win * cfg.wlen);
+    let j0 = 2u * jw;
+    let in_range = j0 < cfg.hd;            // the head-dim padding stays zero
+
+    var q0 = vec2<f32>(0.0, 0.0);
+    var k0 = q0; var v0 = q0; var q1 = q0; var k1 = q0; var v1 = q0;
+    if (in_range) {
+        let t0 = win * cfg.wlen + 2u * rp;
+        let i0 = t0 * (cfg.acols / 2u) + head * hd2 + jw;
+        if (2u * rp < valid) {
+            q0 = unpack2x16float(Q[i0]);
+            k0 = unpack2x16float(K[i0]);
+            v0 = unpack2x16float(V[i0]);
+        }
+        if (2u * rp + 1u < valid) {
+            let i1 = i0 + cfg.acols / 2u;
+            q1 = unpack2x16float(Q[i1]);
+            k1 = unpack2x16float(K[i1]);
+            v1 = unpack2x16float(V[i1]);
+        }
+    }
+
+    // vp: one row per token, `pad_n/2` words wide, so the head-dim padding is
+    // *inside* the row and these threads write the zeros for it.
+    let vp = z * (cfg.wpad * (cfg.pad_n / 2u)) + (2u * rp) * (cfg.pad_n / 2u) + jw;
+    Vp[vp] = pack2x16float(v0);
+    Vp[vp + cfg.pad_n / 2u] = pack2x16float(v1);
+
+    // qp: the row is exactly `hd2` words with no padding, so a `jw` past the
+    // row must not write at all — `Qp[qp]` would land in the *next* token's row
+    // and this thread's zeros would race the writes of that row's own thread
+    // (whichever workgroup the hardware ran last decided whether a Q row was
+    // real or zero).
+    if (in_range) {
+        let qp = z * (cfg.wpad * hd2) + (2u * rp) * hd2 + jw;
+        Qp[qp] = pack2x16float(q0);
+        Qp[qp + hd2] = pack2x16float(q1);
+    }
+
+    // kt: the transpose — row `j`, and the token pair in one word.  Only the
+    // real `hd` rows exist; the rest would run into the next block.
+    if (in_range) {
+        let kt = z * (cfg.hd * wpad2) + j0 * wpad2 + rp;
+        Kt[kt] = pack2x16float(vec2<f32>(k0.x, k1.x));
+        Kt[kt + wpad2] = pack2x16float(vec2<f32>(k0.y, k1.y));
+    }
+}
+"
+    .to_string()
+}
+
+/// Windowed attention softmax — one thread per `(head, window, token)` row,
+/// serial over the window's valid keys.
+///
+/// Blocks are **dense**: `[z][wpad][wpad]` with `z = head·n_win + win`, so the
+/// batched GEMMs' block strides are all `wpad²/2` words.  (The old layout mixed
+/// a per-head `s_pad` stride with a per-window one, which is why its `A`
+/// operand addressing never lined up.)
+///
+/// The reference runs each window over `min(wlen, s - win·wlen)` tokens, so a
+/// short last window must **not** see the padded keys: the loops run to `valid`
+/// and everything past it is written zero.
+///
+/// Bindings: 0 = scores, 1 = probs, 2 = `SmCfg { s, wlen, wpad, n_win, scale }`.
+pub fn audio_window_softmax() -> String {
+    "struct SmCfg { s: u32, wlen: u32, wpad: u32, n_win: u32, scale: f32,
+                _a: u32, _b: u32, _c: u32 };
+
+@group(0) @binding(0) var<storage, read>       Sc:  array<u32>;
+@group(0) @binding(1) var<storage, read_write> Out: array<u32>;
+@group(0) @binding(2) var<uniform>             cfg: SmCfg;
+
+fn half_at(v: vec2<f32>, i: u32) -> f32 { return select(v.x, v.y, (i & 1u) == 1u); }
+
+@compute @workgroup_size(128)
+fn softmax(@builtin(global_invocation_id) gid: vec3<u32>) {
+    // gid.x = token inside the window; gid.y = head·n_win + window
+    let row = gid.x;
+    if (row >= cfg.wpad) { return; }
+    let z = gid.y;
+    let win = z % cfg.n_win;
+    let valid = min(cfg.wlen, cfg.s - win * cfg.wlen);
+    let base = z * (cfg.wpad * (cfg.wpad / 2u)) + row * (cfg.wpad / 2u);
+    // Keys past `valid` contribute nothing even for a live row, and a row past
+    // `valid` has no consumer at all — write both as zero.
+    if (row >= valid) {
+        for (var w: u32 = 0u; w < cfg.wpad / 2u; w = w + 1u) { Out[base + w] = 0u; }
+        return;
+    }
+
+    var mx = -3.0e38;
+    for (var j: u32 = 0u; j < valid; j = j + 1u) {
+        mx = max(mx, half_at(unpack2x16float(Sc[base + j / 2u]), j) * cfg.scale);
+    }
+    var sum = 0.0;
+    for (var j: u32 = 0u; j < valid; j = j + 1u) {
+        sum = sum + exp(half_at(unpack2x16float(Sc[base + j / 2u]), j) * cfg.scale - mx);
+    }
+    let inv = 1.0 / sum;
+    for (var w: u32 = 0u; w < cfg.wpad / 2u; w = w + 1u) {
+        let j0 = w * 2u;
+        let j1 = j0 + 1u;
+        let v = unpack2x16float(Sc[base + w]);
+        let p0 = select(0.0, exp(v.x * cfg.scale - mx) * inv, j0 < valid);
+        let p1 = select(0.0, exp(v.y * cfg.scale - mx) * inv, j1 < valid);
+        Out[base + w] = pack2x16float(vec2<f32>(p0, p1));
+    }
+}
+"
+    .to_string()
+}
+
+/// Conv-stem epilogue: `h = conv_out + PE`.  `h` is `[tokens, d]` with token
+/// stride `s_pad` (the transformer's operand layout); `dst` is the packed
+/// `[tokens, d]` conv-stem output.  Both get the same value so the embedding
+/// dump and the transformer consume identical bytes.
+///
+/// Bindings: 0 = h, 1 = PE `[tpc, d]`, 2 = dst, 3 = `PeCfg { d, tpc, s_pad }`.
+pub fn audio_add_pe() -> String {
+    "struct PeCfg { d: u32, tpc: u32, s_pad: u32, _a: u32 };
+
+@group(0) @binding(0) var<storage, read>       H:   array<u32>;
+@group(0) @binding(1) var<storage, read>       Pe:  array<u32>;
+@group(0) @binding(2) var<storage, read_write> Dst: array<u32>;
+@group(0) @binding(3) var<uniform>             cfg: PeCfg;
+
+@compute @workgroup_size(16, 16)
+fn add_pe(@builtin(workgroup_id) wid: vec3<u32>,
+          @builtin(local_invocation_id) lid: vec3<u32>) {
+    // 256 words per workgroup, so the y grid has to walk the row: `d_model/2`
+    // is 448 words and the old single-workgroup row left 192 of them unwritten.
+    let w = wid.y * 256u + lid.x + 16u * lid.y;
+    let d2 = cfg.d / 2u;
+    if (w >= d2) { return; }
+    let tok = wid.x;
+    let v = unpack2x16float(H[tok * (cfg.s_pad / 2u) + w])
+          + unpack2x16float(Pe[(tok % cfg.tpc) * d2 + w]);
+    let packed = pack2x16float(v);
+    Dst[tok * (cfg.s_pad / 2u) + w] = packed;
+}
+"
+    .to_string()
+}
+
+/// Gather the conv3 activation `[c][pos]` into the `conv_out` operand
+/// `[tok, c·f]`.
+///
+/// `audio_conv`'s GEMM writes its `C` as `[m][n]` with `m` the **channel** and
+/// `n` the flattened position, so a chunk's plane for channel `c` starts at
+/// `c*n_all` and holds `plane_pad` positions per chunk.  Position
+/// `p = f*t3 + ti` (`ti` fastest — the GEMM's tile wrote `(h_out, w_out)` in
+/// row-major order), and the chunk's token `ti` is the `t3`-th part of the
+/// token index.  A packed row element `j = c*f_dim + f` therefore reads
+///
+/// ```text
+///   src = c*n_all + chunk*plane_pad + f*t3 + ti
+/// ```
+///
+/// The positional embedding is **not** added here: the reference adds it to the
+/// `conv_out` *output* (`d_model` wide), not to this `c·f` operand — see
+/// [`audio_add_pe`].
+///
+/// Bindings: 0 = c3, 1 = packed, 2 = `PmCfg`.
+pub fn audio_permute_pe() -> String {
+    "struct PmCfg { c: u32, f: u32, t3: u32, s_pad: u32, n_all: u32, plane_pad: u32,
+                tok0: u32, n_tokens: u32 };
+
+@group(0) @binding(0) var<storage, read>       C3:  array<u32>;
+@group(0) @binding(1) var<storage, read_write> Dst: array<u32>;
+@group(0) @binding(2) var<uniform>             cfg: PmCfg;
+
+fn half_at(addr: u32) -> f32 {
+    let v = unpack2x16float(C3[addr / 2u]);
+    return select(v.x, v.y, (addr & 1u) == 1u);
+}
+
+@compute @workgroup_size(16, 16)
+fn permute_pe(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_id) lid: vec3<u32>) {
+    let cf = cfg.c * cfg.f;
+    // 256 words per workgroup, so `wid.y` walks the row: `c·f/2` is 3840 words
+    // and a single block would leave all but the first 256 unwritten.
+    let w = wid.y * 256u + lid.x + 16u * lid.y;
+    if (w * 2u >= cf) { return; }
+    // `wid.x` is the token inside this tile, spanning `plane_pad / t3` chunks;
+    // the grid is padded to a GEMM `m` tile so the rows past the clip — which
+    // the `conv_out` GEMM still reads — are written zero rather than left as
+    // whatever the allocator handed us.
+    let tok = wid.x;
+    if (cfg.tok0 + tok >= cfg.n_tokens) {
+        // The destination row is the *global* token: using the tile-local `tok`
+        // zeroed the wrong rows whenever a round did not start at token 0 (it
+        // wiped the previous round's tail and its own head).
+        Dst[(cfg.tok0 + tok) * (cfg.s_pad / 2u) + w] = 0u;
+        return;
+    }
+    let chunk = (cfg.tok0 + tok) / cfg.t3 - cfg.tok0 / cfg.t3;
+    let ti = (cfg.tok0 + tok) % cfg.t3;
+    var x = vec2<f32>(0.0, 0.0);
+    for (var e: u32 = 0u; e < 2u; e = e + 1u) {
+        let j = w * 2u + e;
+        let c = j / cfg.f;
+        let f = j - c * cfg.f;
+        let src = c * cfg.n_all + chunk * cfg.plane_pad + f * cfg.t3 + ti;
+        let v = half_at(src);
+        if (e == 0u) { x.x = v; } else { x.y = v; }
+    }
+    Dst[(cfg.tok0 + tok) * (cfg.s_pad / 2u) + w] = pack2x16float(x);
+}
+"
+    .to_string()
+}
+
+/// Flatten the per-`(head, window)` attention output into the token-major
+/// `[tok, nh·hd]` operand `out_proj` wants.
+///
+/// The AV GEMM writes `[z][row][hd_pad]` blocks (`z = head·n_win + win`); a
+/// destination word covers two adjacent `j`, which stay inside one head, so the
+/// copy is word-for-word — only the two index maps (row → global token, head →
+/// block) change.
+///
+/// Bindings: 0 = src blocks, 1 = dst, 2 = `CpCfg { cols, wlen, wpad, hd, n_win,
+/// rows, ... }`.
+pub fn audio_attn_flat() -> String {
+    "struct CpCfg { cols: u32, wlen: u32, wpad: u32, hd: u32, n_win: u32, rows: u32,
+                _a: u32, _b: u32 };
+
+@group(0) @binding(0) var<storage, read>       Src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> Dst: array<u32>;
+@group(0) @binding(2) var<uniform>             cfg: CpCfg;
+
+@compute @workgroup_size(256)
+fn attn_flat(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;                       // word index into the destination
+    let cols2 = cfg.cols / 2u;
+    if (i >= cfg.rows * cols2) { return; }
+    let tok = i / cols2;
+    let w = i - tok * cols2;
+    let win = tok / cfg.wlen;
+    let row = tok - win * cfg.wlen;
+    let hd2 = cfg.hd / 2u;
+    let head = w / hd2;
+    let z = head * cfg.n_win + win;
+    let src = z * (cfg.wpad * 64u) + row * 64u + (w - head * hd2);
+    Dst[i] = Src[src];
+}
+"
+    .to_string()
 }

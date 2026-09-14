@@ -12,6 +12,7 @@
 //! still being ported. See `ROADMAP-wgpu.md`.
 
 pub mod audio_encoder;
+pub mod audio_encoder_gpu;
 pub mod config;
 pub mod cpu_tensor;
 pub mod decoder;

@@ -35,6 +35,10 @@ pub struct AudioEncoderConfig {
     pub encoder_ffn_dim: usize,
     #[serde(default = "default_num_mel_bins")]
     pub num_mel_bins: usize,
+    /// Conv-stem output width = `d_model` of the `conv_out` projection input.
+    /// Present in `config.json` (`downsample_hidden_size`, 480 for both sizes).
+    #[serde(default = "default_downsample_hidden_size")]
+    pub downsample_hidden_size: usize,
     #[serde(default = "default_max_source_positions")]
     pub max_source_positions: usize,
     #[serde(default = "default_n_window")]
@@ -52,6 +56,7 @@ fn default_encoder_layers() -> usize { 18 }
 fn default_encoder_attention_heads() -> usize { 14 }
 fn default_encoder_ffn_dim() -> usize { 3584 }
 fn default_num_mel_bins() -> usize { 128 }
+fn default_downsample_hidden_size() -> usize { 480 }
 fn default_max_source_positions() -> usize { 1500 }
 fn default_n_window() -> usize { 50 }
 fn default_n_window_infer() -> usize { 800 }

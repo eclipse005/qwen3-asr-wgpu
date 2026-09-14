@@ -88,6 +88,41 @@ impl RawTensor {
     pub fn as_f32(&self) -> Result<(Vec<f32>, Vec<usize>)> {
         Ok((self.to_f32_vec()?, self.shape.clone()))
     }
+
+    /// Append row `row` of a `[*, cols]` tensor to `out` as little-endian f16 —
+    /// the byte layout the decoder's `prefill` takes.
+    ///
+    /// An f16 tensor is a straight `memcpy` out of the mapped file; any other
+    /// dtype is converted element-wise.  Use this for token lookups instead of
+    /// [`Self::to_f16_vec`], which materialises the *whole* table on every call:
+    /// `embed_tokens` is 155 M elements at 0.6 B and twice that at 1.7 B, i.e.
+    /// ~0.3 s / ~0.6 s of allocation and conversion per transcription.
+    pub fn append_f16_row_le(&self, row: usize, cols: usize, out: &mut Vec<u8>) -> Result<()> {
+        anyhow::ensure!(self.shape.len() >= 1 && cols == *self.shape.last().unwrap(), "row cols {cols} != {:?}", self.shape);
+        let stride = cols * 2;
+        let start = row
+            .checked_mul(stride)
+            .filter(|s| s + stride <= self.data.len())
+            .ok_or_else(|| anyhow!("row {row} of {:?} is out of range", self.shape))?;
+        match self.dtype {
+            Dtype::F16 => out.extend_from_slice(&self.data[start..start + stride]),
+            Dtype::BF16 => {
+                for c in self.data[start..start + stride].chunks_exact(2) {
+                    let b = u16::from_ne_bytes([c[0], c[1]]);
+                    let h = half::f16::from_f32(f32::from_bits((b as u32) << 16));
+                    out.extend_from_slice(&h.to_le_bytes());
+                }
+            }
+            Dtype::F32 => {
+                for c in self.data[start..].chunks_exact(4).take(cols) {
+                    let h = half::f16::from_f32(f32::from_ne_bytes([c[0], c[1], c[2], c[3]]));
+                    out.extend_from_slice(&h.to_le_bytes());
+                }
+            }
+            other => anyhow::bail!("unsupported dtype {other:?}"),
+        }
+        Ok(())
+    }
 }
 
 /// mmap every safetensors shard, zero-copy, mirroring `weights.rs`.

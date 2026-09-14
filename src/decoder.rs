@@ -248,6 +248,9 @@ struct Layer {
     bg_gemv_o: wgpu::BindGroup,
     bg_gemv_gu: wgpu::BindGroup,
     bg_gemv_dp: wgpu::BindGroup,
+    /// The two GEMVs whose input is a layer norm, with the norm folded in.
+    bg_gemv_qkv_norm: wgpu::BindGroup,
+    bg_gemv_gu_norm: wgpu::BindGroup,
     bg_rms1: wgpu::BindGroup,
     bg_rms2: wgpu::BindGroup,
     bg_extract: wgpu::BindGroup,
@@ -262,6 +265,11 @@ struct Pipes {
     gemv_gu: wgpu::ComputePipeline,
     gemv_dp: wgpu::ComputePipeline,
     gemv_lm: wgpu::ComputePipeline,
+    /// `gemv` + the RMSNorm that produces its input, for the three sites where
+    /// the activation is a normed row (see [`shaders::gemv_norm`]).
+    gemv_qkv_norm: wgpu::ComputePipeline,
+    gemv_gu_norm: wgpu::ComputePipeline,
+    gemv_lm_norm: wgpu::ComputePipeline,
     rms_norm: wgpu::ComputePipeline,
     extract: wgpu::ComputePipeline,
     gqa256: wgpu::ComputePipeline,
@@ -310,6 +318,8 @@ pub struct WgpuTextDecoder {
 
     bg_final_rms: wgpu::BindGroup,
     bg_gemv_lm: wgpu::BindGroup,
+    /// Final norm folded into the LM head's GEMV (decode path).
+    bg_gemv_lm_norm: wgpu::BindGroup,
     bg_silu: wgpu::BindGroup,
     bg_argmax: wgpu::BindGroup,
     bg_embed: wgpu::BindGroup,
@@ -379,12 +389,37 @@ impl WgpuTextDecoder {
 
         // ── pipelines ─────────────────────────────────────────────────────
         let rms_bs = block_for_reduction(hs) as usize;
+        // `gemv`'s 32-lane xor butterfly can use `subgroupShuffleXor` instead of
+        // 5 shared-memory rounds.  Both produce the SAME reduction tree, so the
+        // results are bit-identical (A/B: 1.17-1.18x, 0 differing outputs on
+        // 18992 rows) — see `shaders::gemv` and `docs/wgpu-best-practices-audit.md`.
+        let subgroup = gpu.features.contains(wgpu::Features::SUBGROUP);
         let pipes = Pipes {
-            gemv_qkv: build("gemv_qkv", &shaders::gemv(cfg.fused_qkv_cols(), hs, false), "gemv", None)?,
-            gemv_o: build("gemv_o", &shaders::gemv(hs, q_dim, true), "gemv", None)?,
-            gemv_gu: build("gemv_gu", &shaders::gemv(2 * inter, hs, false), "gemv", None)?,
-            gemv_dp: build("gemv_dp", &shaders::gemv(hs, inter, true), "gemv", None)?,
-            gemv_lm: build("gemv_lm", &shaders::gemv(vocab, hs, false), "gemv", None)?,
+            gemv_qkv: build("gemv_qkv", &shaders::gemv(cfg.fused_qkv_cols(), hs, false, subgroup), "gemv", None)?,
+            gemv_o: build("gemv_o", &shaders::gemv(hs, q_dim, true, subgroup), "gemv", None)?,
+            gemv_gu: build("gemv_gu", &shaders::gemv(2 * inter, hs, false, subgroup), "gemv", None)?,
+            gemv_dp: build("gemv_dp", &shaders::gemv(hs, inter, true, subgroup), "gemv", None)?,
+            gemv_lm: build("gemv_lm", &shaders::gemv(vocab, hs, false, subgroup), "gemv", None)?,
+            // The three sites whose activation is a normed row: the norm is folded
+            // into the GEMV prologue instead of being its own 1-workgroup dispatch.
+            gemv_qkv_norm: build(
+                "gemv_qkv_norm",
+                &shaders::gemv_norm(cfg.fused_qkv_cols(), hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
+                "gemv",
+                None,
+            )?,
+            gemv_gu_norm: build(
+                "gemv_gu_norm",
+                &shaders::gemv_norm(2 * inter, hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
+                "gemv",
+                None,
+            )?,
+            gemv_lm_norm: build(
+                "gemv_lm_norm",
+                &shaders::gemv_norm(vocab, hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
+                "gemv",
+                None,
+            )?,
             rms_norm: build("rms_norm", &shaders::rms_norm(hs, rms_bs), "rms_norm", None)?,
             extract: build("qkv_extract", &shaders::qkv_extract(nqh, nkvh, hd), "qkv_extract", None)?,
             gqa256: build("gqa256", &shaders::gqa_decode_single(nqh, nkvh, hd, 256, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl))?,
@@ -494,6 +529,25 @@ impl WgpuTextDecoder {
                 ],
             })
         };
+        // `gemv_norm`: weights, raw activation, output, and the layer-norm weight
+        // the prologue applies.
+        let gemv_norm_bg = |pipe: &wgpu::ComputePipeline,
+                            wt: &wgpu::Buffer,
+                            x: &wgpu::Buffer,
+                            y: &wgpu::Buffer,
+                            nw: &wgpu::Buffer|
+         -> wgpu::BindGroup {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gemv_norm"),
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wt.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: y.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: nw.as_entire_binding() },
+                ],
+            })
+        };
         let rms_bg = |x: &wgpu::Buffer, wt: &wgpu::Buffer, out: &wgpu::Buffer| -> wgpu::BindGroup {
             gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("rms"),
@@ -531,8 +585,10 @@ impl WgpuTextDecoder {
             let v_cache = gpu.storage("v_cache", (kv_words * 4) as u64);
 
             let bg_gemv_qkv = gemv_bg(&pipes.gemv_qkv, &qkv, &scratch.norm1, &scratch.qkv);
+            let bg_gemv_qkv_norm = gemv_norm_bg(&pipes.gemv_qkv_norm, &qkv, &scratch.h, &scratch.qkv, &iln);
             let bg_gemv_o = gemv_bg(&pipes.gemv_o, &o, &scratch.attn_out, &scratch.h);
             let bg_gemv_gu = gemv_bg(&pipes.gemv_gu, &gu, &scratch.norm2, &scratch.gate_up);
+            let bg_gemv_gu_norm = gemv_norm_bg(&pipes.gemv_gu_norm, &gu, &scratch.h, &scratch.gate_up, &pln);
             let bg_gemv_dp = gemv_bg(&pipes.gemv_dp, &dp, &scratch.activated, &scratch.h);
             let bg_rms1 = rms_bg(&scratch.h, &iln, &scratch.norm1);
             let bg_rms2 = rms_bg(&scratch.h, &pln, &scratch.norm2);
@@ -603,8 +659,10 @@ impl WgpuTextDecoder {
                 gu_w: gu,
                 dp_w: dp,
                 bg_gemv_qkv,
+                bg_gemv_qkv_norm,
                 bg_gemv_o,
                 bg_gemv_gu,
+                bg_gemv_gu_norm,
                 bg_gemv_dp,
                 bg_rms1,
                 bg_rms2,
@@ -617,6 +675,7 @@ impl WgpuTextDecoder {
 
         let bg_final_rms = rms_bg(&scratch.h, &norm_buf, &scratch.final_norm);
         let bg_gemv_lm = gemv_bg(&pipes.gemv_lm, &embed_table, &scratch.final_norm, &scratch.logits);
+        let bg_gemv_lm_norm = gemv_norm_bg(&pipes.gemv_lm_norm, &embed_table, &scratch.h, &scratch.logits, &norm_buf);
         let bg_silu = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("silu"),
             layout: &pipes.silu.get_bind_group_layout(0),
@@ -659,6 +718,7 @@ impl WgpuTextDecoder {
             scratch,
             bg_final_rms,
             bg_gemv_lm,
+            bg_gemv_lm_norm,
             bg_silu,
             bg_argmax,
             bg_embed,
@@ -676,6 +736,11 @@ impl WgpuTextDecoder {
     }
 
     // ── KV cache / RoPE plumbing ─────────────────────────────────────────
+
+    /// The device the decoder lives on — shared with the GPU audio tower.
+    pub fn gpu(&self) -> &Gpu {
+        &self.gpu
+    }
 
     pub fn k_cache(&self, layer: usize) -> &wgpu::Buffer {
         &self.layers[layer].k_cache
@@ -765,12 +830,10 @@ impl WgpuTextDecoder {
         cp.dispatch_workgroups(1, 1, 1);
 
         for l in &self.layers {
-            cp.set_pipeline(&self.pipes.rms_norm);
-            cp.set_bind_group(0, &l.bg_rms1, &[]);
-            cp.dispatch_workgroups(1, 1, 1);
-
-            cp.set_pipeline(&self.pipes.gemv_qkv);
-            cp.set_bind_group(0, &l.bg_gemv_qkv, &[]);
+            // No standalone `rms_norm` here: `gemv_qkv_norm` / `gemv_gu_norm` carry
+            // the norm in their prologue (bit-identical tree, see `shaders::gemv_norm`).
+            cp.set_pipeline(&self.pipes.gemv_qkv_norm);
+            cp.set_bind_group(0, &l.bg_gemv_qkv_norm, &[]);
             cp.dispatch_workgroups(gemv_grid(cfg.fused_qkv_cols()), 1, 1);
 
             cp.set_pipeline(&self.pipes.extract);
@@ -783,12 +846,8 @@ impl WgpuTextDecoder {
             cp.set_bind_group(0, &l.bg_gemv_o, &[]);
             cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
 
-            cp.set_pipeline(&self.pipes.rms_norm);
-            cp.set_bind_group(0, &l.bg_rms2, &[]);
-            cp.dispatch_workgroups(1, 1, 1);
-
-            cp.set_pipeline(&self.pipes.gemv_gu);
-            cp.set_bind_group(0, &l.bg_gemv_gu, &[]);
+            cp.set_pipeline(&self.pipes.gemv_gu_norm);
+            cp.set_bind_group(0, &l.bg_gemv_gu_norm, &[]);
             cp.dispatch_workgroups(gemv_grid(2 * cfg.intermediate_size), 1, 1);
 
             cp.set_pipeline(&self.pipes.silu);
@@ -800,12 +859,8 @@ impl WgpuTextDecoder {
             cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
         }
 
-        cp.set_pipeline(&self.pipes.rms_norm);
-        cp.set_bind_group(0, &self.bg_final_rms, &[]);
-        cp.dispatch_workgroups(1, 1, 1);
-
-        cp.set_pipeline(&self.pipes.gemv_lm);
-        cp.set_bind_group(0, &self.bg_gemv_lm, &[]);
+        cp.set_pipeline(&self.pipes.gemv_lm_norm);
+        cp.set_bind_group(0, &self.bg_gemv_lm_norm, &[]);
         cp.dispatch_workgroups(gemv_grid(cfg.vocab_size), 1, 1);
 
         cp.set_pipeline(&self.pipes.argmax);

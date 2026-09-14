@@ -203,7 +203,10 @@ fn main() -> Result<()> {
         };
 
         // production kernel
-        let src = shaders::gemv(rows, cols, false);
+        // production kernel, in BOTH reduction flavours: the subgroup form must
+        // be bit-identical and is the one the decoder now uses when the adapter
+        // exposes `Features::SUBGROUP` (see `subgroup_bfly_bench`).
+        let src = shaders::gemv(rows, cols, false, false);
         let pipe_p = gpu.pipeline("prod", &src, "gemv", None)?;
         let bg_p = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("prod"),
@@ -255,3 +258,4 @@ fn main() -> Result<()> {
     );
     Ok(())
 }
+
