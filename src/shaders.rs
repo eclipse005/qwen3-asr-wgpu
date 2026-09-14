@@ -1392,7 +1392,7 @@ pub const PREFILL_GEMM_BN: usize = 16 * PREFILL_GEMM_TN;
 /// The tile geometry comes from the `PREFILL_GEMM_*` constants above; callers
 /// must pad `m`, `n` and the operand row strides with those same values.
 pub fn prefill_gemm(transb: bool, beta: bool) -> String {
-    prefill_gemm_impl(transb, beta, false, false)
+    prefill_gemm_impl(transb, beta, false, false, false)
 }
 
 /// [`prefill_gemm`] with the causal-attention tile skip: a tile wholly above the
@@ -1400,7 +1400,15 @@ pub fn prefill_gemm(transb: bool, beta: bool) -> String {
 /// never reads columns past `row + 1`, so skipping it is bit-identical — it just
 /// stops writing ~half of the `s × cur` score matrix.
 pub fn prefill_gemm_causal() -> String {
-    prefill_gemm_impl(false, false, false, true)
+    prefill_gemm_impl(false, false, false, true, false)
+}
+
+/// [`prefill_gemm_bias`]-style AV form (`transb = 1`) with the causal *k* bound:
+/// the A operand is the softmax output, whose columns past `row + 1` are exactly
+/// zero, so a row block only has to sweep `k < m0 + BM`.  Skipping exact zeros
+/// from a sum is bit-identical.
+pub fn prefill_gemm_causal_av() -> String {
+    prefill_gemm_impl(true, false, false, false, true)
 }
 
 /// As [`prefill_gemm`], plus the per-column bias add (binding 4).  A separate
@@ -1408,10 +1416,16 @@ pub fn prefill_gemm_causal() -> String {
 /// *declared* only for the variants that read it, and a declared-but-unbound
 /// binding fails pipeline validation even when the read is dead code.
 pub fn prefill_gemm_bias(transb: bool, beta: bool) -> String {
-    prefill_gemm_impl(transb, beta, true, false)
+    prefill_gemm_impl(transb, beta, true, false, false)
 }
 
-fn prefill_gemm_impl(transb: bool, beta: bool, bias: bool, causal_skip: bool) -> String {
+fn prefill_gemm_impl(
+    transb: bool,
+    beta: bool,
+    bias: bool,
+    causal_skip: bool,
+    causal_k: bool,
+) -> String {
     let tm = PREFILL_GEMM_TM;
     let tn = PREFILL_GEMM_TN;
     let bk = PREFILL_GEMM_BK;
@@ -1436,11 +1450,12 @@ fn prefill_gemm_impl(transb: bool, beta: bool, bias: bool, causal_skip: bool) ->
         "const BM: u32 = {bm}u;\nconst BN: u32 = {bn}u;\nconst BK: u32 = {bk}u;\n\
          const PAD: u32 = {pad}u;\nconst TM: u32 = {tm}u;\nconst TN: u32 = {tn}u;\n\
          const TRANSB: u32 = {}u;\nconst BETA: u32 = {}u;\nconst BIAS: u32 = {}u;\n\
-         const CAUSAL: u32 = {}u;\n",
+         const CAUSAL: u32 = {}u;\nconst CAUSAL_K: u32 = {}u;\n",
         u32::from(transb),
         u32::from(beta),
         u32::from(bias),
         u32::from(causal_skip),
+        u32::from(causal_k),
     ));
     s.push_str(&format!("var<workgroup> As: array<f32, {}>;\n", bm * pad));
     s.push_str(&format!("var<workgroup> Bs: array<f32, {}>;\n", bn * pad));
@@ -1463,7 +1478,8 @@ fn prefill_gemm_impl(transb: bool, beta: bool, bias: bool, causal_skip: bool) ->
          let m0 = wid.y * BM;\n let n0 = wid.x * BN;\n let kk = gd.k / 2u;\n\
          let abase = wid.z * gd.bsa;\n let wb = wid.z * gd.bsb;\n\
          let cbase = wid.z * gd.bsc;\n\
-         if (CAUSAL == 1u && n0 > m0 + BM - 1u) { return; }\n",
+         if (CAUSAL == 1u && n0 > m0 + BM - 1u) { return; }\n\
+         let klim = select(gd.k, min(gd.k, m0 + BM), CAUSAL_K == 1u);\n",
     );
 
     for i in 0..tm {
@@ -1589,16 +1605,16 @@ fn prefill_gemm_impl(transb: bool, beta: bool, bias: bool, causal_skip: bool) ->
     s.push_str(&load_as("k0"));
     s.push_str(&load_bs("k0"));
     s.push_str(" workgroupBarrier();\n");
-    s.push_str(" loop {\n  if (k0 >= gd.k) { break; }\n");
+    s.push_str(" loop {\n  if (k0 >= klim) { break; }\n");
     s.push_str("  let kn = k0 + BK;\n");
     s.push_str(&pf_decl());
-    s.push_str("  if (kn < gd.k) {\n");
+    s.push_str("  if (kn < klim) {\n");
     s.push_str(&pf_as("kn"));
     s.push_str(&pf_bs("kn"));
     s.push_str("  }\n");
     s.push_str(&compute());
     s.push_str("  workgroupBarrier();\n");
-    s.push_str("  if (kn < gd.k) {\n");
+    s.push_str("  if (kn < klim) {\n");
     s.push_str(&store_as());
     s.push_str(&store_bs());
     s.push_str("  }\n  workgroupBarrier();\n");

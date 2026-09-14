@@ -303,6 +303,8 @@ struct Pipes {
     /// Plain GEMM with the causal score-tile skip (scores only, never read above
     /// the diagonal — see `shaders::prefill_gemm_causal`).
     gemm_causal: wgpu::ComputePipeline,
+    /// AV GEMM with the causal k bound (skips the softmax's exact zeros).
+    gemm_av_causal: wgpu::ComputePipeline,
     /// Causal softmax, one pipeline per block size (reduction tree depends on it).
     softmax: std::collections::HashMap<usize, wgpu::ComputePipeline>,
     repeat_kv: wgpu::ComputePipeline,
@@ -457,6 +459,7 @@ impl WgpuTextDecoder {
             gemm_acc: build("gemm_acc", &shaders::prefill_gemm(false, true), "gemm", Some(&gemm_pl))?,
             gemm_av: build("gemm_av", &shaders::prefill_gemm(true, false), "gemm", Some(&gemm_pl))?,
             gemm_causal: build("gemm_causal", &shaders::prefill_gemm_causal(), "gemm", Some(&gemm_pl))?,
+            gemm_av_causal: build("gemm_av_causal", &shaders::prefill_gemm_causal_av(), "gemm", Some(&gemm_pl))?,
             softmax: std::collections::HashMap::from([
                 (32, build("softmax32", &shaders::softmax_causal(32), "softmax", Some(&sm_pl))?),
                 (64, build("softmax64", &shaders::softmax_causal(64), "softmax", Some(&sm_pl))?),
@@ -1524,7 +1527,7 @@ impl WgpuTextDecoder {
 
             // 7. AV GEMM, batched: attn_flat[s, nqh*hd] = attn × V  (V is [cur, hd])
             gemm!(
-                &mut cp, &self.pipes.gemm_av, &attn, &v_rep, &attn_flat,
+                &mut cp, &self.pipes.gemm_av_causal, &attn, &v_rep, &attn_flat,
                 s, hd, cur16, nqh * hd, mp * cur16 / 2, np * hd / 2, hd,
                 1, (mp / 128) as u32, nqh as u32
             );
