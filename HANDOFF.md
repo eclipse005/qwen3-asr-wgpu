@@ -436,6 +436,39 @@ whisper `BasicTextNormalizer`。已知偏悲观项：日文表记差异（子供
 
 ---
 
+## RTFx 第三轮（2026-09-14）：实测账本 + 一次已落地的优化
+
+**工具（都在仓库里）**：`tools/verify_all.ps1`（6 fixture × 2 模型，对齐 + 分相位 + 时钟，
+每次改动先过它）；`QASR_DUP=<op>` 环境变量（`decoder.rs`）把某个 op **重复派发一次**——
+这些 op 都是纯函数写同一缓冲，重跑结果不变 ⇒ token 流不变，时间差就是该 op 的真实成本
+**含它的启动气泡**（op-by-op 时间戳分不出来）。解码侧支持：
+`qkv/extract/gqa/o/gu/silu/dp/lm`；prefill 侧支持：`p_scores/p_softmax/p_av/p_repeat`。
+
+**180s_en / 0.6B / 1911 MHz 实测（单相位之和 = elapsed）**
+
+| 相位 | 时间 | 内部构成（消融实测） |
+|---|---|---|
+| 前端（44.1k→16k soxr HQ） | 1330 ms | **非编译问题、非 recipe**：cubic 与 HQ 同为 ~1.6 s；44.1k→16k 是非整数比（441/160）多相滤波本身贵；48k→16k（整数比）只要 ~46 ns/样本，快 4.5×。换算法=策略决定（会放弃与 librosa 逐位一致） |
+| enc（音频塔） | 1000 ms | ≈ 塔权重 300 MB / DRAM 带宽 ⇒ **已在带宽上，无余量** |
+| prefill | 1770 ms | scores GEMM 295 / softmax 243 / AV GEMM 283（**注意力 46% 全在搬 s² scratch ≈680 MB**）/ repeat_kv 仅 14 ms / 其余是权重 GEMM（~690 ms 带宽下限）+ elementwise |
+| decode | 5730 ms | gqa 3.9 ms/步（**42%**）/ gu 1.3 / dp 1.1 / qkv 0.97 / lm 0.87（297 MB/步 ⇒ 带宽饱和）/ extract·silu ≈ 0（被掩盖）。四个投影合计 4.3 ms/步，而带宽下限 ~1.6 ms/步 |
+
+**已落地的优化**：`gqa_decode_single` / `gqa_decode_split_p1` 的 AV 扫描改成**一线程一对 dim**
+（两个 dim 共用同一 f16 字 ⇒ 1 次 LDS + 1 次 unpack 喂 2 条 FMA；每个 dim 的 key 步进不变
+⇒ 构造上逐位一致）。decode −2~3%：15s_en RTFx 23.59→**24.34**、180s_en 17.03→**17.34**、
+90s_ja 23.44→23.50、180s_zh 19.22→19.38，12/12 复验。
+
+**测过的死路（别再试）**：GEMV 的 `xsmem`（X 预展成 f32 smem）255.9 vs 255.2 GB/s；
+GEMV 的 `rows2`（一 warp 两行）**200 GB/s，全形状退化 0.77–0.89×** ⇒ 小形状是**并行度受限**
+（warp 少了更慢），而 split-K 会改求和顺序、破坏逐位一致 ⇒ 四个投影暂时无解；
+`repeat_kv`（我按流量估 ≈0.45 s）实测只有 14 ms —— **先测再改**。
+
+**下一步（按性价比）**：① prefill 分块注意力（**门槛 gated**：只在 s > ~4096 token 启用，
+6 个 fixture 走老路径 ⇒ 逐位不变），省 ~0.5 s/180s，且能解开 10 分钟以上的容量墙；
+② 解码 GEMV 的并行度（受逐位一致约束，需要新思路）；③ 前端重采样（策略决定，需用户点头）。
+
+---
+
 ## 长音频（>4 分钟）：本窗口实测与遗留限制
 
 `15m.wav`（16 kHz mono PCM16，926.93 s ≈ **12,065 token**）把这个仓库从没走过的路走了一遍，
