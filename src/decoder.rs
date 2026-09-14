@@ -1309,7 +1309,7 @@ impl WgpuTextDecoder {
         // land at submit start, so per-dispatch values MUST live in distinct
         // slots — a single reused uniform would give every dispatch the last
         // written value
-        const MAX_GEMMS: u64 = 192;
+        const MAX_GEMMS: u64 = 256;
         let u_gd = up.uniform("p.gd", MAX_GEMMS * 256);
         let u_sm = up.uniform("p.sm", 32);
         let u_rk = up.uniform("p.rk", 32);
@@ -1414,6 +1414,9 @@ impl WgpuTextDecoder {
         let mut enc = gpu.device.create_command_encoder(&Default::default());
         let mut cp = enc.begin_compute_pass(&Default::default());
 
+        // Ablation hook for prefill RTFx work (see `encode_step` for the scheme).
+        let dup = std::env::var("QASR_DUP").unwrap_or_default();
+
         for (li, layer) in self.layers.iter().enumerate() {
             // 1. rms_norm(h, iln) → normed   [s, hs]
             let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1471,6 +1474,11 @@ impl WgpuTextDecoder {
                 cp.set_pipeline(&self.pipes.repeat_kv);
                 cp.set_bind_group(0, &bg_rk, &[]);
                 cp.dispatch_workgroups(repeat_grid.0, repeat_grid.1, 1);
+                // Ablation hook (see `encode_step`): re-dispatching is idempotent,
+                // so the token stream is unchanged and the time delta is the cost.
+                if dup == "p_repeat" {
+                    cp.dispatch_workgroups(repeat_grid.0, repeat_grid.1, 1);
+                }
             }
 
             // 5. scores GEMM, batched over heads: [s, cur] = q × Kᵀ  (K is [cur, hd])
@@ -1481,6 +1489,15 @@ impl WgpuTextDecoder {
                 s, cur, hd, np, mp * hd / 2, np * hd / 2, mp * np,
                 (np / 128) as u32, (mp / 128) as u32, nqh as u32
             );
+            // Ablation hook: re-dispatching is idempotent (the GEMM overwrites its
+            // output), so the token stream is unchanged and the delta is the cost.
+            if dup == "p_scores" {
+                gemm!(
+                    &mut cp, &self.pipes.gemm, &q_out, &k_rep, &scores,
+                    s, cur, hd, np, mp * hd / 2, np * hd / 2, mp * np,
+                    (np / 128) as u32, (mp / 128) as u32, nqh as u32
+                );
+            }
 
             // 6. causal softmax, in place on scores
             let bs = block_for_reduction(cur) as usize;
@@ -1497,6 +1514,9 @@ impl WgpuTextDecoder {
             cp.set_pipeline(&self.pipes.softmax[&bs]);
             cp.set_bind_group(0, &bg_sm, &[]);
             cp.dispatch_workgroups(softmax_grid.0, softmax_grid.1, 1);
+            if dup == "p_softmax" {
+                cp.dispatch_workgroups(softmax_grid.0, softmax_grid.1, 1);
+            }
 
             // 7. AV GEMM, batched: attn_flat[s, nqh*hd] = attn × V  (V is [cur, hd])
             gemm!(
@@ -1504,6 +1524,13 @@ impl WgpuTextDecoder {
                 s, hd, cur16, nqh * hd, mp * cur16 / 2, np * hd / 2, hd,
                 1, (mp / 128) as u32, nqh as u32
             );
+            if dup == "p_av" {
+                gemm!(
+                    &mut cp, &self.pipes.gemm_av, &attn, &v_rep, &attn_flat,
+                    s, hd, cur16, nqh * hd, mp * cur16 / 2, np * hd / 2, hd,
+                    1, (mp / 128) as u32, nqh as u32
+                );
+            }
 
             // 8. o projection + residual:  h += attn_flat × o_wᵀ
             gemm!(
