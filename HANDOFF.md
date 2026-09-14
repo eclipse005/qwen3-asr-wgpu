@@ -453,19 +453,35 @@ whisper `BasicTextNormalizer`。已知偏悲观项：日文表记差异（子供
 | prefill | 1770 ms | scores GEMM 295 / softmax 243 / AV GEMM 283（**注意力 46% 全在搬 s² scratch ≈680 MB**）/ repeat_kv 仅 14 ms / 其余是权重 GEMM（~690 ms 带宽下限）+ elementwise |
 | decode | 5730 ms | gqa 3.9 ms/步（**42%**）/ gu 1.3 / dp 1.1 / qkv 0.97 / lm 0.87（297 MB/步 ⇒ 带宽饱和）/ extract·silu ≈ 0（被掩盖）。四个投影合计 4.3 ms/步，而带宽下限 ~1.6 ms/步 |
 
-**已落地的优化**：`gqa_decode_single` / `gqa_decode_split_p1` 的 AV 扫描改成**一线程一对 dim**
-（两个 dim 共用同一 f16 字 ⇒ 1 次 LDS + 1 次 unpack 喂 2 条 FMA；每个 dim 的 key 步进不变
-⇒ 构造上逐位一致）。decode −2~3%：15s_en RTFx 23.59→**24.34**、180s_en 17.03→**17.34**、
-90s_ja 23.44→23.50、180s_zh 19.22→19.38，12/12 复验。
+**已落地的优化（每一步都过了 12/12 门禁）**：
+
+1. **AV 扫描「一线程一对 dim」**（`gqa_decode_single` / `gqa_decode_split_p1`）：两个 dim 共用同一
+   f16 字 ⇒ 1 次 LDS + 1 次 unpack 喂 2 条 FMA；每个 dim 的 key 步进不变 ⇒ 构造上逐位一致。
+2. **因果 score tile 跳过**（`prefill_gemm_causal`，只给 scores GEMM 用）：`n0 > m0 + BM - 1`
+   的 tile 整块在因果线上方，softmax 只读 `j < row+1` ⇒ 直接 return，逐位一致。
+3. **AV GEMM 的因果 k 界**（`prefill_gemm_causal_av`，transb=1）：A 操作数是 softmax 输出，
+   `row+1` 之后**恰好是 0**，加 0 不改和 ⇒ k 循环只扫 `k < m0 + BM`。
+
+效果（0.6B，单作业实测）：prefill 180s_en **1772 → 1522 ms（−14%）**、180s_zh 1799 → 1528；
+decode 每步 gqa 由 ~4.2 → ~3.9 ms。RTFx：
+
+| | 15s_en | 30s_zh | 90s_en | 90s_ja | 180s_en | 180s_zh |
+|---|---|---|---|---|---|---|
+| 0.6B 起点 → 现在 | 23.59 → **24.38** | 21.03 → **21.27** | 19.40 → **19.74** | 23.44 → **23.95** | 17.03 → **17.77** | 19.22 → **20.14** |
+| 1.7B 起点 → 现在 | 11.23 → **11.26** | 10.34 → **10.36** | 10.84 → **10.96** | 12.98 → **13.12** | 10.23 → **10.48** | 10.86 → **11.08** |
+
+**decode 内部再拆一层**（消融，180s_en，40 步）：`gqa_p1`（分块扫描）= **3.45 ms/步**、
+`gqa_merge`（每 head 一个 14-workgroup 的小 kernel）= **0.78 ms/步**；后者基本是 P1 结束后的
+启动/同步气泡（handoff 早先评估：折叠进 o_proj prologue 可行，代价是 +40 KB/workgroup 读取）
+⇒ 下一步候选。
 
 **测过的死路（别再试）**：GEMV 的 `xsmem`（X 预展成 f32 smem）255.9 vs 255.2 GB/s；
 GEMV 的 `rows2`（一 warp 两行）**200 GB/s，全形状退化 0.77–0.89×** ⇒ 小形状是**并行度受限**
 （warp 少了更慢），而 split-K 会改求和顺序、破坏逐位一致 ⇒ 四个投影暂时无解；
 `repeat_kv`（我按流量估 ≈0.45 s）实测只有 14 ms —— **先测再改**。
 
-**下一步（按性价比）**：① prefill 分块注意力（**门槛 gated**：只在 s > ~4096 token 启用，
-6 个 fixture 走老路径 ⇒ 逐位不变），省 ~0.5 s/180s，且能解开 10 分钟以上的容量墙；
-② 解码 GEMV 的并行度（受逐位一致约束，需要新思路）；③ 前端重采样（策略决定，需用户点头）。
+**下一步（按性价比）**：① `gqa_merge` 气泡（~0.78 ms/步 ≈ decode 8%）；
+② decode 四个投影的并行度（受逐位一致约束，需新思路）；③ 前端重采样（策略决定，需用户点头）。
 
 ---
 

@@ -956,12 +956,19 @@ impl WgpuTextDecoder {
         let chunk = gqa_split_chunk(cur_len) as u32;
         let n_chunks = (cur_len as u32).div_ceil(chunk);
         let split = if chunk == 512 { &self.pipes.gqa_split512 } else { &self.pipes.gqa_split256 };
+        let dup = std::env::var("QASR_DUP").unwrap_or_default();
         cp.set_pipeline(split);
         cp.set_bind_group(0, &l.bg_gqa_split, &[]);
         cp.dispatch_workgroups(self.cfg.num_attention_heads as u32, n_chunks, 1);
+        if dup == "gqa_p1" {
+            cp.dispatch_workgroups(self.cfg.num_attention_heads as u32, n_chunks, 1);
+        }
         cp.set_pipeline(&self.pipes.gqa_merge);
         cp.set_bind_group(0, &l.bg_gqa_merge, &[]);
         cp.dispatch_workgroups(self.cfg.num_attention_heads as u32, 1, 1);
+        if dup == "gqa_merge" {
+            cp.dispatch_workgroups(self.cfg.num_attention_heads as u32, 1, 1);
+        }
     }
 
     /// One decode step at `self.pos`, then `pos += 1`.  Returns the token argmax
