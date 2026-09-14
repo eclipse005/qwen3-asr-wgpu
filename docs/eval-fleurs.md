@@ -90,3 +90,21 @@ Reproduce:
 python tools/diff_systems.py --ours w06 --other py06     # 0.6B
 python tools/diff_systems.py --ours w17 --other py17     # 1.7B
 ```
+
+### Proof: those differences are ties, not bugs
+
+`tools/logit_margin.py` runs the Python reference with `output_scores=True` and
+prints the top-1 margin of every greedy step in fp16 logit space (one ULP near
+|24| is 0.0156).  Three clips, same 0.6B checkpoint:
+
+| clip | systems | min top-1 margin | steps below 0.5 |
+|---|---|---|---|
+| en_us `1003119935936341070` (they agree) | — | **1.875** | 0 |
+| da_dk `10444405129133538025` (they differ) | Python `' lø'` +24.141 vs `' lun'` +24.125 | **0.0156 = 1 ULP** | 1 |
+| el_gr `12193016159940919202` (they differ) | `' �'` +26.312 vs `' Δ'` +26.312 | **0.0000 = exact tie** | 5 |
+
+On the clips where the two implementations disagree the model's own decision is a
+tie; different accumulation orders resolve it differently, and the sentence
+re-converges afterwards.  Making the alignment 100% would mean reproducing
+torch's exact kernel arithmetic — and it would not change quality, because at a
+tie either token is as good as the other.
