@@ -358,6 +358,31 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
 }}
 ";
 
+/// Split-K: `SPLITS` workgroups per row-block each own a slice of the K range and
+/// write f32 partials; a second kernel (`gemv_merge`, generated in
+/// `shaders::gemv_merge`) adds them.  Not bit-identical to `prod` (the per-lane
+/// accumulator covers a sub-range), so the transcript is the gate.
+const SPLIT_MERGE_WGSL: &str = "\
+struct Cfg { words: u32, splits: u32 };
+
+@group(0) @binding(0) var<storage, read>       P: array<f32>;
+@group(0) @binding(1) var<storage, read_write> Y: array<u32>;
+@group(0) @binding(2) var<uniform>             cfg: Cfg;
+
+@compute @workgroup_size(256)
+fn gemv_merge(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= cfg.words) { return; }
+    var va = 0.0;
+    var vb = 0.0;
+    for (var s = 0u; s < cfg.splits; s = s + 1u) {
+        va = va + P[(2u * i) * cfg.splits + s];
+        vb = vb + P[(2u * i + 1u) * cfg.splits + s];
+    }
+    Y[i] = pack2x16float(vec2<f32>(va, vb));
+}
+";
+
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
 }
@@ -390,12 +415,12 @@ fn main() -> Result<()> {
     let iters = 50usize;
 
     println!(
-        "{:<11} {:>10} {:>14} {:>12} {:>12} {:>12} {:>9}",
-        "gemv", "weight(MB)", "prod GB/s", "unroll4", "xsmem", "rows2", "p/2"
+        "{:<11} {:>10} {:>14} {:>12} {:>12} {:>12} {:>12} {:>9}",
+        "gemv", "weight(MB)", "prod GB/s", "unroll4", "xsmem", "rows2", "splitK", "p/sp"
     );
     println!("{}", "-".repeat(70));
 
-    let mut totals = [0.0f64; 4];
+    let mut totals = [0.0f64; 5];
     let mut bytes_total = 0usize;
     for (name, rows, cols) in shapes {
         let bytes = rows * cols * 2;
@@ -510,21 +535,90 @@ fn main() -> Result<()> {
         });
         let ms_2 = run(&pipe_2, &bg_2)?;
 
+        // split-K: SPLITS workgroups per row block + a merge kernel
+        let splits = 2usize;
+        let srcs = shaders::gemv_split(rows, cols, false, splits);
+        let pipe_sp = gpu.pipeline("gemv_split", &srcs, "gemv", None)?;
+        let ngran = cols / 8 / 32 / splits; // granules per lane per split
+        let _ = ngran;
+        let p_buf = gpu.storage("p_partial", (rows * splits * 4) as u64);
+        let merge_src = SPLIT_MERGE_WGSL.replace("{words}u", &format!("{}u", rows / 2));
+        let pipe_mg = gpu.pipeline("gemv_merge", &merge_src, "gemv_merge", None)?;
+        let u_merge = gpu.uniform("u_merge", 32);
+        let cfg: [u32; 2] = [(rows / 2) as u32, splits as u32];
+        gpu.queue.write_buffer(&u_merge, 0, bytemuck::cast_slice(&cfg));
+        let bg_sp = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("split"),
+            layout: &pipe_sp.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: w.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: p_buf.as_entire_binding() },
+            ],
+        });
+        let bg_mg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("merge"),
+            layout: &pipe_mg.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: p_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: y.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: u_merge.as_entire_binding() },
+            ],
+        });
+        let _ = ngran;
+        let run_split = |pipe_sp: &wgpu::ComputePipeline, bg_sp: &wgpu::BindGroup,
+                         pipe_mg: &wgpu::ComputePipeline, bg_mg: &wgpu::BindGroup|
+         -> Result<f64> {
+            for _ in 0..3 {
+                let mut enc = gpu.device.create_command_encoder(&Default::default());
+                {
+                    let mut cp = enc.begin_compute_pass(&Default::default());
+                    cp.set_pipeline(pipe_sp);
+                    cp.set_bind_group(0, bg_sp, &[]);
+                    cp.dispatch_workgroups(grid, 1, splits as u32);
+                    cp.set_pipeline(pipe_mg);
+                    cp.set_bind_group(0, bg_mg, &[]);
+                    cp.dispatch_workgroups(((rows / 2) as u32).div_ceil(256), 1, 1);
+                }
+                gpu.queue.submit([enc.finish()]);
+            }
+            gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                let mut enc = gpu.device.create_command_encoder(&Default::default());
+                {
+                    let mut cp = enc.begin_compute_pass(&Default::default());
+                    cp.set_pipeline(pipe_sp);
+                    cp.set_bind_group(0, bg_sp, &[]);
+                    cp.dispatch_workgroups(grid, 1, splits as u32);
+                    cp.set_pipeline(pipe_mg);
+                    cp.set_bind_group(0, bg_mg, &[]);
+                    cp.dispatch_workgroups(((rows / 2) as u32).div_ceil(256), 1, 1);
+                }
+                gpu.queue.submit([enc.finish()]);
+            }
+            gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
+            Ok(t0.elapsed().as_secs_f64() * 1000.0 / iters as f64)
+        };
+        let ms_sp = run_split(&pipe_sp, &bg_sp, &pipe_mg, &bg_mg)?;
+
         let bw = |ms: f64| bytes as f64 / 1e9 / (ms / 1000.0);
         println!(
-            "{:<11} {:>10.1} {:>14.1} {:>12.1} {:>12.1} {:>12.1} {:>9.2}",
+            "{:<11} {:>10.1} {:>14.1} {:>12.1} {:>12.1} {:>12.1} {:>12.1} {:>9.2}",
             name,
             bytes as f64 / 1048576.0,
             bw(ms_p),
             bw(ms_u),
             bw(ms_s),
             bw(ms_2),
-            ms_p / ms_2
+            bw(ms_sp),
+            ms_p / ms_sp
         );
         totals[0] += ms_p;
         totals[1] += ms_u;
         totals[2] += ms_s;
         totals[3] += ms_2;
+        totals[4] += ms_sp;
         bytes_total += bytes;
     }
     println!("{}", "-".repeat(70));

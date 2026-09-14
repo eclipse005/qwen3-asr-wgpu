@@ -82,6 +82,149 @@ fn rms_norm(@builtin(workgroup_id) wgid: vec3<u32>,
     )
 }
 
+/// [`gemv`] with a split-K dimension: `splits` workgroups (distinguished by
+/// `wgid.z`) each own a contiguous range of the row's K granules and write an f32
+/// partial, which [`gemv_merge`] combines.
+///
+/// **Measured and rejected** (`gemv_bench`, 2026-09-14): splitting K does not buy
+/// the parallelism the shapes lack — `o_proj` gets *slower* (64 vs 82 GB/s) and
+/// the other shapes are 0.96-1.01x, because the extra dispatch and the partial
+/// traffic cost more than the added workgroups.  Kept only as the bench's A/B
+/// variant; do not wire it into the decoder.  (Also not bit-identical: the
+/// per-lane accumulator covers a sub-range of K.)
+pub fn gemv_split(n: usize, k: usize, subgroup: bool, splits: usize) -> String {
+    assert_eq!(n % 8, 0, "gemv_split: rows must be a multiple of 8");
+    assert_eq!(k % 8, 0, "gemv_split: k must be a multiple of 8");
+    let kg = k / 8;
+    assert_eq!(kg % 32, 0, "gemv_split: k/8 must be a multiple of 32");
+    let granules_per_lane = kg / 32;
+    assert_eq!(granules_per_lane % splits, 0, "gemv_split: granules/lane must divide by splits");
+    let gpt = granules_per_lane / splits;
+
+    let subgroup_body = if subgroup {
+        "    var t = v;
+    t = t + subgroupShuffleXor(t, 16u);
+    t = t + subgroupShuffleXor(t, 8u);
+    t = t + subgroupShuffleXor(t, 4u);
+    t = t + subgroupShuffleXor(t, 2u);
+    t = t + subgroupShuffleXor(t, 1u);
+    return t;"
+    } else {
+        "    let wb = lid & 0xFFFFFFE0u;
+    bt0[lid] = v;
+    workgroupBarrier();
+    var t = bt0[lid] + bt0[wb + (lane ^ 16u)];
+    bt1[lid] = t;
+    workgroupBarrier();
+    t = bt1[lid] + bt1[wb + (lane ^ 8u)];
+    bt0[lid] = t;
+    workgroupBarrier();
+    t = bt0[lid] + bt0[wb + (lane ^ 4u)];
+    bt1[lid] = t;
+    workgroupBarrier();
+    t = bt1[lid] + bt1[wb + (lane ^ 2u)];
+    bt0[lid] = t;
+    workgroupBarrier();
+    t = bt0[lid] + bt0[wb + (lane ^ 1u)];
+    return t;"
+    };
+    let bfly_scratch = if subgroup {
+        ""
+    } else {
+        "var<workgroup> bt0: array<f32, 256>;
+var<workgroup> bt1: array<f32, 256>;
+"
+    };
+    // One granule = 4 u32 words = 8 f16 columns; the four words feed the four
+    // accumulators, exactly as in `gemv`.
+    let mut body = String::new();
+    for g in 0..gpt {
+        body.push_str(&format!(
+            "        let wv{g} = Wt[wbase + (sp * {gpt}u + {g}u) * 32u + lane];\n\
+             \x20        let xv{g} = X[(sp * {gpt}u + {g}u) * 32u + lane];\n",
+        ));
+        for c in 0..4 {
+            let sel = ["x", "y", "z", "w"][c];
+            body.push_str(&format!(
+                "        let w{g}{c} = unpack2x16float(wv{g}.{sel});\n\
+                 \x20        let x{g}{c} = unpack2x16float(xv{g}.{sel});\n\
+                 \x20        a{c} = fma(w{g}{c}.x, x{g}{c}.x, fma(w{g}{c}.y, x{g}{c}.y, a{c}));\n",
+            ));
+        }
+    }
+    format!(
+        "@group(0) @binding(0) var<storage, read>       Wt: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read>       X:  array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read_write> P:  array<f32>;
+
+const KG: u32 = {kg}u;
+const SPLITS: u32 = {splits}u;
+const SUBGROUP: u32 = {subgroup_lit}u;
+
+{bfly_scratch}var<workgroup> rows_out: array<f32, 8>;
+
+fn bfly(v: f32, lid: u32, lane: u32) -> f32 {{
+{subgroup_body}
+}}
+
+@compute @workgroup_size(256)
+fn gemv(@builtin(workgroup_id) workgroup_id: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let lane = lid.x & 31u;
+    let warp = lid.x >> 5u;
+    let row = workgroup_id.x * 8u + warp;
+    let sp = workgroup_id.z;
+    let wbase = row * KG;
+    var a0 = 0.0; var a1 = 0.0; var a2 = 0.0; var a3 = 0.0;
+    {{
+{body}    }}
+    let acc = (a0 + a1) + (a2 + a3);
+    let r = bfly(acc, lid.x, lane);
+    if (lane == 0u) {{ rows_out[warp] = r; }}
+    workgroupBarrier();
+    if (lid.x < 8u) {{
+        P[(workgroup_id.x * 8u + lid.x) * SPLITS + sp] = rows_out[lid.x];
+    }}
+}}
+",
+        subgroup_lit = u32::from(subgroup),
+    )
+}
+
+/// Combine the [`gemv_split`] partials: `Y[i] = sum_s P[i*SPLITS + s]`, plus the
+/// residual word when `accum`.  One thread per packed f16 output word (two rows).
+pub fn gemv_merge(accum: bool) -> String {
+    format!(
+        "struct Cfg {{ words: u32, splits: u32 }};
+
+@group(0) @binding(0) var<storage, read>       P: array<f32>;
+@group(0) @binding(1) var<storage, read_write> Y: array<u32>;
+@group(0) @binding(2) var<uniform>             cfg: Cfg;
+
+const ACCUM: u32 = {accum}u;
+
+@compute @workgroup_size(256)
+fn gemv_merge(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let i = gid.x;
+    if (i >= cfg.words) {{ return; }}
+    var va = 0.0;
+    var vb = 0.0;
+    for (var s = 0u; s < cfg.splits; s = s + 1u) {{
+        va = va + P[(2u * i) * cfg.splits + s];
+        vb = vb + P[(2u * i + 1u) * cfg.splits + s];
+    }}
+    if (ACCUM == 1u) {{
+        let old = unpack2x16float(Y[i]);
+        va = va + old.x;
+        vb = vb + old.y;
+    }}
+    Y[i] = pack2x16float(vec2<f32>(va, vb));
+}}
+",
+        accum = u32::from(accum),
+    )
+}
+
 /// `gemv_f16` -- warp-per-row, `uint4` (8-half) lane-strided loads on both the
 /// weight row and the activation vector, four independent f32 accumulators,
 /// 5-round xor butterfly over 32-lane warps, residual add folded into the epilogue.

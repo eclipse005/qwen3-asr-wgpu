@@ -476,12 +476,18 @@ decode 每步 gqa 由 ~4.2 → ~3.9 ms。RTFx：
 ⇒ 下一步候选。
 
 **测过的死路（别再试）**：GEMV 的 `xsmem`（X 预展成 f32 smem）255.9 vs 255.2 GB/s；
-GEMV 的 `rows2`（一 warp 两行）**200 GB/s，全形状退化 0.77–0.89×** ⇒ 小形状是**并行度受限**
-（warp 少了更慢），而 split-K 会改求和顺序、破坏逐位一致 ⇒ 四个投影暂时无解；
+GEMV 的 `rows2`（一 warp 两行）**200 GB/s，全形状退化 0.77–0.89×**；
+GEMV 的 **split-K**（`shaders::gemv_split` + `gemv_merge`，2 片 + 合并 kernel）**o_proj 退化到
+64 vs 82 GB/s**，其余 0.96–1.01× —— 额外派发与 partial 流量超过并行度收益。
+三条合起来说明：**四个小投影的 80–155 GB/s 就是这颗 P104 + 这个 kernel 结构的实际上限**
+（rows 数不够填满机器，但减 warp 更差、加 warp 要靠 split-K 又得不偿失）。此路封闭。
 `repeat_kv`（我按流量估 ≈0.45 s）实测只有 14 ms —— **先测再改**。
+`PREFILL_GEMM_BK` 也不是旋钮：32 让 smem 涨到 35 KB（每 SM 仅 1 个 workgroup）⇒ prefill +27%；
+8 则因为 staging 循环假定 `BK ≥ 16`（`bm*bk/256` 需覆盖 `bm/16` 行）而**算错**（只剩 25 token）。
 
 **下一步（按性价比）**：① `gqa_merge` 气泡（~0.78 ms/步 ≈ decode 8%）；
-② decode 四个投影的并行度（受逐位一致约束，需新思路）；③ 前端重采样（策略决定，需用户点头）。
+② 前端重采样（策略决定，需用户点头 —— 44.1 kHz 源每 3 分钟 ~1.1 s，比任何 kernel 改动都大）；
+③ 长上下文的分块注意力（同时解 10 分钟容量墙）。
 
 ---
 

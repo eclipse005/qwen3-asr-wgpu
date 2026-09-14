@@ -1473,6 +1473,9 @@ impl WgpuTextDecoder {
             cp.set_pipeline(&self.pipes.extract);
             cp.set_bind_group(0, &bg_ex, &[]);
             cp.dispatch_workgroups(s as u32, (nqh + nkvh) as u32, 1);
+            if dup == "p_extract" {
+                cp.dispatch_workgroups(s as u32, (nqh + nkvh) as u32, 1);
+            }
 
             // 4. repeat_kv (K and V) — GQA head duplication
             for (cache, out) in [(&layer.k_cache, &k_rep), (&layer.v_cache, &v_rep)] {
@@ -1567,6 +1570,9 @@ impl WgpuTextDecoder {
             cp.set_pipeline(&self.pipes.rms_norm);
             cp.set_bind_group(0, &bg_rms2, &[]);
             cp.dispatch_workgroups(s as u32, 1, 1);
+            if dup == "p_rms" {
+                cp.dispatch_workgroups(s as u32, 1, 1);
+            }
 
             // 10. gate/up GEMM → silu → down GEMM + residual
             gemm!(
@@ -1587,6 +1593,9 @@ impl WgpuTextDecoder {
             cp.set_pipeline(&self.pipes.silu);
             cp.set_bind_group(0, &bg_silu, &[]);
             cp.dispatch_workgroups(silu_grid.0, silu_grid.1, 1);
+            if dup == "p_silu" {
+                cp.dispatch_workgroups(silu_grid.0, silu_grid.1, 1);
+            }
 
             gemm!(
                 &mut cp, &self.pipes.gemm_acc, &activated, &layer.dp_w, &h_buf,
