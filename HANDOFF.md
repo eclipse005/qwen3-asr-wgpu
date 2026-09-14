@@ -396,6 +396,19 @@ prompt=…)` + `AutoModelForMultimodalLM.generate` + `processor.decode(…, retu
 
 ⇒ 结论：**结果是逐字对齐的（连没见过的 6 分钟长音频都只差一个缩写），长音频的容量是设计限制**。
 
+**官方 Python 在同一台机器上的长音频表现（同 15m.wav，0.6B fp16）**
+
+| 输入 | 官方 transformers（`attn_implementation: sdpa`） | 我们 |
+|---|---|---|
+| 6 min（4,695 token） | 跑通：83.2 s，torch 峰值分配 **5.25 GiB** | 跑通：21.4 s，nvidia-smi 峰值 **4,600 MiB** |
+| 15 min（12,065 token） | **`CUDA error: out of memory`**（`generate` 第一次 forward 就挂；nvidia-smi 峰值 8,009/8,192 MiB） | **明确拒绝**（scratch 超 2047 MiB 单绑定上限），不给垃圾 |
+
+⇒ 8 GB 卡上**两边都吃不下 15 分钟**（0.6B！）——它并不是「官方能跑我们不能」：
+Pascal(sm61) 没有 flash-attention kernel，torch 的 SDPA 在这张卡上退化成会materialize
+`s²` 分数矩阵的路径（16·12065²·2 ≈ 4.7 GB），所以它也是死在同一类内存上。
+我们这边可用上限约 **10 分钟**（scratch 守卫 ≈ 8.2k token，`max_seq` 8,192），比它略高；
+要真正支持任意长度，两边都得用分块/流式注意力（他们的 vLLM 后端即是）。
+
 ---
 
 ## 布局契约（单一来源，改代码前先读这里）
