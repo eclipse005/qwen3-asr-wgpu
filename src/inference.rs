@@ -23,7 +23,7 @@ use crate::weights;
 /// (`scores`/`attn` in `decoder::prefill`), i.e. 16·s²·2 bytes each, which
 /// passes `max_storage_buffer_binding_size` (2047 MiB here) at s ≈ 8 200.
 /// `prefill` guards that explicitly; this constant just has to stay above it.
-const DECODER_MAX_SEQ: usize = 8192;
+const DECODER_MAX_SEQ: usize = 9216;
 
 /// Which audio-tower implementation a [`WgpuAsr`] runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
