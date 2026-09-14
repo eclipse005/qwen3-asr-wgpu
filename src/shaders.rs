@@ -1392,7 +1392,15 @@ pub const PREFILL_GEMM_BN: usize = 16 * PREFILL_GEMM_TN;
 /// The tile geometry comes from the `PREFILL_GEMM_*` constants above; callers
 /// must pad `m`, `n` and the operand row strides with those same values.
 pub fn prefill_gemm(transb: bool, beta: bool) -> String {
-    prefill_gemm_impl(transb, beta, false)
+    prefill_gemm_impl(transb, beta, false, false)
+}
+
+/// [`prefill_gemm`] with the causal-attention tile skip: a tile wholly above the
+/// diagonal (`n0 > m0 + BM - 1`) is entirely masked by the causal softmax, which
+/// never reads columns past `row + 1`, so skipping it is bit-identical — it just
+/// stops writing ~half of the `s × cur` score matrix.
+pub fn prefill_gemm_causal() -> String {
+    prefill_gemm_impl(false, false, false, true)
 }
 
 /// As [`prefill_gemm`], plus the per-column bias add (binding 4).  A separate
@@ -1400,10 +1408,10 @@ pub fn prefill_gemm(transb: bool, beta: bool) -> String {
 /// *declared* only for the variants that read it, and a declared-but-unbound
 /// binding fails pipeline validation even when the read is dead code.
 pub fn prefill_gemm_bias(transb: bool, beta: bool) -> String {
-    prefill_gemm_impl(transb, beta, true)
+    prefill_gemm_impl(transb, beta, true, false)
 }
 
-fn prefill_gemm_impl(transb: bool, beta: bool, bias: bool) -> String {
+fn prefill_gemm_impl(transb: bool, beta: bool, bias: bool, causal_skip: bool) -> String {
     let tm = PREFILL_GEMM_TM;
     let tn = PREFILL_GEMM_TN;
     let bk = PREFILL_GEMM_BK;
@@ -1427,10 +1435,12 @@ fn prefill_gemm_impl(transb: bool, beta: bool, bias: bool) -> String {
     s.push_str(&format!(
         "const BM: u32 = {bm}u;\nconst BN: u32 = {bn}u;\nconst BK: u32 = {bk}u;\n\
          const PAD: u32 = {pad}u;\nconst TM: u32 = {tm}u;\nconst TN: u32 = {tn}u;\n\
-         const TRANSB: u32 = {}u;\nconst BETA: u32 = {}u;\nconst BIAS: u32 = {}u;\n",
+         const TRANSB: u32 = {}u;\nconst BETA: u32 = {}u;\nconst BIAS: u32 = {}u;\n\
+         const CAUSAL: u32 = {}u;\n",
         u32::from(transb),
         u32::from(beta),
         u32::from(bias),
+        u32::from(causal_skip),
     ));
     s.push_str(&format!("var<workgroup> As: array<f32, {}>;\n", bm * pad));
     s.push_str(&format!("var<workgroup> Bs: array<f32, {}>;\n", bn * pad));
@@ -1452,7 +1462,8 @@ fn prefill_gemm_impl(transb: bool, beta: bool, bias: bool) -> String {
          let tx = lid.x;\n let ty = lid.y;\n\
          let m0 = wid.y * BM;\n let n0 = wid.x * BN;\n let kk = gd.k / 2u;\n\
          let abase = wid.z * gd.bsa;\n let wb = wid.z * gd.bsb;\n\
-         let cbase = wid.z * gd.bsc;\n",
+         let cbase = wid.z * gd.bsc;\n\
+         if (CAUSAL == 1u && n0 > m0 + BM - 1u) { return; }\n",
     );
 
     for i in 0..tm {
