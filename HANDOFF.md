@@ -484,9 +484,11 @@ GEMV 的 **split-K**（`shaders::gemv_split` + `gemv_merge`，2 片 + 合并 ker
 `repeat_kv`（我按流量估 ≈0.45 s）实测只有 14 ms —— **先测再改**。
 `PREFILL_GEMM_BK` 也不是旋钮：32 让 smem 涨到 35 KB（每 SM 仅 1 个 workgroup）⇒ prefill +27%；
 8 则因为 staging 循环假定 `BK ≥ 16`（`bm*bk/256` 需覆盖 `bm/16` 行）而**算错**（只剩 25 token）。
+smem padding 同样是局部最优：`PAD = BK+4`（20，为向量化对齐）让 **enc 2640 vs 1010 ms、
+prefill 4200 vs 1518 ms**（bank conflict + 占用率同时变坏）——`PAD = BK+1 = 17` 别动。
 
 **下一步（按性价比）**：① `gqa_merge` 气泡（~0.78 ms/步 ≈ decode 8%）；
-② 前端重采样（策略决定，需用户点头 —— 44.1 kHz 源每 3 分钟 ~1.1 s，比任何 kernel 改动都大）；
+② 预处理链路（重采样）**不可换算法**（用户 2026-09-14 明确：换算法会改变转录，不能用）；
 ③ 长上下文的分块注意力（同时解 10 分钟容量墙）。
 
 ---
