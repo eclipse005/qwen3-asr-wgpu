@@ -1007,7 +1007,7 @@ pub fn silu_mul_split(inter: usize) -> String {
 @group(0) @binding(1) var<storage, read_write> Out: array<u32>;
 @group(0) @binding(2) var<uniform>             cfg: Cfg;
 
-struct Cfg {{ inter2: u32, total2: u32, _a: u32, _b: u32 }};
+struct Cfg {{ inter2: u32, total2: u32, gx: u32, _b: u32 }};
 
 const INTER2: u32 = {inter2}u;
 const LOG2E: f32 = {log2e};
@@ -1015,7 +1015,10 @@ const THREADS: u32 = {threads}u;
 
 @compute @workgroup_size({threads})
 fn silu_mul_split(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let i = gid.x;
+    // Two grid axes: `rows · inter/2` words overflows wgpu's 65535-per-dimension
+    // limit for prefills longer than ~5.8 minutes, so x is capped and y continues
+    // the flat index space (`gx · THREADS` words per row).
+    let i = gid.x + gid.y * (cfg.gx * THREADS);
     if (i >= cfg.total2) {{ return; }}
     // rows of [row_gate | row_up]: decode runs one row, prefill s rows
     let row = i / cfg.inter2;
@@ -1611,7 +1614,7 @@ fn prefill_gemm_impl(transb: bool, beta: bool, bias: bool) -> String {
 /// `valid..n_pad` are written zero so downstream GEMMs read zeros.
 pub fn softmax_causal(bs: usize) -> String {
     format!(
-        "struct Cfg {{ n_w: u32, n_x: u32, valid: u32, m: u32, mp: u32, scale: f32 }};
+        "struct Cfg {{ n_w: u32, n_x: u32, valid: u32, m: u32, mp: u32, scale: f32, gx: u32, _p: u32 }};
 
 @group(0) @binding(0) var<storage, read>       X:   array<u32>;
 @group(0) @binding(1) var<storage, read_write> Out: array<u32>;
@@ -1628,8 +1631,11 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
            @builtin(local_invocation_id) lid: vec3<u32>) {{
     // X rows are n_x-strided (tile-padded scores, one row per head*pos);
     // Out uses the BATCHED [head][mp][cur16] layout the AV GEMM expects.
-    let head = wgid.x / cfg.m;
-    let pos = wgid.x % cfg.m;
+    // Two grid axes: `nqh · s` rows overflow the 65535-per-dimension limit for
+    // prefills beyond ~4.2 minutes (x is capped, y continues the row index).
+    let row = wgid.x + wgid.y * cfg.gx;
+    let head = row / cfg.m;
+    let pos = row % cfg.m;
     let base_x = (head * cfg.mp + pos) * cfg.n_x;
     let base_o = (head * cfg.mp + pos) * cfg.n_w;
     let row_in_head = pos;
@@ -1692,7 +1698,7 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
 /// group into `[nqh, cur, hd]` (CUDA `repeat_kv_from_cache`).
 pub fn repeat_kv(nrep: usize) -> String {
     format!(
-        "struct Cfg {{ nkvh: u32, max_seq: u32, cur: u32, hd: u32, npw: u32, _a: u32 }};
+        "struct Cfg {{ nkvh: u32, max_seq: u32, cur: u32, hd: u32, npw: u32, gx: u32 }};
 
 @group(0) @binding(0) var<storage, read>       Cache: array<u32>;
 @group(0) @binding(1) var<storage, read_write> Out:   array<u32>;
@@ -1702,7 +1708,9 @@ const NREP: u32 = {nrep}u;
 
 @compute @workgroup_size(256)
 fn repeat_kv(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let i = gid.x;
+    // Two grid axes: `nkvh · nrep · cur · hd/2` reaches 65535 words at a
+    // ~19-minute prefill, so x is capped and y continues the index space.
+    let i = gid.x + gid.y * (cfg.gx * 256u);
     let words_per_head_pos = cfg.hd / 2u;
     let per_head = cfg.cur * words_per_head_pos;
     let total = cfg.nkvh * NREP * per_head;
@@ -1843,7 +1851,7 @@ fn im2col(@builtin(workgroup_id) wid: vec3<u32>,
 ///
 /// Bindings: 0 = src, 1 = bias, 2 = dst, 3 = `ScaleCfg { n, words, mode }`.
 pub fn audio_bias_gelu() -> String {
-    "struct ScaleCfg { n: u32, words: u32, mode: u32, _a: u32 };
+    "struct ScaleCfg { n: u32, words: u32, mode: u32, gx: u32 };
 
 @group(0) @binding(0) var<storage, read>       Src:  array<u32>;
 @group(0) @binding(1) var<storage, read>       Bias: array<u32>;
@@ -1872,7 +1880,9 @@ fn gelu(x: f32) -> f32 {
 
 @compute @workgroup_size(256)
 fn bias_gelu(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;                       // word index: two f16 per thread
+    // Two grid axes: a long clip's FFN activation is `tokens · ffn/2` words,
+    // which passes 65535 workgroups well before the 22-minute token cap.
+    let i = gid.x + gid.y * (cfg.gx * 256u);
     if (i * 2u >= cfg.n) { return; }
     let s = unpack2x16float(Src[i]);
     var b = vec2<f32>(0.0, 0.0);
@@ -1968,13 +1978,14 @@ pub fn audio_extract_qkv() -> String {
 
 @compute @workgroup_size(256)
 fn extract(@builtin(global_invocation_id) gid: vec3<u32>) {
-    // gid.x = (token, head) pair; gid.y = word inside the head
-    let nh = cfg.nh;
+    // gid = (token, head, word inside the head).  The head is its own grid axis
+    // rather than folded into x: `s_pad · nh` exceeds wgpu's 65535-per-dimension
+    // limit at ~6 minutes of audio, and the dispatch was rejected outright.
     let hd2 = cfg.hd / 2u;
-    let tok = gid.x / nh;
+    let tok = gid.x;
     if (tok >= cfg.n_tokens) { return; }
-    let head = gid.x - tok * nh;
-    let w = gid.y;
+    let head = gid.y;
+    let w = gid.z;
     if (w >= hd2) { return; }
 
     let dm2 = cfg.dm / 2u;

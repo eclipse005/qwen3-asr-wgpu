@@ -18,8 +18,12 @@ use crate::mrope::{compute_mrope_cos_sin, text_positions};
 use crate::prompt::{self, TranscribeResult, ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID};
 use crate::weights;
 
-/// KV + MRoPE size; 180s prompt (~2355) + 1024 new tokens fits with margin.
-const DECODER_MAX_SEQ: usize = 4096;
+/// KV + MRoPE size.  The binding limit, not this, is what really caps audio
+/// length: the prefill's causal-attention scratch is O(s²) per head
+/// (`scores`/`attn` in `decoder::prefill`), i.e. 16·s²·2 bytes each, which
+/// passes `max_storage_buffer_binding_size` (2047 MiB here) at s ≈ 8 200.
+/// `prefill` guards that explicitly; this constant just has to stay above it.
+const DECODER_MAX_SEQ: usize = 8192;
 
 /// Which audio-tower implementation a [`WgpuAsr`] runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +41,34 @@ pub enum EncoderBackend {
 /// Round-to-even pad of a width — mirrors `audio_encoder_gpu`'s mel stride.
 fn mel_pad_even(v: usize) -> usize {
     if v % 2 == 1 { v + 1 } else { v }
+}
+
+/// Per-request knobs, mirroring upstream `Qwen3ASRModel.transcribe(audio,
+/// context=…, language=…)`.  `context` is the hotword/bias text and goes into
+/// the chat template's **system** message; `language` forces text-only output by
+/// prefilling `language {Language}<asr_text>` after the assistant header.
+#[derive(Debug, Clone, Default)]
+pub struct TranscribeOptions {
+    pub context: String,
+    /// `None` = let the model detect it.  Normalised and validated against
+    /// [`prompt::SUPPORTED_LANGUAGES`] on use, like upstream.
+    pub language: Option<String>,
+}
+
+impl TranscribeOptions {
+    /// The canonical language name to prompt with, or `None` when the caller did
+    /// not force one.  Mirrors the reference processor: a code (`"en"`) or a full
+    /// name (`"English"`), either case, resolved to the canonical name; anything
+    /// else is rejected.
+    fn forced_language(&self) -> Result<Option<String>> {
+        let Some(raw) = self.language.as_deref() else {
+            return Ok(None);
+        };
+        if raw.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(prompt::resolve_language(raw.trim())?))
+    }
 }
 
 /// The global chunk index a captured round starts at.
@@ -185,6 +217,18 @@ impl WgpuAsr {
         dump_dir: Option<&Path>,
         compare_enc: bool,
     ) -> Result<TranscribeResult> {
+        self.transcribe_file_opts(wav, max_new_tokens, dump_dir, compare_enc, &TranscribeOptions::default())
+    }
+
+    /// [`Self::transcribe_file`] with upstream's `context` / `language` knobs.
+    pub fn transcribe_file_opts(
+        &mut self,
+        wav: &Path,
+        max_new_tokens: usize,
+        dump_dir: Option<&Path>,
+        compare_enc: bool,
+        opts: &TranscribeOptions,
+    ) -> Result<TranscribeResult> {
         let samples = load_audio_wav(wav, MEL_SAMPLE_RATE)?;
         if let Some(dir) = dump_dir {
             std::fs::create_dir_all(dir)?;
@@ -194,7 +238,7 @@ impl WgpuAsr {
             }
             std::fs::write(dir.join("wave16k.f32"), bytes)?;
         }
-        self.transcribe_samples_impl(&samples, max_new_tokens, dump_dir, compare_enc)
+        self.transcribe_samples_impl(&samples, max_new_tokens, dump_dir, compare_enc, opts)
     }
 
     /// Mel-in entry point with an optional CPU-vs-GPU encoder comparison.
@@ -206,6 +250,23 @@ impl WgpuAsr {
         max_new_tokens: usize,
         dump_dir: Option<&Path>,
         compare_enc: bool,
+    ) -> Result<TranscribeResult> {
+        self.transcribe_from_mel_cmp_opts(
+            mel, n_mels, n_frames, max_new_tokens, dump_dir, compare_enc, &TranscribeOptions::default(),
+        )
+    }
+
+    /// [`Self::transcribe_from_mel_cmp`] with upstream's options.
+    #[allow(clippy::too_many_arguments)]
+    pub fn transcribe_from_mel_cmp_opts(
+        &mut self,
+        mel: &[f32],
+        n_mels: usize,
+        n_frames: usize,
+        max_new_tokens: usize,
+        dump_dir: Option<&Path>,
+        compare_enc: bool,
+        opts: &TranscribeOptions,
     ) -> Result<TranscribeResult> {
         let t1 = Instant::now();
         let audio_embeds = self.run_encoder(mel, n_mels, n_frames, compare_enc)?;
@@ -229,6 +290,7 @@ impl WgpuAsr {
             dump_dir,
             0.0,
             t_enc.as_secs_f64() * 1000.0,
+            opts,
         )
     }
 
@@ -755,6 +817,7 @@ impl WgpuAsr {
             dump_dir,
             0.0,
             t_enc.as_secs_f64() * 1000.0,
+            &TranscribeOptions::default(),
         )
     }
 
@@ -764,7 +827,14 @@ impl WgpuAsr {
         max_new_tokens: usize,
         dump_dir: Option<&Path>,
     ) -> Result<TranscribeResult> {
-        self.decode_from_audio_embeds(audio_embeds, max_new_tokens, dump_dir, 0.0, 0.0)
+        self.decode_from_audio_embeds(
+            audio_embeds,
+            max_new_tokens,
+            dump_dir,
+            0.0,
+            0.0,
+            &TranscribeOptions::default(),
+        )
     }
 
     pub fn transcribe_samples_with_dump(
@@ -773,7 +843,7 @@ impl WgpuAsr {
         max_new_tokens: usize,
         dump_dir: Option<&Path>,
     ) -> Result<TranscribeResult> {
-        self.transcribe_samples_impl(samples, max_new_tokens, dump_dir, false)
+        self.transcribe_samples_impl(samples, max_new_tokens, dump_dir, false, &TranscribeOptions::default())
     }
 
     fn transcribe_samples_impl(
@@ -782,6 +852,7 @@ impl WgpuAsr {
         max_new_tokens: usize,
         dump_dir: Option<&Path>,
         compare_enc: bool,
+        opts: &TranscribeOptions,
     ) -> Result<TranscribeResult> {
         let t0 = Instant::now();
         let (mel, n_mels, n_frames) = self.mel.extract(samples)?;
@@ -809,9 +880,11 @@ impl WgpuAsr {
             dump_dir,
             t_mel.as_secs_f64() * 1000.0,
             t_enc.as_secs_f64() * 1000.0,
+            opts,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decode_from_audio_embeds(
         &mut self,
         audio_embeds: &[f32],
@@ -819,6 +892,7 @@ impl WgpuAsr {
         dump_dir: Option<&Path>,
         t_mel_ms: f64,
         t_enc_ms: f64,
+        opts: &TranscribeOptions,
     ) -> Result<TranscribeResult> {
         let hs = self.config.thinker_config.text_config.hidden_size;
         let nat = audio_embeds.len() / hs;
@@ -830,13 +904,17 @@ impl WgpuAsr {
             }
             std::fs::write(dir.join("audio_embeds.f32"), bytes)?;
         }
+        // Upstream normalises and validates a forced language before prompting,
+        // and only then appends `language X<asr_text>` to the assistant turn.
+        let language = opts.forced_language()?;
         let (input_ids, asp) = prompt::build_prompt(
             &self.tokenizer,
             self.config.thinker_config.audio_start_token_id,
             self.config.thinker_config.audio_token_id,
             self.config.thinker_config.audio_end_token_id,
             nat,
-            None,
+            language.as_deref(),
+            &opts.context,
             None,
         )?;
         let seq_len = input_ids.len();
@@ -899,7 +977,7 @@ impl WgpuAsr {
             let ids: String = generated.iter().map(|id| format!("{id}\n")).collect();
             std::fs::write(dir.join("gen_ids.txt"), ids)?;
         }
-        prompt::decode_result(&self.tokenizer, &generated, None)
+        prompt::decode_result(&self.tokenizer, &generated)
     }
 }
 

@@ -23,6 +23,7 @@ pub(crate) const TOK_NEWLINE: i64 = 198;
 pub(crate) const TOK_IM_END: i64 = IM_END_TOKEN_ID;
 pub(crate) const TOK_USER: i64 = 872;
 pub(crate) const TOK_ASSISTANT: i64 = 77091;
+const LANG_PREFIX: &str = "language ";
 
 // ─── Prompt building ──────────────────────────────────────────────
 
@@ -33,19 +34,21 @@ pub(crate) fn build_prompt(
     audio_end_token_id: i64,
     nat: usize,
     language: Option<&str>,
+    context: &str,
     prefix_text: Option<&str>,
 ) -> anyhow::Result<(Vec<i64>, usize)> {
-    let mut tokens: Vec<i64> = vec![
-        TOK_IM_START,
-        TOK_SYSTEM,
-        TOK_NEWLINE,
-        TOK_IM_END,
-        TOK_NEWLINE,
-        TOK_IM_START,
-        TOK_USER,
-        TOK_NEWLINE,
-        audio_start_token_id,
-    ];
+    // Chat template parity: `system` carries the context (hotword biasing),
+    // `user` carries the audio.  Upstream: `_build_messages(context, audio)` then
+    // `apply_chat_template(..., add_generation_prompt=True)`.
+    let mut tokens: Vec<i64> = vec![TOK_IM_START, TOK_SYSTEM, TOK_NEWLINE];
+    if !context.is_empty() {
+        let enc = tokenizer
+            .encode(context, false)
+            .map_err(|e| anyhow::anyhow!("encode context: {}", e))?;
+        tokens.extend(enc.get_ids().iter().map(|&id| id as i64));
+    }
+    tokens.extend_from_slice(&[TOK_IM_END, TOK_NEWLINE, TOK_IM_START, TOK_USER, TOK_NEWLINE]);
+    tokens.push(audio_start_token_id);
     let asp = tokens.len();
     tokens.extend(std::iter::repeat_n(audio_token_id, nat));
     tokens.extend_from_slice(&[audio_end_token_id, TOK_IM_END, TOK_NEWLINE, TOK_IM_START]);
@@ -80,12 +83,11 @@ pub(crate) fn build_prompt(
 pub(crate) fn decode_result(
     tokenizer: &tokenizers::Tokenizer,
     generated_ids: &[u32],
-    language: Option<&str>,
 ) -> anyhow::Result<TranscribeResult> {
     let raw_text = tokenizer
         .decode(generated_ids, true)
         .map_err(|e| anyhow::anyhow!("decode: {}", e))?;
-    let (lang, text) = parse_asr_output(&raw_text, language);
+    let (lang, text) = parse_asr_output(&raw_text);
     Ok(TranscribeResult {
         text,
         language: lang,
@@ -93,64 +95,114 @@ pub(crate) fn decode_result(
     })
 }
 
-/// Port of Python `parse_asr_output` including `detect_and_fix_repetitions`.
-pub(crate) fn parse_asr_output(raw: &str, user_language: Option<&str>) -> (String, String) {
-    if raw.is_empty() {
+/// Port of the reference processor's `_parse_single_output`
+/// (transformers' `Qwen3ASRProcessor`), which is what produced the gold texts —
+/// note it takes **no** forced-language argument: when a language is forced the
+/// metadata is part of the *prompt*, so the generated text carries none and the
+/// reported language is empty, exactly like the reference.
+pub(crate) fn parse_asr_output(raw: &str) -> (String, String) {
+    if raw.trim().is_empty() {
         return (String::new(), String::new());
     }
     let mut s = raw.trim().to_string();
-    if s.is_empty() {
-        return (String::new(), String::new());
+
+    // The decoded string can still carry the prompt's assistant tail.
+    if let Some(idx) = s.find("assistant\n") {
+        s = s[idx + "assistant\n".len()..].to_string();
     }
 
     s = detect_and_fix_repetitions(&s, 20);
 
-    if let Some(user_lang) = user_language {
-        // Forced language: model output is pure transcription text.
-        // Still strip a leading <asr_text> if the model re-emitted the tag.
-        let text = strip_leading_asr_text_tag(&s);
-        return (user_lang.to_string(), text);
-    }
-
     const TAG: &str = "<asr_text>";
-    if let Some(pos) = s.find(TAG) {
-        let meta = s[..pos].trim();
-        let text = s[pos + TAG.len()..].trim().to_string();
-        let lang = meta
-            .strip_prefix("language ")
-            .or_else(|| meta.strip_prefix("Language "))
-            .unwrap_or(meta)
-            .trim()
-            .to_string();
-        if lang.eq_ignore_ascii_case("none") {
-            return (String::new(), String::new());
+    let Some(pos) = s.find(TAG) else {
+        // No tag — treat the whole string as plain transcription.
+        return (String::new(), s.trim().to_string());
+    };
+    let prefix = s[..pos].trim().to_string();
+    let transcription = s[pos + TAG.len()..].trim().to_string();
+
+    // Empty-audio heuristic: "language None<asr_text>"
+    if prefix.to_lowercase() == "language none" {
+        return (String::new(), transcription);
+    }
+
+    // Only the first non-empty line is inspected, and its value is used raw.
+    let mut language = String::new();
+    for line in prefix.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
         }
-        return (lang, text);
+        let lower = line.to_lowercase();
+        if lower.starts_with(LANG_PREFIX) {
+            let val = line[LANG_PREFIX.len()..].trim();
+            if !val.is_empty() {
+                language = val.to_string();
+            }
+        } else {
+            language = line.to_string();
+        }
+        break;
     }
-
-    // no tag => pure text
-    (String::new(), s)
+    (language, transcription)
 }
 
-fn strip_leading_asr_text_tag(s: &str) -> String {
-    let t = s.trim();
-    if let Some(rest) = t.strip_prefix("<asr_text>") {
-        return rest.trim().to_string();
+/// Port of transformers' `resolve_language` (`audio_utils.py`): accepts a
+/// language code (`"en"`, `"zh"`) or a full name (`"English"`), either case, and
+/// returns the canonical full name the forced-language suffix must use.
+pub(crate) fn resolve_language(language: &str) -> anyhow::Result<String> {
+    let l = language.to_lowercase();
+    for (code, name) in LANGUAGE_CODE_TO_NAME {
+        if l == code.to_lowercase() || l == name.to_lowercase() {
+            return Ok(name.to_string());
+        }
     }
-    // Model may emit the literal after whitespace / newlines.
-    if let Some(pos) = t.find("<asr_text>") {
-        return t[pos + "<asr_text>".len()..].trim().to_string();
-    }
-    t.to_string()
+    anyhow::bail!(
+        "unsupported language: {language:?} — use a code (e.g. \"en\", \"zh\") or a full name (e.g. \"English\", \"Chinese\")"
+    )
 }
+
+/// `LANGUAGE_CODE_TO_NAME` from the reference processor.
+pub(crate) const LANGUAGE_CODE_TO_NAME: [(&str, &str); 30] = [
+    ("ar", "Arabic"),
+    ("yue", "Cantonese"),
+    ("zh", "Chinese"),
+    ("cs", "Czech"),
+    ("da", "Danish"),
+    ("nl", "Dutch"),
+    ("en", "English"),
+    ("fil", "Filipino"),
+    ("fi", "Finnish"),
+    ("fr", "French"),
+    ("de", "German"),
+    ("el", "Greek"),
+    ("hi", "Hindi"),
+    ("hu", "Hungarian"),
+    ("id", "Indonesian"),
+    ("it", "Italian"),
+    ("ja", "Japanese"),
+    ("ko", "Korean"),
+    ("mk", "Macedonian"),
+    ("ms", "Malay"),
+    ("fa", "Persian"),
+    ("pl", "Polish"),
+    ("pt", "Portuguese"),
+    ("ro", "Romanian"),
+    ("ru", "Russian"),
+    ("es", "Spanish"),
+    ("sv", "Swedish"),
+    ("th", "Thai"),
+    ("tr", "Turkish"),
+    ("vi", "Vietnamese"),
+];
 
 /// Port of Python `detect_and_fix_repetitions` (threshold default 20).
 ///
-/// Pattern search window matches upstream (`max_pattern_len=20` is too small for
-/// some Chinese phrase units; 96 is a safe upper bound and only runs after decode).
+/// `max_pattern_len` is upstream's 20: a longer window collapses repeats the
+/// reference leaves alone, which is a behaviour difference, not an improvement.
 pub(crate) fn detect_and_fix_repetitions(text: &str, threshold: usize) -> String {
     let text = fix_char_repeats(text, threshold);
-    fix_pattern_repeats(&text, threshold, 96)
+    fix_pattern_repeats(&text, threshold, 20)
 }
 
 fn fix_char_repeats(s: &str, thresh: usize) -> String {

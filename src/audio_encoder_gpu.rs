@@ -129,7 +129,8 @@ struct ScaleCfg {
     words: u32,
     /// 1 = index the bias by `i / words`, 0 = by `i % words`.
     mode: u32,
-    _a: u32,
+    /// x-axis grid size; `y` continues the flat index space beyond it.
+    gx: u32,
 }
 
 #[repr(C)]
@@ -1082,14 +1083,17 @@ impl GpuAudioEncoder {
         .enumerate()
         {
             let words = lin.n_pad / 2;
+            let n = rows * lin.n_pad;
             gpu.queue.write_buffer(
                 &self.u_sc[3 + i],
                 0,
                 bytemuck::bytes_of(&ScaleCfg {
-                    n: (rows * lin.n_pad) as u32,
+                    n: n as u32,
                     words: words as u32,
                     mode: u32::from(by_channel),
-                    _a: 0,
+                    // The `bias_gelu` dispatch for these two sites splits over
+                    // both grid axes (`grid_xy` in the dispatch below).
+                    gx: crate::decoder::grid_xy(n.div_ceil(512)).0,
                 }),
             );
         }
@@ -1347,7 +1351,9 @@ impl GpuAudioEncoder {
             let mut cp = enc.begin_compute_pass(&Default::default());
             cp.set_pipeline(&self.p.extract);
             cp.set_bind_group(0, &bg, &[]);
-            cp.dispatch_workgroups(ctx.s_pad as u32 * nh as u32, (hd / 2) as u32, 1);
+            // (token, head, head-word) — `s_pad·nh` would overflow the 65535
+            // per-dimension grid limit for audio longer than ~6 minutes.
+            cp.dispatch_workgroups(ctx.s_pad as u32, nh as u32, (hd / 2) as u32);
         }
         // 4. re-pack into the per-(head, window) blocks the GEMMs can read
         //    with their fixed operand row strides.
@@ -1870,6 +1876,10 @@ impl GpuAudioEncoder {
         by_channel: bool,
     ) {
         assert!(n % 2 == 0, "bias_gelu needs an even element count");
+        // 256 threads × 2 halves per workgroup; `x` is capped at wgpu's 65535
+        // per-dimension limit and `y` continues the index space (a long clip's
+        // FFN activation needs >100k workgroups).
+        let (gx, gy) = crate::decoder::grid_xy(n.div_ceil(512));
         gpu.queue.write_buffer(
             sc,
             0,
@@ -1877,7 +1887,7 @@ impl GpuAudioEncoder {
                 n: n as u32,
                 words: words as u32,
                 mode: u32::from(by_channel),
-                _a: 0,
+                gx,
             }),
         );
         let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1895,7 +1905,7 @@ impl GpuAudioEncoder {
         cp.set_bind_group(0, &bg, &[]);
         // 256 threads × 2 halves = 512 elements per workgroup (the old divisor
         // 600 covered only 85 % of the tensor and left the tail un-GELU'd).
-        cp.dispatch_workgroups(n.div_ceil(512) as u32, 1, 1);
+        cp.dispatch_workgroups(gx, gy, 1);
     }
 
     fn layernorm(

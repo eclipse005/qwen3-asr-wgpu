@@ -90,6 +90,16 @@ fn block_for_reduction(last: usize) -> u32 {
     bs.min(1024).max(32)
 }
 
+/// Split a flat workgroup count across two grid axes.  `max_compute_workgroups_
+/// per_dimension` is 65535: a 15-minute clip's prefill needs 85k workgroups for
+/// the SiLU and 194k rows for the causal softmax, and wgpu rejects the whole
+/// command buffer rather than clamping.
+pub(crate) fn grid_xy(workgroups: usize) -> (u32, u32) {
+    let gx = workgroups.clamp(1, 65_535) as u32;
+    let gy = workgroups.div_ceil(gx as usize).max(1) as u32;
+    (gx, gy)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct RmsCfg {
@@ -132,7 +142,8 @@ struct GDims {
 struct SiluCfg {
     inter2: u32,
     total2: u32,
-    _a: u32,
+    /// x-axis grid size; `y` continues the flat index space beyond it.
+    gx: u32,
     _b: u32,
 }
 
@@ -144,7 +155,8 @@ struct RepeatKvCfg {
     cur: u32,
     hd: u32,
     npw: u32,
-    _a: u32,
+    /// x-axis grid size; `y` continues the flat index space beyond it.
+    gx: u32,
 }
 
 #[repr(C)]
@@ -156,6 +168,9 @@ struct SoftmaxCfg {
     m: u32,
     mp: u32,
     scale: f32,
+    /// x-axis grid size; `y` continues the row index beyond it.
+    gx: u32,
+    _p: u32,
 }
 
 #[repr(C)]
@@ -805,23 +820,31 @@ impl WgpuTextDecoder {
     }
 
     /// SiLU row count: decode processes one `[gate|up]` row; prefill s rows.
-    fn write_silu_rows(&self, rows: usize) {
+    /// Returns the `(x, y)` grid that covers `rows · inter/2` words — wgpu caps
+    /// each grid dimension at 65535, which a long prefill exceeds.
+    fn write_silu_rows(&self, rows: usize) -> (u32, u32) {
+        let words = rows * self.cfg.intermediate_size / 2;
+        let workgroups = words.div_ceil(256);
+        let (gx, gy) = grid_xy(workgroups);
         self.gpu.upload(
             &self.scratch.u_silu,
             bytemuck::bytes_of(&SiluCfg {
                 inter2: (self.cfg.intermediate_size / 2) as u32,
-                total2: (rows * self.cfg.intermediate_size / 2) as u32,
-                _a: 0,
+                total2: words as u32,
+                gx,
                 _b: 0,
             }),
         );
+        (gx, gy)
     }
 
     pub fn encode_step(&self, enc: &mut wgpu::CommandEncoder, pos: usize) {
         let cfg = &self.cfg;
         let cur_len = pos + 1;
         let gemv_grid = |rows: usize| (rows / 8) as u32;
-        let silu_grid = ((cfg.intermediate_size / 2).div_ceil(256)) as u32;
+        // One row of `[gate|up]`: the grid is tiny here, the helper just keeps
+        // the uniform's `gx` consistent with what the prefill writes.
+        let silu_grid = grid_xy((cfg.intermediate_size / 2).div_ceil(256));
 
         let mut cp = enc.begin_compute_pass(&Default::default());
 
@@ -852,7 +875,7 @@ impl WgpuTextDecoder {
 
             cp.set_pipeline(&self.pipes.silu);
             cp.set_bind_group(0, &self.bg_silu, &[]);
-            cp.dispatch_workgroups(silu_grid, 1, 1);
+            cp.dispatch_workgroups(silu_grid.0, silu_grid.1, 1);
 
             cp.set_pipeline(&self.pipes.gemv_dp);
             cp.set_bind_group(0, &l.bg_gemv_dp, &[]);
@@ -936,7 +959,7 @@ impl WgpuTextDecoder {
         let cfg = &self.cfg;
         let cur_len = pos + 1;
         let gemv_grid = |rows: usize| (rows / 8) as u32;
-        let silu_grid = ((cfg.intermediate_size / 2).div_ceil(256)) as u32;
+        let silu_grid = grid_xy((cfg.intermediate_size / 2).div_ceil(256));
         let layer = &self.layers[l];
         let mut cp = enc.begin_compute_pass(&Default::default());
         cp.set_pipeline(&self.pipes.rms_norm);
@@ -960,7 +983,7 @@ impl WgpuTextDecoder {
         cp.dispatch_workgroups(gemv_grid(2 * cfg.intermediate_size), 1, 1);
         cp.set_pipeline(&self.pipes.silu);
         cp.set_bind_group(0, &self.bg_silu, &[]);
-        cp.dispatch_workgroups(silu_grid, 1, 1);
+        cp.dispatch_workgroups(silu_grid.0, silu_grid.1, 1);
         cp.set_pipeline(&self.pipes.gemv_dp);
         cp.set_bind_group(0, &layer.bg_gemv_dp, &[]);
         cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
@@ -1207,6 +1230,23 @@ impl WgpuTextDecoder {
         let cur16 = cur.div_ceil(16) * 16; // k-side zero pad for the AV GEMM
         anyhow::ensure!(hidden_words.len() >= s * hs * 2, "prefill hidden size mismatch");
 
+        // The causal-attention scratch is `nqh · mp · cur` *halves* and is not
+        // tiled: `scores` and `attn` are each allocated whole, so a long clip
+        // either blows the per-binding limit or runs out of VRAM, and wgpu's
+        // failure mode for that is garbage output rather than an error.  Refuse
+        // explicitly — the reference (SDPA) has no such scratch, this is ours.
+        let scratch = (nqh * mp * cur16 * 2) as u64;
+        let bind_limit = self.gpu.limits.max_storage_buffer_binding_size as u64;
+        anyhow::ensure!(
+            scratch <= bind_limit,
+            "prefill attention scratch is {:.2} GiB for {s} tokens ({:.1} min of audio), over the {:.2} GiB per-binding limit — \
+             the O(s²) prefill attention supports at most ~{} tokens",
+            scratch as f64 / (1u64 << 30) as f64,
+            s as f64 / 12.5 / 60.0,
+            bind_limit as f64 / (1u64 << 30) as f64,
+            ((bind_limit / (2 * nqh as u64)) as f64).sqrt() as usize,
+        );
+
         let words = |rows: usize, cols: usize| (rows * cols / 2 * 4) as u64;
         let mut up = self.gpu.uploader();
         let h_buf = up.storage("p.h", words(mp, hs));
@@ -1285,7 +1325,8 @@ impl WgpuTextDecoder {
         }
 
         // per-call uniforms: multi-position extract + silu rows + softmax + repeat
-        self.write_silu_rows(s);
+        let silu_grid = self.write_silu_rows(s);
+        let softmax_grid = grid_xy(nqh * s);
         gpu.upload(
             &self.scratch.u_qkvx,
             bytemuck::bytes_of(&QkvxCfg {
@@ -1309,8 +1350,11 @@ impl WgpuTextDecoder {
                 m: s as u32,
                 mp: mp as u32,
                 scale: cfg.scale(),
+                gx: softmax_grid.0,
+                _p: 0,
             }),
         );
+        let repeat_grid = grid_xy((nqh * cur * hd / 2).div_ceil(256));
         gpu.upload(
             &u_rk,
             bytemuck::bytes_of(&RepeatKvCfg {
@@ -1319,7 +1363,7 @@ impl WgpuTextDecoder {
                 cur: cur as u32,
                 hd: hd as u32,
                 npw: (np * hd / 2) as u32,
-                _a: 0,
+                gx: repeat_grid.0,
             }),
         );
 
@@ -1382,11 +1426,7 @@ impl WgpuTextDecoder {
                 });
                 cp.set_pipeline(&self.pipes.repeat_kv);
                 cp.set_bind_group(0, &bg_rk, &[]);
-                cp.dispatch_workgroups(
-                    ((nqh * cur * hd / 2).div_ceil(256)) as u32,
-                    1,
-                    1,
-                );
+                cp.dispatch_workgroups(repeat_grid.0, repeat_grid.1, 1);
             }
 
             // 5. scores GEMM, batched over heads: [s, cur] = q × Kᵀ  (K is [cur, hd])
@@ -1412,7 +1452,7 @@ impl WgpuTextDecoder {
             });
             cp.set_pipeline(&self.pipes.softmax[&bs]);
             cp.set_bind_group(0, &bg_sm, &[]);
-            cp.dispatch_workgroups((nqh * s) as u32, 1, 1);
+            cp.dispatch_workgroups(softmax_grid.0, softmax_grid.1, 1);
 
             // 7. AV GEMM, batched: attn_flat[s, nqh*hd] = attn × V  (V is [cur, hd])
             gemm!(
@@ -1461,7 +1501,7 @@ impl WgpuTextDecoder {
             });
             cp.set_pipeline(&self.pipes.silu);
             cp.set_bind_group(0, &bg_silu, &[]);
-            cp.dispatch_workgroups(((s * inter / 2).div_ceil(256)) as u32, 1, 1);
+            cp.dispatch_workgroups(silu_grid.0, silu_grid.1, 1);
 
             gemm!(
                 &mut cp, &self.pipes.gemm_acc, &activated, &layer.dp_w, &h_buf,

@@ -276,6 +276,128 @@ vp 的行宽是 `pad_n/2`，写 0 正好是「head 维 padding」，没问题；
 
 ---
 
+## 上游 API 对齐（2026-09-14，对照 transformers 的 `Qwen3ASRProcessor`）
+
+**权威口径是 transformers 那条路**（`AutoProcessor.apply_transcription_request(audio, language=…,
+prompt=…)` + `AutoModelForMultimodalLM.generate` + `processor.decode(…, return_format="parsed")`），
+因为 12 组 gold 就是它生成的（`D:\Qwen3-ASR\run_hf_cuda.py`）。`qwen_asr` 那个包在本机 env 里
+**import 就报错**（vendored modeling 与 transformers 5.17 的 `check_model_inputs` 签名不匹配），
+而且它的 parser 与 transformers 的 parser 有几处细节不同 —— **以 transformers 为准**。
+
+本窗口按它补齐的：
+
+* **`context`（热词）= chat template 的 system 消息内容**（之前我们的 system 段是硬编码空）。
+  `WgpuAsr::transcribe_file_opts(..., &TranscribeOptions { context, language })`；
+  CLI 新增 **`--context`** / **`--lang`**。
+* **`language`**：接受 ISO 码或全名（大小写不敏感）→ 规范全名，其它报错
+  （= transformers 的 `resolve_language`）；随后按官方做法把 `language {NAME}<asr_text>`
+  预填到 assistant 轮。
+* **`parse_asr_output` 重写为 `_parse_single_output` 的逐行移植**：不再规范化语言、
+  只看第一行非空、`prefix == "language none"` 而非 contains、无 tag 时语言为空、
+  以及「强制语言时语言字段为空」（meta 在 prompt 里，生成的文本不带 meta）。
+* `detect_and_fix_repetitions` 的 pattern 窗口从 96 改回上游的 **20**（原来会把上游不折叠的
+  重复也折叠掉，属于行为差异）。
+
+**逐字验证（6 个用例，官方 vs 我们，0.6B / 15s_en）**：
+
+| 用例 | 官方 language | 官方文本 | 我们 |
+|---|---|---|---|
+| 无 context | English | MATCH | 文本逐字一致、language 一致 |
+| 热词 context | English | MATCH | 一致（连把 `swing` 变成 `wind` 的偏置都一致） |
+| `language="English"` | None | MATCH | 一致（language 也为空） |
+| `language="Chinese"` | None | MATCH | 一致 |
+| `language="en"`（ISO） | None | MATCH | 一致 |
+| 热词 + `language="English"` | None | MATCH | 一致 |
+
+补完这些之后 **12/12 基线复测仍全 MATCH**（prompt 空 context 时与原来逐 token 相同）。
+
+**逐层对齐证据**（0.6B / 15s_en，官方 transformers 路径 vs 我们）：
+
+| 层 | 结果 |
+|---|---|
+| **mel 前端** | 形状 `128×1500` 一致；**max\|d\| = 1.7e-5**、mean 1.7e-7（f32 最后一位量级，双方 FFT/算子顺序不同所致） |
+| **prompt** | token 数一致（15s_en：210），空 context 时逐 token 相同；带 context / 强制语言时输出也逐字一致 |
+| **生成 token 序列** | 我们 == 官方 **去掉末尾 `<\|im_end\|>`**（官方 `generate` 把终止符也算进 `generated_ids`，我们遇到 EOS 就停；两边 `decode(skip_special_tokens=True)` 都会把它去掉） |
+| **文本** | 12/12（0.6B/1.7B × 6 音频）逐字 MATCH；6 个 context/language 用例逐字一致 |
+| **特殊 token / 术语** | `<asr_text>` = 151704、`<\|im_start\|>`/`<\|im_end\|>` = 151644/151645、**EOS 集合 = 官方 `generation_config.json` 的 `[151643, 151645]`**、greedy（`do_sample=false`）、`max_new_tokens` 默认 512 —— 全部一致 |
+| **meta 术语** | 输出 `language <NAME><asr_text><text>`、语言规范表（30 个全名 + ISO 码）与官方逐条相同 |
+
+**API 面术语差异**（我们 vs 官方；功能等价，名字不同）：
+
+| 官方 | 我们 | 说明 |
+|---|---|---|
+| `apply_transcription_request(prompt=…)` | `TranscribeOptions.context` / `--context` | 官方 `qwen_asr` 包叫 `context`，transformers 处理器叫 `prompt`，两者指同一个东西 |
+| `ASRTranscription{language, text, time_stamps}` / parsed dict `{language, transcription}` | `TranscribeResult{text, language, raw_output}` | 字段名不同；`raw_output` 对应官方 `decode(return_format="raw")` |
+| `decode(return_format="raw"｜"parsed"｜"transcription_only")` | 只做 parsed（`prompt::decode_result`） | 没有 raw/transcription-only 的开关 |
+| `get_supported_languages()` | 无公开入口（`prompt::LANGUAGE_CODE_TO_NAME` 是 crate 内部） | 需要的话加一个 pub 访问器即可 |
+| `return_time_stamps=True` + `Qwen3-ForcedAligner` | — | 第二个模型，未移植 |
+| gold harness 的 `max_new` 规则 `max(256, min(2048, audio_s*8 + 64))` | CLI `--max-new`（默认 512） | 我们跑 180s 用 700（> 实际 585/641，不会截断） |
+
+**上游还有、我们没有的**（都属于另外的产品面，不是推理链）：时间戳（`Qwen3-ForcedAligner`
+是第二个模型）、流式（`ASRStreamingSession` / vLLM 后端）、批量（一次多音频）、
+>20 分钟音频的**静音点切片**（`split_audio_into_chunks`，阈值 1200 s；我们的 6 个 fixture
+都 ≤180 s，所以 gold 与我们的单段推理一致）、微调、vLLM serving / Gradio / DashScope。
+
+### 热词实测：能不能矫正转录（0.6B，真实错误）
+
+错误候选来自 **0.6B 与 1.7B baseline 的分歧**（同一段音频，两个尺寸不一致处通常有一边错），
+再结合上下文判定：
+
+| 片段 | 我们的错误 | 判定依据 | 给的热词 context | 结果 |
+|---|---|---|---|---|
+| 90s_en（交易课） | `order book` | 1.7B 说 `order block`；ICT 交易术语；上文在讲 swing trading | `Swing trading course. Terms: order block, time frame, four-hour chart, …, liquidity, entry model, stop loss.` | **修好** ✓ `order book → order block`；全文只有 6 处变化（含 `timeframe → time frame`），**零副作用** |
+| 180s_en（动画） | `Robo headbox.` | 下一句 "Please stop hitting me with my own arm"；1.7B 说 `headbutt` | 人名 + 动作词（`Robo, Panther, Beastbot, Banana Blaster, Jimmy, the Shroud, pandemonium particles, headbutt, intruder, lockdown`） | 修好 `headbox → headbutt` ✓，但**也丢了 4 处短句**（"Help, Panther!" / "Hey." / "Uh oh." / "How? Come on."）并新增 1 处错（`dimwit's snarl → dim wit. It's`） ✗ |
+| 同上 | 同上 | 同上 | **只给人名**（`Robo, Panther, Beastbot, Banana Blaster, Jimmy, the Shroud, pandemonium particles.`） | 没有删词/新错 ✓，把 `Banana blaster → Banana Blaster` 修正 ✓，但 `headbox` 没被修正（没点它） |
+
+**结论/用法**：context 是**真有效**的（`order book → order block` 是实打实的矫正），
+用法上：
+1. **领域术语最划算**：给一串同领域词（不只是那一个词）——模型会锁到该领域，修正未见过的词，
+   且这类 context 在长音频上表现稳定（90s_en 零副作用）。
+2. **纯专有名词列表最安全**：只影响拼写/大小写（`Banana Blaster`），不删词、不引入新错。
+3. **长 context + 小模型（0.6B）在长音频上有风险**：会掉短句/引入新错 —— 改完要 diff 一遍；
+   短音频（15s/30s）没观察到这种副作用。
+4. 上下文**只对当次请求生效**；加 context 后输出自然不再等于无 context 的 gold，
+   `--baseline` 那种逐字比对只适用于默认（无 context）路径。
+
+---
+
+## 长音频（>4 分钟）：本窗口实测与遗留限制
+
+`15m.wav`（16 kHz mono PCM16，926.93 s ≈ **12,065 token**）把这个仓库从没走过的路走了一遍，
+暴露的都是**容量/网格上限**（不是数学错），而且 6 个 fixture 都 ≤180 s，所以以前从没碰到：
+
+**已修的真 bug（都是同类：wgpu 每个 grid 维度上限 65535，超了整条命令缓冲被拒）**
+
+| 位置 | 触发点 | 修法 |
+|---|---|---|
+| 音频塔 `extract` | `s_pad·nh` > 65535，**~6 分钟** | grid 改成 `(s_pad, nh, hd/2)` |
+| prefill `silu` | `s·inter/2/256` > 65535，**~5.8 分钟** | 二维 grid + uniform 里的 `gx` |
+| prefill causal `softmax` | `nqh·s` > 65535，**~4.2 分钟** | 同上 |
+| `repeat_kv` | ~19 分钟（正好顶到 65536） | 同上 |
+| 音频塔 `bias_gelu` | FFN/proj1 的 `n/512`（85k / 170k） | 同上 |
+
+算术一律没动（只是把平坦下标换成 `x + y·gx·threads`）⇒ 短音频 12 组仍全 MATCH。
+
+**真正的硬限制：prefill 的因果注意力 scratch 是 O(s²)**（`decoder::prefill` 里的 `scores`/`attn`
+两块，各 `nqh·s²·2` 字节）。12,065 token 时 **≈4.7 GB × 2** ⇒ 既超 8 GB 显存，也超单绑定
+**2047 MiB** 上限；wgpu 的失败方式是**静默出垃圾**（表现为「prefill 70 ms + 乱码」）。
+现在 `prefill` 会**显式报错**（并把可支持的最大 token 数算给用户看）。
+`DECODER_MAX_SEQ` 从 4096 提到 **8192**（与 scratch 上限自洽；KV cache +~450 MB）。
+参考实现（transformers）走 **SDPA**，没有 O(s²) scratch，所以它 15 分钟能跑 —— **这是我们在长音频上唯一
+与 Python 原版不一致的地方**，要补就得把 prefill 注意力分块（两遍式精确 softmax），是个正经的 kernel 工程。
+
+**实测（0.6B）**
+
+| 输入 | 结果 |
+|---|---|
+| 15m.wav（12,065 token） | **明确拒绝**：`seq 12065 + max_new 512 exceeds decoder max_seq 8192`（之前是静默垃圾） |
+| 6m.wav（360 s / 4,695 token） | **跑通**：mel 50 / enc 1975 / prefill 4996 / decode 14397 ms，**峰值显存 4,600 MiB**；输出连贯 |
+| 同一 6m.wav 用官方 Python 跑 | prompt token **4,695 = 我们的 4,695**（逐 token 相同）；Python 83.2 s vs 我们 21.4 s；**文本 4,519 vs 4,520 字符，全长只有 1 处不同**（`you're` / `you are`，属 f16 边界处的取整抖动） |
+
+⇒ 结论：**结果是逐字对齐的（连没见过的 6 分钟长音频都只差一个缩写），长音频的容量是设计限制**。
+
+---
+
 ## 布局契约（单一来源，改代码前先读这里）
 
 `src/audio_encoder_gpu.rs` 的 **`ConvLevel`** 是唯一的几何来源；`LevelView` / `enc.level(i)`

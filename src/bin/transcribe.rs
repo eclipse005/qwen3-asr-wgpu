@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
-use qwen3_asr_wgpu::inference::EncoderBackend;
+use qwen3_asr_wgpu::inference::{EncoderBackend, TranscribeOptions};
 use qwen3_asr_wgpu::WgpuAsr;
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -54,6 +54,12 @@ fn main() -> Result<()> {
         if asr.gpu_encoder_active() { "gpu" } else { "cpu" }
     );
 
+    // Upstream parity knobs: `--context` (hotword/bias text, goes into the chat
+    // template's system message) and `--lang` (force the output language).
+    let opts = TranscribeOptions {
+        context: arg(&args, "--context").unwrap_or_default(),
+        language: arg(&args, "--lang"),
+    };
     let dump = arg(&args, "--dump").map(PathBuf::from);
     let compare_enc = flag(&args, "--compare-enc");
     if flag(&args, "--diag-enc") {
@@ -84,7 +90,9 @@ fn main() -> Result<()> {
         anyhow::ensure!(mel.len() % n_mels == 0, "mel length");
         let n_frames = mel.len() / n_mels;
         println!("mel: {n_mels}x{n_frames} from {mel_path}");
-        asr.transcribe_from_mel_cmp(&mel, n_mels, n_frames, max_new, dump.as_deref(), compare_enc)?
+        asr.transcribe_from_mel_cmp_opts(
+            &mel, n_mels, n_frames, max_new, dump.as_deref(), compare_enc, &opts,
+        )?
     } else if let Some(embeds_path) = arg(&args, "--embeds") {
         let raw = std::fs::read(&embeds_path)?;
         anyhow::ensure!(raw.len() % 4 == 0, "embeds not f32");
@@ -95,7 +103,7 @@ fn main() -> Result<()> {
         println!("embeds: {} from {embeds_path}", embeds.len());
         asr.transcribe_from_embeds(&embeds, max_new, dump.as_deref())?
     } else {
-        asr.transcribe_file(&wav, max_new, dump.as_deref(), compare_enc)?
+        asr.transcribe_file_opts(&wav, max_new, dump.as_deref(), compare_enc, &opts)?
     };
     let elapsed = t0.elapsed().as_secs_f64();
     let audio_s = if arg(&args, "--mel").is_none() && arg(&args, "--embeds").is_none() {
