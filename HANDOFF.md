@@ -361,6 +361,81 @@ prompt=…)` + `AutoModelForMultimodalLM.generate` + `processor.decode(…, retu
 
 ---
 
+## 流式 API + WER/CER 评测（2026-09-14 第三轮）
+
+### 流式（补齐「上游还有、我们没有的」第一条）
+
+新增（形状对照 `qwen3-asr-rs` 的 `AsrStreamingSession` / `transcribe_streaming`）：
+
+| 入口 | 说明 |
+|---|---|
+| `transcribe_file_streaming` / `transcribe_samples_streaming` | 每 token 回调 `StreamToken{token_id, text_so_far}`（原始解码，不做 language 切分/重复修复） |
+| `supported_languages()` | 30 个语言名（= 官方模型卡清单，与 `prompt::SUPPORTED_LANGUAGES` 同源） |
+| `create_streaming_session` → `push_samples` → `flush` / `flush_streaming` | 增量音频进、flush 出文本；每 104 token（8 conv chunk = 800 mel 帧）编码一个注意力窗口，内存 O(窗口) |
+| CLI | `--stream`（增量打到 stderr，stdout 仍是最终文本）、`--session`（按 1 s 喂进 session）、`--languages` |
+
+**验收**：6/6 fixture 的 session 文本与整段路径 MATCH（15s/30s/90s/180s 全语言）。
+
+**一处必须记住的偏差（原设计「逐位等价」的说法不成立）**：mel 的 log-max 归一化
+（`(max-8, +4)/4`）是**每次 `extract` 调用内**取 max。逐窗口编码时每个窗口用自己的 max，
+所以窗口 mel 与整段 mel 的差 **恰好**是常数 `(M_whole − M_window)/4`（探针实测，见
+`mel.rs::slice_extraction_matches_whole_clip_modulo_normalization`）。后果：文本 5/6 fixture
+逐字相同，`180s_zh` 差 2 处标点（`，`→`。`）+ 4 字（丢 `嗯，`）。真流式**不可能**知道整段的
+max，参考实现同样有这类漂移（它每次 push 用「已累积 buffer」重取 mel），因此选择保留真流式
+（增量编码、内存有界）并在文档记录偏差，而不是缓存整段音频。
+
+### WER/CER + RTFx 四组对比（真实音频 + 人工标注，parity 之外的第二个指标）
+
+parity（与 python-hf 逐字相同）是**回归信号**，不是目标；目标是与**人工转写**的 WER/CER。
+手头 6 个 fixture 没有人工真值（`docs/baseline/texts/` 全是 python-hf 输出），所以引入
+**FLEURS test**（29/30 个受支持语言；该镜像缺粤语 `yue_hant_hk`，22 个汉语方言 FLEURS 无覆盖）。
+
+工具链（都在本仓库，数据在 git-ignored 的 `eval_data/`）：
+
+```text
+tools/fetch_fleurs.ps1      从 modelscope.cn/pengzhendong/fleurs 拉数据（HF 不通）
+tools/run_fleurs_sweep.ps1  本移植版（-Tag w06 -Even 20），导出 hyps/langs/summary
+tools/run_python_hf.py      Python-HF 对照（--even 20 --tag py06，同一批 clip）
+tools/run_eval_all.ps1      四个 run + 最终表，**严格串行**（8 GB 卡装不下两个 ASR 客户端）
+tools/score_asr.py          归一化 + S/D/I 编辑距离（jiwer 交叉校验）+ 两系统逐句对比
+tools/score_final.py        最终表：4 组 WER/CER + 4 组 RTFx + 2 组逐音频对齐度
+src/bin/eval_asr.rs         评测入口（`--even N`：按文件大小≈时长排序后均匀取样）
+```
+
+**协议**：29 语言 × **20 条**（按文件大小排序后均匀取样，覆盖短/长音频），greedy、
+`max_new 256`、语言自动识别；两边同一批 clip；计时口径同为「读 wav → 出文本」，
+时序数字全部在**单作业**下测得。
+
+**结果（`docs/eval-fleurs-final.md`，2026-09-14）**：
+
+| 系统 | WER/CER 均值（29 语言） | RTFx 均值 |
+|---|---|---|
+| **wgpu 0.6B** | **21.50%** | **14.33×** |
+| python 0.6B | 21.51% | 7.34× |
+| **wgpu 1.7B** | **12.99%** | **7.01×** |
+| python 1.7B | 12.98% | 4.60× |
+
+- **逐音频对齐度**（与 Python 输出逐字相同）：0.6B **96.4%**、1.7B **97.4%**；
+  多数语言 100%，少数 80~95%（差异都是个别 clip 的标点/单字）。
+- **质量无退化**：每语言 WER/CER 与 Python 相差 −0.68 ~ +0.66 pp（多数 ±0.00），
+  1.7B 明显强于 0.6B（均值 13.0% vs 21.5%）。
+- **RTFx**：wgpu 分别是 Python 的 **1.95×**（0.6B）和 **1.52×**（1.7B）；慢语种
+  （希腊/印地）两边都低，因为那批 clip 更长。
+
+**度量口径（读表前必看）**：en 用 whisper `EnglishTextNormalizer`（数字/序数/缩略）；
+zh 加 `cn2an`；ar/fa 去变音符/tatweel 并折叠 alef/ya/ta-marbuta（21.3% → 16.4%）；
+zh/ja 两边去掉 FLEURS 参考里**没被朗读的拉丁人名**（`--strip-latin`）；其余用
+whisper `BasicTextNormalizer`。已知偏悲观项：日文表记差异（子供/子ども）未归一、
+中文时间表达（十一点三十五）cn2an 不转。
+
+### 顺带修的真 bug
+
+- `load_audio_wav`：FLEURS 镜像里 `ar_eg` 有一个 `data` 块声明 151492 字节、实际 147398 字节的
+  **截断 wav**，`hound` 直接报错。改成**读多少用多少**（libsndfile/ffmpeg 行为）并打 warning。
+- `prompt.rs` 的两个单测还是旧的 `parse_asr_output(raw, lang)` 签名，`cargo test` 编不过 —— 已修。
+
+---
+
 ## 长音频（>4 分钟）：本窗口实测与遗留限制
 
 `15m.wav`（16 kHz mono PCM16，926.93 s ≈ **12,065 token**）把这个仓库从没走过的路走了一遍，

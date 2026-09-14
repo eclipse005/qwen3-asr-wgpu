@@ -287,6 +287,47 @@ mod tests {
         assert!(y.iter().any(|v| *v != 0.0));
     }
 
+    /// The session's window slices must reproduce the whole-clip frames; the
+    /// only difference the extractor can introduce is its per-call log-mel max
+    /// normalization.  This locks that property down: every value moves by
+    /// `0 ..= -(M_whole - M_slice)/4` (large values are untouched, deep silence
+    /// clamps to the same floor on both sides).
+    #[test]
+    fn slice_extraction_matches_whole_clip_modulo_normalization() {
+        let wav = r"D:\qwen3-asr-rs\tests\fixtures\180s_zh.wav";
+        if !std::path::Path::new(wav).exists() {
+            return;
+        }
+        let samples = load_audio_wav(wav, MEL_SAMPLE_RATE).unwrap();
+        let ex = MelExtractor::new(N_FFT, HOP_LENGTH, 128, MEL_SAMPLE_RATE);
+        let (mel_w, n_mels, frames_w) = ex.extract(&samples).unwrap();
+        let m_whole = mel_w.iter().cloned().fold(f32::NEG_INFINITY, f32::max) * 4.0 - 4.0;
+
+        // Window 1 of the session's slicing: `2` hops of lead-in, `2` dropped frames.
+        let (win, drop) = (800usize, 2usize);
+        let f0 = win;
+        let lo = f0 * HOP_LENGTH - drop * HOP_LENGTH;
+        let hi = (f0 + win - 1) * HOP_LENGTH + N_FFT / 2;
+        let (mel_s, _n, frames_s) = ex.extract(&samples[lo..hi]).unwrap();
+        let m_slice = mel_s.iter().cloned().fold(f32::NEG_INFINITY, f32::max) * 4.0 - 4.0;
+        let shift = (m_whole - m_slice) / 4.0;
+
+        let (mut dmin, mut dmax) = (f32::INFINITY, f32::NEG_INFINITY);
+        for m in 0..n_mels {
+            for j in 0..win {
+                let d = mel_s[m * frames_s + drop + j] - mel_w[m * frames_w + f0 + j];
+                dmin = dmin.min(d);
+                dmax = dmax.max(d);
+            }
+        }
+        println!(
+            "M_whole {m_whole:.6} M_slice {m_slice:.6} shift {shift:.6} delta [{dmin:.6}, {dmax:.6}]"
+        );
+        assert!(shift > 0.0, "fixture should have a window max below the whole-clip max");
+        assert!(dmax.abs() < 1e-6, "slice values must never exceed the whole-clip ones: {dmax}");
+        assert!((dmin + shift).abs() < 1e-5, "delta floor {dmin} != -shift {}", -shift);
+    }
+
     #[test]
     fn resample_180s_en_vs_python_dump() {
         let wav = r"D:\qwen3-asr-rs\tests\fixtures\180s_en.wav";
@@ -393,24 +434,46 @@ fn load_audio_wav_impl(path: &std::path::Path, target_sr: u32) -> anyhow::Result
     let spec = reader.spec();
     let sr = spec.sample_rate;
     let channels = spec.channels as usize;
+    let max_val = (1i64 << (spec.bits_per_sample - 1)) as f32;
 
-    let samples_f32: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader
-            .into_samples::<f32>()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| anyhow::anyhow!("WAV read error: {}", e))?,
-        hound::SampleFormat::Int => {
-            let bits = spec.bits_per_sample;
-            let max_val = (1i64 << (bits - 1)) as f32;
-            reader
-                .into_samples::<i32>()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| anyhow::anyhow!("WAV read error: {}", e))?
-                .into_iter()
-                .map(|s| s as f32 / max_val)
-                .collect()
+    // A data chunk shorter than the header promises is not fatal: libsndfile and
+    // ffmpeg play what is there, and one FLEURS test wav ships that way (its
+    // `data` chunk claims 151492 bytes, the file holds 147398).  Keep the
+    // samples that could be read rather than failing the whole clip.
+    let mut truncated = false;
+    let mut samples_f32: Vec<f32> = Vec::new();
+    match spec.sample_format {
+        hound::SampleFormat::Float => {
+            for s in reader.into_samples::<f32>() {
+                match s {
+                    Ok(v) => samples_f32.push(v),
+                    Err(_) => {
+                        truncated = true;
+                        break;
+                    }
+                }
+            }
         }
-    };
+        hound::SampleFormat::Int => {
+            for s in reader.into_samples::<i32>() {
+                match s {
+                    Ok(v) => samples_f32.push(v as f32 / max_val),
+                    Err(_) => {
+                        truncated = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    anyhow::ensure!(!samples_f32.is_empty(), "WAV read error: no samples in {}", path.display());
+    if truncated {
+        eprintln!(
+            "warning: {} is truncated (header promises more samples), using {}",
+            path.display(),
+            samples_f32.len()
+        );
+    }
 
     let mono: Vec<f32> = if channels == 1 {
         samples_f32

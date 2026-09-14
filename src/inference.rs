@@ -38,6 +38,206 @@ pub enum EncoderBackend {
     Gpu,
 }
 
+/// Incremental audio in, text at [`StreamingSession::flush`] — the same shape
+/// as the reference port's `AsrStreamingSession`.
+///
+/// Audio is encoded as it arrives, in whole attention windows (104 tokens =
+/// 8 conv chunks = 800 mel frames), which is exactly the granularity the
+/// encoder is independent at: the conv stem runs per chunk, the attention is
+/// windowed, and a window is a whole multiple of `tpc`, so the positional
+/// embedding's `tok % tpc` phase matches the whole-clip pass.  `flush` reuses
+/// the ordinary decode path.
+///
+/// The mel *frames* are bit-identical to the whole-clip pass (a slice that
+/// starts `n_fft/2` of samples early reproduces them exactly — see
+/// [`Self::encode_window`]).  What a stream cannot reproduce is the
+/// extractor's log-mel max normalization, which is a property of the whole
+/// call: each window is normalized against its own max, so its values sit up
+/// to `(M_whole − M_window) / 4` below the whole-clip ones.  Measured on
+/// 0.6B: text identical to the whole-clip run on 5 of the 6 fixtures,
+/// `180s_zh` differs by two `，`→`。` and a dropped `嗯，`.  The reference port
+/// has the same class of deviation, and no live stream can know the final max
+/// in advance.
+pub struct StreamingSession<'a> {
+    asr: &'a mut WgpuAsr,
+    opts: TranscribeOptions,
+    max_new_tokens: usize,
+    /// Un-consumed 16 kHz samples; `samples[0]` is global sample `base`.
+    samples: Vec<f32>,
+    base: usize,
+    /// Next global mel frame to encode.
+    frame: usize,
+    embeds: Vec<f32>,
+    n_mels: usize,
+    out_dim: usize,
+    /// Mel frames in one attention window (`cs · n_window_infer/cs`).
+    win_frames: usize,
+}
+
+impl WgpuAsr {
+    /// Start an incremental session (audio in via [`StreamingSession::push_samples`]).
+    pub fn create_streaming_session(
+        &mut self,
+        opts: TranscribeOptions,
+        max_new_tokens: usize,
+    ) -> Result<StreamingSession<'_>> {
+        let (cs, n_window_infer, n_mels, out_dim) = {
+            let ac = &self.config.thinker_config.audio_config;
+            (ac.n_window * 2, ac.n_window_infer, ac.num_mel_bins, ac.output_dim)
+        };
+        let win_frames = cs * (n_window_infer / cs).max(1);
+        Ok(StreamingSession {
+            asr: self,
+            opts,
+            max_new_tokens,
+            samples: Vec::new(),
+            base: 0,
+            frame: 0,
+            embeds: Vec::new(),
+            n_mels,
+            out_dim,
+            win_frames,
+        })
+    }
+}
+
+impl StreamingSession<'_> {
+    /// Feed more 16 kHz mono audio; every complete window is encoded on the way in.
+    pub fn push_samples(&mut self, samples: &[f32]) -> Result<()> {
+        self.samples.extend_from_slice(samples);
+        loop {
+            // The window covers global frames `[frame, frame + win_frames)`; its
+            // last frame needs samples up to `(f_last)·hop + n_fft/2`.
+            let f_last = self.frame + self.win_frames - 1;
+            let need_end = f_last * HOP_LENGTH + N_FFT / 2;
+            if self.base + self.samples.len() < need_end {
+                break;
+            }
+            self.encode_window(Some(self.win_frames))?;
+        }
+        Ok(())
+    }
+
+    /// Encode the remaining audio and decode the text.
+    pub fn flush(&mut self) -> Result<TranscribeResult> {
+        self.flush_streaming(|_| {})
+    }
+
+    /// [`Self::flush`] with a per-token callback.
+    pub fn flush_streaming<F>(&mut self, mut on_token: F) -> Result<TranscribeResult>
+    where
+        F: FnMut(StreamToken),
+    {
+        // Encode whatever is left (a partial window is fine — that is what the
+        // whole-clip path does for its tail chunk too).  The extractor makes
+        // `len / hop` frames for `len` samples, over the whole stream pushed so
+        // far: `base + samples.len()`.
+        let total_frames = (self.base + self.samples.len()) / HOP_LENGTH;
+        if total_frames > self.frame {
+            self.encode_window(None)?;
+        }
+        let embeds = std::mem::take(&mut self.embeds);
+        self.asr.decode_from_audio_embeds(
+            &embeds,
+            self.max_new_tokens,
+            None,
+            0.0,
+            0.0,
+            &self.opts.clone(),
+            Some(&mut on_token),
+        )
+    }
+
+    /// Encode `n_frames` frames starting at `self.frame` (or all that the buffer
+    /// holds, when `None`) and append the result.
+    ///
+    /// The mel is recomputed for just this slice: `MelExtractor` frames depend
+    /// on `±n_fft/2` samples, so a slice that starts an integral number of hops
+    /// before the first frame we keep reproduces the whole-clip frames exactly
+    /// (frames whose 400-sample window would touch the slice's own reflection
+    /// are dropped — two of them, or none at the very start of the stream).
+    /// The extractor's per-call max normalization is the one thing that differs;
+    /// see the [`StreamingSession`] docs.
+    fn encode_window(&mut self, n_frames: Option<usize>) -> Result<()> {
+        let f0 = self.frame;
+        let want_from = f0 * HOP_LENGTH;
+        let slice_start = want_from.saturating_sub(2 * HOP_LENGTH);
+        let drop = (want_from - slice_start) / HOP_LENGTH;
+        let hi = match n_frames {
+            Some(n) => {
+                let end = (f0 + n - 1) * HOP_LENGTH + N_FFT / 2;
+                anyhow::ensure!(end <= self.base + self.samples.len(), "stream slice past the buffer");
+                end - self.base
+            }
+            None => self.samples.len(),
+        };
+        let lo = slice_start - self.base;
+        let (mel, n_mels, frames) = self.asr.mel.extract(&self.samples[lo..hi])?;
+        anyhow::ensure!(n_mels == self.n_mels, "mel bins {n_mels} != {}", self.n_mels);
+        let n = match n_frames {
+            Some(n) => n,
+            None => frames.saturating_sub(drop),
+        };
+        anyhow::ensure!(n > 0 && frames >= drop + n, "mel slice too short ({frames} frames, need {})", drop + n);
+
+        let mut win = vec![0.0f32; self.n_mels * n];
+        for m in 0..self.n_mels {
+            let src = m * frames + drop;
+            win[m * n..(m + 1) * n].copy_from_slice(&mel[src..src + n]);
+        }
+        let embeds = self.asr.run_encoder(&win, self.n_mels, n, false)?;
+        let tokens = embeds.len() / self.out_dim;
+        anyhow::ensure!(embeds.len() == tokens * self.out_dim, "encoder output not a whole number of tokens");
+        self.embeds.extend_from_slice(&embeds);
+        self.frame += n;
+
+        // Drop what can no longer be needed: the next slice starts two hops
+        // before the next window's first frame.
+        let keep_from = (self.frame * HOP_LENGTH).saturating_sub(2 * HOP_LENGTH);
+        if keep_from > self.base {
+            self.samples.drain(..(keep_from - self.base));
+            self.base = keep_from;
+        }
+        Ok(())
+    }
+
+    /// Tokens encoded so far (one per audio token; the prompt adds the rest).
+    pub fn encoded_tokens(&self) -> usize {
+        self.embeds.len() / self.out_dim
+    }
+}
+
+/// One incremental decode event, mirroring the reference port's `StreamToken`
+/// (`qwen3-asr-rs`'s `transcribe_streaming` callback).
+#[derive(Debug, Clone)]
+pub struct StreamToken {
+    /// The token id the decoder just produced.
+    pub token_id: u32,
+    /// Raw decoding of every token generated so far — not parsed (no
+    /// `language X<asr_text>` split, no repetition fix), so a caller sees the
+    /// text grow exactly as the reference's callback does.
+    pub text_so_far: String,
+}
+
+/// The languages the forced-language suffix accepts, in upstream's order
+/// (`qwen_asr.inference.utils.SUPPORTED_LANGUAGES` / the processor's
+/// `LANGUAGE_CODE_TO_NAME` values — the two lists are the same 30 names).
+pub fn supported_languages() -> &'static [&'static str] {
+    &prompt::SUPPORTED_LANGUAGES
+}
+
+fn emit_token(
+    cb: &mut dyn FnMut(StreamToken),
+    tokenizer: &tokenizers::Tokenizer,
+    generated: &[u32],
+) -> Result<()> {
+    let text_so_far = tokenizer
+        .decode(generated, true)
+        .map_err(|e| anyhow::anyhow!("decode: {}", e))?;
+    cb(StreamToken { token_id: *generated.last().unwrap_or(&0), text_so_far });
+    Ok(())
+}
+
 /// Round-to-even pad of a width — mirrors `audio_encoder_gpu`'s mel stride.
 fn mel_pad_even(v: usize) -> usize {
     if v % 2 == 1 { v + 1 } else { v }
@@ -241,6 +441,59 @@ impl WgpuAsr {
         self.transcribe_samples_impl(&samples, max_new_tokens, dump_dir, compare_enc, opts)
     }
 
+    /// [`Self::transcribe_file_opts`] with a per-token callback.
+    ///
+    /// `on_token` fires once per generated token with the token id and the raw
+    /// text so far — the same shape as the reference port's
+    /// `transcribe_streaming`.  The callback is host-side only: the token stream
+    /// (and therefore the final text) is identical to the non-streaming call.
+    pub fn transcribe_file_streaming<F>(
+        &mut self,
+        wav: &Path,
+        max_new_tokens: usize,
+        dump_dir: Option<&Path>,
+        compare_enc: bool,
+        opts: &TranscribeOptions,
+        mut on_token: F,
+    ) -> Result<TranscribeResult>
+    where
+        F: FnMut(StreamToken),
+    {
+        let samples = load_audio_wav(wav, MEL_SAMPLE_RATE)?;
+        if let Some(dir) = dump_dir {
+            std::fs::create_dir_all(dir)?;
+            let mut bytes = Vec::with_capacity(samples.len() * 4);
+            for v in &samples {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            std::fs::write(dir.join("wave16k.f32"), bytes)?;
+        }
+        self.transcribe_samples_streaming(&samples, max_new_tokens, dump_dir, compare_enc, opts, &mut on_token)
+    }
+
+    /// [`Self::transcribe_samples`] with a per-token callback.
+    pub fn transcribe_samples_streaming<F>(
+        &mut self,
+        samples: &[f32],
+        max_new_tokens: usize,
+        dump_dir: Option<&Path>,
+        compare_enc: bool,
+        opts: &TranscribeOptions,
+        mut on_token: F,
+    ) -> Result<TranscribeResult>
+    where
+        F: FnMut(StreamToken),
+    {
+        self.transcribe_samples_impl_stream(
+            samples,
+            max_new_tokens,
+            dump_dir,
+            compare_enc,
+            opts,
+            Some(&mut on_token),
+        )
+    }
+
     /// Mel-in entry point with an optional CPU-vs-GPU encoder comparison.
     pub fn transcribe_from_mel_cmp(
         &mut self,
@@ -291,6 +544,7 @@ impl WgpuAsr {
             0.0,
             t_enc.as_secs_f64() * 1000.0,
             opts,
+            None,
         )
     }
 
@@ -818,6 +1072,7 @@ impl WgpuAsr {
             0.0,
             t_enc.as_secs_f64() * 1000.0,
             &TranscribeOptions::default(),
+            None,
         )
     }
 
@@ -834,6 +1089,7 @@ impl WgpuAsr {
             0.0,
             0.0,
             &TranscribeOptions::default(),
+            None,
         )
     }
 
@@ -853,6 +1109,19 @@ impl WgpuAsr {
         dump_dir: Option<&Path>,
         compare_enc: bool,
         opts: &TranscribeOptions,
+    ) -> Result<TranscribeResult> {
+        self.transcribe_samples_impl_stream(samples, max_new_tokens, dump_dir, compare_enc, opts, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transcribe_samples_impl_stream(
+        &mut self,
+        samples: &[f32],
+        max_new_tokens: usize,
+        dump_dir: Option<&Path>,
+        compare_enc: bool,
+        opts: &TranscribeOptions,
+        stream: Option<&mut dyn FnMut(StreamToken)>,
     ) -> Result<TranscribeResult> {
         let t0 = Instant::now();
         let (mel, n_mels, n_frames) = self.mel.extract(samples)?;
@@ -881,6 +1150,7 @@ impl WgpuAsr {
             t_mel.as_secs_f64() * 1000.0,
             t_enc.as_secs_f64() * 1000.0,
             opts,
+            stream,
         )
     }
 
@@ -893,6 +1163,7 @@ impl WgpuAsr {
         t_mel_ms: f64,
         t_enc_ms: f64,
         opts: &TranscribeOptions,
+        mut stream: Option<&mut dyn FnMut(StreamToken)>,
     ) -> Result<TranscribeResult> {
         let hs = self.config.thinker_config.text_config.hidden_size;
         let nat = audio_embeds.len() / hs;
@@ -955,12 +1226,18 @@ impl WgpuAsr {
         let t3 = Instant::now();
         if !eos.contains(&first) {
             generated.push(first as u32);
+            if let Some(cb) = stream.as_deref_mut() {
+                emit_token(cb, &self.tokenizer, &generated)?;
+            }
             for _ in 1..max_new_tokens {
                 let tok = self.decoder.step()?;
                 if eos.contains(&tok) {
                     break;
                 }
                 generated.push(tok as u32);
+                if let Some(cb) = stream.as_deref_mut() {
+                    emit_token(cb, &self.tokenizer, &generated)?;
+                }
             }
         }
         let t_decode = t3.elapsed();

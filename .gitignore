@@ -12,6 +12,13 @@
 # alignment dumps vs Python (regenerable)
 /align_dump/
 
+# WER/CER evaluation data (FLEURS tars + extracted wavs; see docs/eval-fleurs.md)
+/eval_data/
+
+# python bytecode from the eval tools
+__pycache__/
+*.pyc
+
 # probe dump bins (regenerable via examples/exp_probe.rs + src/bin/exp_probe.rs)
 exp_probe/*.bin
 

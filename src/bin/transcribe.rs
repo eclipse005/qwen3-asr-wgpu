@@ -62,6 +62,10 @@ fn main() -> Result<()> {
     };
     let dump = arg(&args, "--dump").map(PathBuf::from);
     let compare_enc = flag(&args, "--compare-enc");
+    if flag(&args, "--languages") {
+        println!("{}", qwen3_asr_wgpu::inference::supported_languages().join(", "));
+        return Ok(());
+    }
     if flag(&args, "--diag-enc") {
         if let Some(mel_path) = arg(&args, "--mel") {
             let raw = std::fs::read(&mel_path)?;
@@ -102,6 +106,29 @@ fn main() -> Result<()> {
             .collect();
         println!("embeds: {} from {embeds_path}", embeds.len());
         asr.transcribe_from_embeds(&embeds, max_new, dump.as_deref())?
+    } else if flag(&args, "--session") {
+        // Feed the wav through the incremental session in 1 s chunks (what a
+        // live source would do), then flush — the text must equal the
+        // whole-clip run.
+        let samples = qwen3_asr_wgpu::mel::load_audio_wav(&wav, 16_000)?;
+        let mut sess = asr.create_streaming_session(opts.clone(), max_new)?;
+        let chunk = 16_000;
+        for part in samples.chunks(chunk) {
+            sess.push_samples(part)?;
+        }
+        println!("session encoded {} tokens", sess.encoded_tokens());
+        sess.flush()?
+    } else if flag(&args, "--stream") {
+        // Per-token callback (reference port's `transcribe_streaming`): the
+        // incremental text goes to stderr, so stdout still carries the final
+        // text for `--baseline`.
+        let mut shown = 0usize;
+        asr.transcribe_file_streaming(&wav, max_new, dump.as_deref(), compare_enc, &opts, |t| {
+            if t.text_so_far.len() > shown {
+                eprint!("{}", &t.text_so_far[shown..]);
+                shown = t.text_so_far.len();
+            }
+        })?
     } else {
         asr.transcribe_file_opts(&wav, max_new, dump.as_deref(), compare_enc, &opts)?
     };

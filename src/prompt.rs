@@ -196,6 +196,16 @@ pub(crate) const LANGUAGE_CODE_TO_NAME: [(&str, &str); 30] = [
     ("vi", "Vietnamese"),
 ];
 
+/// `qwen_asr.inference.utils.SUPPORTED_LANGUAGES` — the canonical names the
+/// forced-language suffix may carry, in upstream's order.  (The processor's
+/// code map above holds the same 30 names, ordered by language code.)
+pub(crate) const SUPPORTED_LANGUAGES: [&str; 30] = [
+    "Chinese", "English", "Cantonese", "Arabic", "German", "French", "Spanish", "Portuguese",
+    "Indonesian", "Italian", "Korean", "Russian", "Thai", "Vietnamese", "Japanese", "Turkish",
+    "Hindi", "Malay", "Dutch", "Swedish", "Danish", "Finnish", "Polish", "Czech", "Filipino",
+    "Persian", "Greek", "Romanian", "Hungarian", "Macedonian",
+];
+
 /// Port of Python `detect_and_fix_repetitions` (threshold default 20).
 ///
 /// `max_pattern_len` is upstream's 20: a longer window collapses repeats the
@@ -320,15 +330,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_forced_strips_asr_text_tag() {
-        let (lang, text) = parse_asr_output("<asr_text>hello world", Some("Chinese"));
-        assert_eq!(lang, "Chinese");
+    fn parse_forced_has_empty_language() {
+        let (lang, text) = parse_asr_output("<asr_text>hello world");
+        assert_eq!(lang, "");
         assert_eq!(text, "hello world");
     }
 
     #[test]
     fn parse_unforced_splits_tag() {
-        let (lang, text) = parse_asr_output("language Chinese<asr_text>正文", None);
+        let (lang, text) = parse_asr_output("language Chinese<asr_text>正文");
         assert_eq!(lang, "Chinese");
         assert_eq!(text, "正文");
     }
