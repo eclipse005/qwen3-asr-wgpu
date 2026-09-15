@@ -17,16 +17,21 @@ against the frozen python-hf text) on every runtime this machine has:
 |---|---|---|---|---|---|---|---|
 | `vulkan:0` | NVIDIA P104-100 | 1012 | 1534 | 5788 | 10.5 s | **17.8×** | MATCH |
 | `dx12:0` | NVIDIA GTX 1070 | 1007 | 1644 | 8934 | 13.7 s | 12.9× | MATCH |
-| `cpu` | host (20 threads, f32 widening) | — | — | — | 83.6 s | 2.11× | MATCH |
+| `cpu` | host (20 threads, f32 KV) | — | — | — | 65.1 s | 2.71× | MATCH |
 | `vulkan:1` | Intel iGPU | 9176 | 14816 | 25062 | 49 s | 3.6× | MATCH |
 | `gl:0` | Intel iGPU (OpenGL) | 7083 | 12131 | 29992 | 51 s | 3.46× | MATCH |
 
 `cpu` is the host decoder (`--cpu-dec`): no adapter, f16 weights widened to f32
-once at load, rayon over output rows (see `src/cpu_decoder.rs` for the three
-measured pathologies that shaped it — 355 ms/token when the GEMV was sliced by
-batch, 5.5 s of prefill when it was sliced by `(row, output)` and re-read the
-weights per row, and conversion-bound inner loops).  Its six-fixture RTFx:
-3.59 / 3.06 / 2.70 / 2.84 / 2.11 / 2.03 (15 s … 180 s).
+once at load, rayon over output rows and over `(row, head)` in the attention.
+`src/cpu_decoder.rs` records the five measured pathologies that shaped it, each
+with its number: 355 ms/token when the GEMV was sliced by batch (decode is
+batch 1); 5.5 s of prefill when it was sliced by `(row, output)` and re-read the
+weights per row instead of streaming them once; 5.4 s of prefill when the
+`f16 → f32` conversion sat inside the inner loop; 18 s of a 34 s prefill when
+the attention converted the f16 caches per key per query row; and 136 ms/token
+when the attention was parallelised per row (a decode step *is* one row) instead
+of per `(row, head)`.  Its six-fixture RTFx:
+3.46 / 3.07 / 3.16 / 3.31 / 2.71 / 2.60 (15 s … 180 s).
 
 One portability bug had to be fixed to get there, and it is the best argument for
 this table existing: `Features::SUBGROUP` is a *capability*, not a width.  Intel's

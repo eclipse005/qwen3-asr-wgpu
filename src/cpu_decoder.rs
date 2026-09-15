@@ -207,9 +207,14 @@ pub struct CpuTextDecoder {
     /// uploads, so the rounding matches.
     cos: Vec<f32>,
     sin: Vec<f32>,
-    /// `[layer][nkvh][max_seq][hd]`, f16 like the GPU caches.
-    k_cache: Vec<f16>,
-    v_cache: Vec<f16>,
+    /// `[layer][nkvh][max_seq][hd]` — the GPU caches hold f16; these hold the
+    /// **same** values already widened to f32, because both attention loops
+    /// read every cached element once per query row and a per-element
+    /// `f16 → f32` there is exactly the conversion-bound pathology that cost
+    /// 18 s of a 34 s prefill.  Every store goes through `f16::from_f32` first,
+    /// so the numbers are bit-identical to the GPU's caches.
+    k_cache: Vec<f32>,
+    v_cache: Vec<f32>,
     /// Milliseconds per phase (norm, projections, rope, attention, mlp) —
     /// filled in by [`Self::forward`] and printed by `QASR_CPU_PROFILE=1`.
     pub profile: [f64; 5],
@@ -249,8 +254,8 @@ impl CpuTextDecoder {
             last_token: 0,
             cos: zeros.clone(),
             sin: zeros,
-            k_cache: vec![f16::from_f32(0.0); cfg.num_hidden_layers * kv],
-            v_cache: vec![f16::from_f32(0.0); cfg.num_hidden_layers * kv],
+            k_cache: vec![0.0; cfg.num_hidden_layers * kv],
+            v_cache: vec![0.0; cfg.num_hidden_layers * kv],
             profile: [0.0; 5],
             cfg,
         })
@@ -318,52 +323,90 @@ impl CpuTextDecoder {
         let scale = 1.0f32 / (hd as f32).sqrt();
         let rep = nqh / nkvh;
         let kv_stride = self.max_seq * hd;
-        let v_base = layer * nkvh * kv_stride;
+        let base = layer * nkvh * kv_stride;
+        let _cur = (q0 + attn.len() / (nqh * hd)).min(self.max_seq);
 
-        // Parallel over (row, head), not over rows: a decode step has one row,
-        // and slicing by row would leave 15 of 16 heads idle.
-        attn.par_chunks_mut(hd).enumerate().for_each(|(hi, out)| {
+        // The caches are already f32 (see the field docs), so no loop here
+        // converts anything per element: that conversion, once per key per query
+        // row, was 18 s of a 34 s prefill.
+        //
+        // One task per *row* (all heads), so the score/accumulator scratch is
+        // allocated once per row instead of once per (row, head).
+        // One task per *(row, head)*: a decode step has a single row, so
+        // grouping the heads into one task would run the whole scan on one core
+        // (measured 136 ms/token).  `map_init` gives each rayon worker its own
+        // scratch, so this does not allocate per task either.
+        let row_elems = nqh * hd;
+        attn.par_chunks_mut(hd)
+            .enumerate()
+            .map_init(
+                || {
+                    (
+                        vec![0.0f32; self.max_seq],
+                        vec![0.0f32; hd],
+                        vec![0.0f32; hd],
+                    )
+                },
+                |(scores, acc, qrow), (hi, out)| {
             let (r, h) = (hi / nqh, hi % nqh);
             let pos = q0 + r;
-            let cur = (pos + 1).min(self.max_seq);
-            let mut scores = vec![0.0f32; cur];
+            let valid = (pos + 1).min(self.max_seq);
             {
-                let qrow = &q[r * nqh * hd + h * hd..r * nqh * hd + (h + 1) * hd];
+                let qh = &q[r * row_elems + h * hd..r * row_elems + (h + 1) * hd];
+                // The query head is f16 (it comes out of the rope epilogue), so
+                // it is widened once per (row, head) — not per key.
+                for (d, s) in qrow.iter_mut().zip(qh) {
+                    *d = s.to_f32();
+                }
                 let kh = h / rep;
-                let k_base = layer * nkvh * kv_stride + kh * kv_stride;
-                let v_b = v_base + kh * kv_stride;
+                let kh_base = base + kh * kv_stride;
+                let krow_all = &self.k_cache[kh_base..kh_base + valid * hd];
+                let vrow_all = &self.v_cache[kh_base..kh_base + valid * hd];
+                // Four accumulators per key row: a single `dot` serialises the
+                // FMA chain on ~4-cycle latency, and the decode scan (2307 keys
+                // x 128 dims per head) is latency-bound long before it is
+                // bandwidth-bound — measured 147 ms/token with one accumulator.
                 let mut best = f32::NEG_INFINITY;
-                for (t, sc) in scores.iter_mut().enumerate() {
-                    let krow = &self.k_cache[k_base + t * hd..k_base + (t + 1) * hd];
-                    let mut dot = 0.0f32;
-                    for j in 0..hd {
-                        dot += qrow[j].to_f32() * krow[j].to_f32();
+                let quads = hd / 4;
+                for t in 0..valid {
+                    let krow = &krow_all[t * hd..(t + 1) * hd];
+                    let mut a = [0.0f32; 4];
+                    for q in 0..quads {
+                        let j = q * 4;
+                        a[0] += qrow[j] * krow[j];
+                        a[1] += qrow[j + 1] * krow[j + 1];
+                        a[2] += qrow[j + 2] * krow[j + 2];
+                        a[3] += qrow[j + 3] * krow[j + 3];
                     }
+                    let dot = (a[0] + a[1]) + (a[2] + a[3]);
                     let s = dot * scale;
-                    *sc = s;
+                    scores[t] = s;
                     if s > best {
                         best = s;
                     }
                 }
                 let mut sum = 0.0f32;
-                for s in scores.iter_mut() {
+                for s in scores[..valid].iter_mut() {
                     *s = (*s - best).exp();
                     sum += *s;
                 }
                 let inv = 1.0 / sum;
-                let mut acc = vec![0.0f32; hd];
-                for (t, sc) in scores.iter().enumerate() {
+                for a in acc.iter_mut() {
+                    *a = 0.0;
+                }
+                for (t, sc) in scores[..valid].iter().enumerate() {
                     let w = sc * inv;
-                    let vrow = &self.v_cache[v_b + t * hd..v_b + (t + 1) * hd];
+                    let vrow = &vrow_all[t * hd..(t + 1) * hd];
                     for j in 0..hd {
-                        acc[j] += w * vrow[j].to_f32();
+                        acc[j] += w * vrow[j];
                     }
                 }
                 for j in 0..hd {
                     out[j] = f16::from_f32(acc[j]);
                 }
             }
-        });
+        })
+        .for_each(|_| {});
     }
 
     /// One forward over `rows` positions starting at `q0`; `x` is `[rows][hs]`
@@ -420,10 +463,13 @@ impl CpuTextDecoder {
                     raw.copy_from_slice(&k[off..off + hd]);
                     self.norm_rope_head(&raw, &layer.kn, pos, &mut tmp);
                     let dst = k_layer + h * kv_stride + pos * hd;
-                    self.k_cache[dst..dst + hd].copy_from_slice(&tmp);
-                    let src = &v[off..off + hd];
+                    for (d, t) in self.k_cache[dst..dst + hd].iter_mut().zip(&tmp) {
+                        *d = t.to_f32(); // `tmp` is already f16-rounded
+                    }
                     let dv = v_off + h * kv_stride + pos * hd;
-                    self.v_cache[dv..dv + hd].copy_from_slice(src);
+                    for (d, s) in self.v_cache[dv..dv + hd].iter_mut().zip(&v[off..off + hd]) {
+                        *d = s.to_f32();
+                    }
                 }
             }
 
