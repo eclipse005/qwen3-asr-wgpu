@@ -21,6 +21,14 @@ against the frozen python-hf text) on every runtime this machine has:
 | `vulkan:1` | Intel iGPU | 9176 | 14816 | 25062 | 49 s | 3.6× | MATCH |
 | `gl:0` | Intel iGPU (OpenGL) | 7083 | 12131 | 29992 | 51 s | 3.46× | MATCH |
 
+A caveat that costs more than any of the above: on **D3D12 the pipeline build takes
+~5.5 minutes** (measured: 344 s on Intel, 328 s on NVIDIA, against 4.6 / 6.6 s on
+Vulkan for their own Vulkan adapters) — wgpu goes through naga → HLSL → FXC, and
+these kernels are heavily unrolled with the bit-exact integer `expf_bt` on the
+critical path, which is what FXC is slowest at (~40 pipelines x ~8 s).  The
+timings in this table are *after* that load; a `PipelineCache` (D3D12's
+`ID3D12PipelineLibrary`, persisted) is the fix and is on the list.
+
 `cpu` is the host decoder (`--cpu-dec`): no adapter, f16 weights widened to f32
 once at load, rayon over output rows and over `(row, head)` in the attention.
 `src/cpu_decoder.rs` records the five measured pathologies that shaped it, each

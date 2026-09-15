@@ -21,8 +21,15 @@
 > 于是**整个模型输出流利的垃圾而且不报任何错**（只有转写文本能看出）。
 > 现在 shuffle 路径只在 `min == max == 32` 时启用，其余走共享内存版（逐位相同）。
 > 验证矩阵（0.6B / 180s_en / 逐字对 python-hf）：**NVIDIA Vulkan ✓、NVIDIA D3D12 ✓、
-> Intel 集显 Vulkan ✓**（iGPU 总耗时 ~49 s、RTFx 3.6）；**Intel D3D12 没验完** ——
-> 180s 跑 9 分钟没结束（同机 Vulkan 只要 49 s），先记为待查。
+> Intel 集显 Vulkan ✓、**gl:0 ✓**（iGPU 49 s / 51 s，RTFx 3.6 / 3.46）。
+> **D3D12 的「9 分钟没跑完」已定位（第五轮）：不是算力，是管线编译** ——
+> 15s 输入实测 `loaded in`：Intel D3D12 **344 s**、**NVIDIA D3D12 也 328 s**、两家 Vulkan
+> 只有 4.6 / 6.6 s ⇒ **与厂商无关，是这套栈 D3D12 后端的问题**（wgpu 走 naga→HLSL→FXC，
+> 而我们的 kernel 有大量手工展开 + 位精确 `expf_bt` 的整数序列，正是 FXC 最慢的形态；
+> ~40 条管线 × ~8 s）。加载之后相位健康：NVIDIA D3D12 enc 135 / prefill 183 / decode 29 ms
+> （比 Vulkan 慢 15–25%）；Intel D3D12 1847 / 3330 / 103 ms（慢 ~2×）。
+> **修法**：上 wgpu 的 `PipelineCache`（D3D12 = `ID3D12PipelineLibrary`，可落盘 ⇒ 第二次运行
+> 免重编）；次优是「按需建管线」（6 个 softmax 变体现在一次全建，每次只用一个）。
 > 另外：`processor.rs`（原版三步 API：apply_transcription_request / generate /
 > decode(ReturnFormat)）、README/LICENSE/docs/PORTING.md（移植指南：11 个坑 + 死路表）。
 
