@@ -298,8 +298,75 @@ struct Pipes {
     slab_merge: wgpu::ComputePipeline,
 }
 
+/// The three bind groups that read a layer's KV cache: the write side
+/// (`extract`, bindings 6/7) and the two attention readers (`gqa` 1/2,
+/// `gqa_split` 1/2).  Every other bind group a layer owns is KV-independent, so
+/// reallocating the cache means rebuilding exactly these — see
+/// [`WgpuTextDecoder::ensure_capacity`].
+fn kv_bind_groups(
+    gpu: &Gpu,
+    pipes: &Pipes,
+    scratch: &Scratch,
+    qn_w: &wgpu::Buffer,
+    kn_w: &wgpu::Buffer,
+    k_cache: &wgpu::Buffer,
+    v_cache: &wgpu::Buffer,
+) -> (wgpu::BindGroup, wgpu::BindGroup, wgpu::BindGroup) {
+    let bg_extract = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("qkv_extract"),
+        layout: &pipes.extract.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: scratch.qkv.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: qn_w.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: kn_w.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: scratch.cos.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: scratch.sin.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: scratch.q_out.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: k_cache.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7, resource: v_cache.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: scratch.u_qkvx.as_entire_binding() },
+        ],
+    });
+    let bg_gqa = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("gqa"),
+        layout: &pipes.gqa256.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: scratch.q_out.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: k_cache.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: v_cache.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: scratch.attn_out.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: scratch.u_gqa.as_entire_binding() },
+        ],
+    });
+    let bg_gqa_split = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("gqa_split"),
+        layout: &pipes.gqa_split256.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: scratch.q_out.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: k_cache.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: v_cache.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: scratch.split_part_out.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: scratch.split_part_max.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: scratch.split_part_sum.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: scratch.u_gp1.as_entire_binding() },
+        ],
+    });
+    (bg_extract, bg_gqa, bg_gqa_split)
+}
+
 /// Capacity of the single-block attention path.
 pub const GQA_SINGLE_CAP: usize = 1024;
+
+/// KV slots allocated at load (112 KiB each, see [`WgpuTextDecoder::load`]).
+///
+/// `max_seq` is the ceiling, not the allocation: the cache grows from here on
+/// demand ([`WgpuTextDecoder::ensure_capacity`]), so a 15-minute request does not
+/// make every 15-second clip pay for the 16 384 slots it might need.
+pub const KV_INITIAL_CAP: usize = 1024;
+
+/// Capacity grows in multiples of this — a series of clips of one shape then
+/// allocates once and pays nothing after that.
+pub(crate) const KV_STEP: usize = 256;
 
 const SLAB_T: usize = 1024;
 
@@ -326,7 +393,13 @@ fn gqa_split_chunk(cur_len: usize) -> usize {
 pub struct WgpuTextDecoder {
     pub gpu: Gpu,
     pub cfg: TextConfig,
+    /// The ceiling on `seq_len + max_new_tokens` — fixed at load, and what the
+    /// caller's own bounds check reports against.
     pub max_seq: usize,
+    /// KV slots actually allocated: [`KV_INITIAL_CAP`] after load, grown on
+    /// demand up to `max_seq`.  Every uniform that carries a KV stride uses
+    /// this, not the ceiling.
+    pub cap: usize,
     /// Positions already in the KV cache — the next step attends at `cur_len = pos + 1`.
     pub pos: usize,
     /// Host-side time accumulated by [`Self::step`]: (uniform + encode + submit,
@@ -356,7 +429,8 @@ pub struct WgpuTextDecoder {
 impl WgpuTextDecoder {
     /// Build the decoder and upload `{prefix}.*` weights.
     ///
-    /// `max_seq` sizes the KV cache (`seq_len + max_new_tokens`);
+    /// `max_seq` is the ceiling on `seq_len + max_new_tokens`; the KV cache
+    /// starts at [`KV_INITIAL_CAP`] slots and grows up to it on demand.
     /// `rope_positions` sizes the MRoPE tables.
     pub fn load(
         gpu: Gpu,
@@ -528,7 +602,8 @@ impl WgpuTextDecoder {
             &weights::get_vector(&w, &format!("{prefix}.norm.weight"))?,
         )?;
 
-        let kv_words = nkvh * max_seq * hd / 2;
+        let cap = KV_INITIAL_CAP.min(max_seq);
+        let kv_words = nkvh * cap * hd / 2;
         let u_argmax = up.uniform("u_argmax", 16);
         let u_embed = up.uniform("u_embed", 16);
         up.upload(
@@ -617,45 +692,8 @@ impl WgpuTextDecoder {
             let bg_rms1 = rms_bg(&scratch.h, &iln, &scratch.norm1);
             let bg_rms2 = rms_bg(&scratch.h, &pln, &scratch.norm2);
 
-            let bg_extract = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("qkv_extract"),
-                layout: &pipes.extract.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: scratch.qkv.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: qn.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: kn.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: scratch.cos.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: scratch.sin.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: scratch.q_out.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 6, resource: k_cache.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 7, resource: v_cache.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 8, resource: scratch.u_qkvx.as_entire_binding() },
-                ],
-            });
-            let bg_gqa = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("gqa"),
-                layout: &pipes.gqa256.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: scratch.q_out.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: k_cache.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: v_cache.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: scratch.attn_out.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: scratch.u_gqa.as_entire_binding() },
-                ],
-            });
-            let bg_gqa_split = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("gqa_split"),
-                layout: &pipes.gqa_split256.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: scratch.q_out.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: k_cache.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: v_cache.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: scratch.split_part_out.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: scratch.split_part_max.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: scratch.split_part_sum.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 6, resource: scratch.u_gp1.as_entire_binding() },
-                ],
-            });
+            let (bg_extract, bg_gqa, bg_gqa_split) =
+                kv_bind_groups(&gpu, &pipes, &scratch, &qn, &kn, &k_cache, &v_cache);
             let bg_gqa_merge = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("gqa_merge"),
                 layout: &pipes.gqa_merge.get_bind_group_layout(0),
@@ -732,6 +770,7 @@ impl WgpuTextDecoder {
             gpu,
             cfg,
             max_seq,
+            cap,
             pos: 0,
             host_submit_ms: 0.0,
             host_read_ms: 0.0,
@@ -770,6 +809,49 @@ impl WgpuTextDecoder {
         &self.layers[layer].v_cache
     }
 
+    /// Grow the KV cache so that it holds `need` positions.
+    ///
+    /// Grow-only and stepped ([`KV_STEP`]): a run of clips of one shape allocates
+    /// once, and a request that already fits costs nothing but the comparison.
+    /// `need` past the ceiling is clamped here — the caller's own check against
+    /// [`Self::max_seq`] is what reports that.
+    ///
+    /// Only the KV buffers and the three bind groups that read them
+    /// ([`kv_bind_groups`]) are rebuilt; weights, pipelines and every other bind
+    /// group stay where they are.
+    pub fn ensure_capacity(&mut self, need: usize) -> usize {
+        let target = (need.div_ceil(KV_STEP) * KV_STEP).min(self.max_seq).max(self.cap);
+        if target == self.cap {
+            return self.cap;
+        }
+        let t0 = std::time::Instant::now();
+        let prev = self.cap;
+        let kv_words = (self.cfg.num_key_value_heads * target * self.cfg.head_dim / 2) as u64;
+        {
+            let Self { gpu, layers, pipes, scratch, .. } = self;
+            for layer in layers.iter_mut() {
+                let k_cache = gpu.storage("k_cache", kv_words * 4);
+                let v_cache = gpu.storage("v_cache", kv_words * 4);
+                let (bg_extract, bg_gqa, bg_gqa_split) = {
+                    let (qn_w, kn_w) = (&layer.qn_w, &layer.kn_w);
+                    kv_bind_groups(gpu, pipes, scratch, qn_w, kn_w, &k_cache, &v_cache)
+                };
+                layer.k_cache = k_cache;
+                layer.v_cache = v_cache;
+                layer.bg_extract = bg_extract;
+                layer.bg_gqa = bg_gqa;
+                layer.bg_gqa_split = bg_gqa_split;
+            }
+        }
+        self.cap = target;
+        let mib = (2 * self.cfg.num_hidden_layers as u64 * kv_words * 4) as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "[kv] capacity {prev} -> {target} slots ({mib:.0} MiB) in {:.1} ms",
+            t0.elapsed().as_secs_f64() * 1000.0,
+        );
+        self.cap
+    }
+
     /// Upload MRoPE tables — `[rope_positions, head_dim]` f16, row-major.
     pub fn set_rope_tables(&self, cos: &[half::f16], sin: &[half::f16]) {
         self.gpu.upload(&self.scratch.cos, &weights::words_bytes(cos));
@@ -787,7 +869,7 @@ impl WgpuTextDecoder {
         self.gpu.upload(
             &self.scratch.u_qkvx,
             bytemuck::bytes_of(&QkvxCfg {
-                max_seq: self.max_seq as u32,
+                max_seq: self.cap as u32,
                 start: pos as u32,
                 pos_offset: pos as u32,
                 s: 1,
@@ -801,7 +883,7 @@ impl WgpuTextDecoder {
             &self.scratch.u_gqa,
             bytemuck::bytes_of(&GqaCfg {
                 cur_len: cur_len as u32,
-                max_seq: self.max_seq as u32,
+                max_seq: self.cap as u32,
                 scale: self.cfg.scale(),
                 _p: 0.0,
             }),
@@ -812,7 +894,7 @@ impl WgpuTextDecoder {
             &self.scratch.u_gp1,
             bytemuck::bytes_of(&SplitCfg {
                 cur_len: cur_len as u32,
-                max_seq: self.max_seq as u32,
+                max_seq: self.cap as u32,
                 scale: self.cfg.scale(),
                 n_chunks,
             }),
@@ -1379,7 +1461,7 @@ impl WgpuTextDecoder {
         gpu.upload(
             &self.scratch.u_qkvx,
             bytemuck::bytes_of(&QkvxCfg {
-                max_seq: self.max_seq as u32,
+                max_seq: self.cap as u32,
                 start: kv_start as u32,
                 pos_offset: kv_start as u32,
                 s: mp as u32,
@@ -1474,7 +1556,7 @@ impl WgpuTextDecoder {
             &u_rk,
             bytemuck::bytes_of(&RepeatKvCfg {
                 nkvh: nkvh as u32,
-                max_seq: self.max_seq as u32,
+                max_seq: self.cap as u32,
                 cur: cur as u32,
                 hd: hd as u32,
                 npw: (nkv_rows * hd / 2) as u32,

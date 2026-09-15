@@ -56,8 +56,9 @@ wav ──► mel (STFT, 128 bins) ──► audio tower (conv stem + 18 transfo
 |---|---|
 | **Parity** | **12/12** byte-identical to the frozen Python reference (`0.6B` and `1.7B` × 6 clips, 15 s … 180 s), re-gated on every change |
 | **RTFx** (0.6B, 15 s → 180 s) | 24.4 / 21.3 / 19.7 / 24.0 / 17.8 / 20.1 (English short → Chinese 180 s) |
+| **VRAM** (peak, 15 s → 180 s) | 2.05 → 2.80 GiB (**0.6B**) and 4.34 → 5.34 GiB (**1.7B**) — the KV cache is grown on demand, so the floor is what a 15 s clip costs |
 | **vs Python on the same GPU** | 1.95× (0.6B) and 1.52× (1.7B) over 29 languages × 20 clips (FLEURS; WER/CER within ±0.7 pp) |
-| **Long audio** | a **15-minute** clip transcribes end to end — 12 065-token prompt, 3 343-token transcript, 98 s, ~5.5 GiB peak, RTFx 9.4 |
+| **Long audio** | a **15-minute** clip transcribes end to end — 12 065-token prompt, 3 343-token transcript, 98 s, RTFx 9.4 |
 | **Not ported** | time stamps (`Qwen3-ForcedAligner` is a second model), batching, the vLLM backend |
 
 Long audio is the interesting case: materialising the `s²` attention matrix at 15
@@ -249,8 +250,33 @@ time). 0.6B unless noted.
 | 180 s | 25 ms | 1012 | 1534 | 5788 | 8.4 s + 1.45 s front end | 17.8 |
 | 15 min | 121 ms | 5236 | 16 259 | 76 556 | 98.3 s | **9.4** |
 
-Memory: 180 s peaks at ~4.6 GiB; 15 minutes at ~5.5 GiB (a 12 065-token prompt
-plus a 16 384-token KV cache). The O(s²) attention scratch is gone — the slabbed
+Memory, peak `memory.used` sampled every ~100 ms on an otherwise idle card (the
+same six clips, both models, `vulkan:0`):
+
+| clip | 0.6B peak | 1.7B peak |
+|---|---|---|
+| 15 s en | 2.05 GiB | 4.34 GiB |
+| 30 s zh | 2.05 GiB | 4.34 GiB |
+| 90 s en | 2.30 GiB | 4.59 GiB |
+| 90 s ja | 2.30 GiB | 4.59 GiB |
+| 180 s en | 2.80 GiB | 5.34 GiB |
+| 180 s zh | 2.80 GiB | 5.34 GiB |
+
+The KV cache is 112 KiB per slot (28 layers × 8 KV heads × 128, f16, K and V —
+the same geometry for both models) and it is **allocated on demand**: `max_seq`,
+16 384 tokens, is the ceiling the rope tables are built for, not the allocation,
+so a 15-second clip holds 1 024 slots (112 MiB) where a long one grows to fit its
+prompt.  Capacity is grow-only and stepped by 256 slots, so a run of clips of one
+shape allocates once: a resize measures 0.4 ms (1 792 slots) to 37 ms (12 032)
+inside runs that last tens of seconds, and a 15-minute request (12 065-token
+prompt plus 2 048 new) needs 1.53 GiB rather than the fixed 1.75.  What a longer
+clip adds beyond the cache is on the audio-tower side — the same 180 s clip with
+`--cpu-enc` stays at the floor and `--max-new` does not move the peak, which
+leaves the tower's per-window workspace (`n_head × n_window` buffers) as the only
+other thing that scales with audio length.  An 881 s clip (11 475-token prompt,
+12 032 slots) peaks at 5.03 GiB on 0.6B; 1.7B does not fit that prompt on this
+8 GB card — its prefill scratch runs out of memory just past 7.3 GiB — so long
+audio is a 0.6B story here.  The O(s²) prefill scratch is gone: the slabbed
 attention needs 398 MB at 15 minutes instead of 2 × 4.7 GB.
 
 Where the time goes at 15 minutes: decode 78 % (the KV scan is instruction-bound,

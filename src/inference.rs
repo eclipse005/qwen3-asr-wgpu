@@ -230,6 +230,15 @@ impl TextBackend {
         }
     }
 
+    /// Make sure the KV cache holds `need` positions — a no-op when it already
+    /// does, which is the common case (the capacity is grow-only).
+    fn ensure_capacity(&mut self, need: usize) -> usize {
+        match self {
+            Self::Gpu(d) => d.ensure_capacity(need),
+            Self::Cpu(d) => d.ensure_capacity(need),
+        }
+    }
+
     fn gpu(&self) -> Option<&Gpu> {
         match self {
             Self::Gpu(d) => Some(&d.gpu),
@@ -1342,6 +1351,7 @@ impl Inner {
             "seq {seq_len} + max_new {max_new_tokens} exceeds decoder max_seq {}",
             self.decoder.max_seq()
         );
+        self.decoder.ensure_capacity(seq_len + max_new_tokens + 8);
 
         let name = "thinker.model.embed_tokens.weight";
         let et = self

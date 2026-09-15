@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Result};
 use half::f16;
 use rayon::prelude::*;
 
-use crate::decoder::TextConfig;
+use crate::decoder::{TextConfig, KV_INITIAL_CAP, KV_STEP};
 use crate::weights::{self, RawTensor};
 
 struct Mat {
@@ -149,6 +149,10 @@ pub struct CpuTextDecoder {
     layers: Vec<Layer>,
     norm_w: Vec<f32>,
     pub max_seq: usize,
+    /// KV slots actually allocated: [`KV_INITIAL_CAP`] after load, grown on
+    /// demand up to `max_seq`.  Both caches are strided by this, not by the
+    /// ceiling.
+    pub cap: usize,
     /// Positions already in the KV cache (the GPU decoder's `pos`).
     pub pos: usize,
     last_token: u32,
@@ -162,6 +166,10 @@ pub struct CpuTextDecoder {
 }
 
 impl CpuTextDecoder {
+    /// Build the decoder from `{prefix}.*` weights.
+    ///
+    /// `max_seq` is the ceiling on `seq_len + max_new_tokens`; both f32 KV caches
+    /// start at [`KV_INITIAL_CAP`] slots and grow up to it on demand.
     pub fn load(
         model_dir: &Path,
         prefix: &str,
@@ -183,7 +191,8 @@ impl CpuTextDecoder {
             .map(|v| v.to_f32())
             .collect();
         let zeros = vec![0.0f32; rope_positions * cfg.head_dim];
-        let kv = cfg.num_key_value_heads * max_seq * cfg.head_dim;
+        let cap = KV_INITIAL_CAP.min(max_seq);
+        let kv = cfg.num_key_value_heads * cap * cfg.head_dim;
         Ok(Self {
             vocab: cfg.vocab_size,
             hs,
@@ -191,6 +200,7 @@ impl CpuTextDecoder {
             layers,
             norm_w,
             max_seq,
+            cap,
             pos: 0,
             last_token: 0,
             cos: zeros.clone(),
@@ -208,6 +218,34 @@ impl CpuTextDecoder {
         self.cos = cos.iter().map(|v| v.to_f32()).collect();
         self.sin = sin.iter().map(|v| v.to_f32()).collect();
         debug_assert_eq!(self.cos.len() % hd, 0);
+    }
+
+    /// Grow both KV caches so that they hold `need` positions.
+    ///
+    /// Same contract as the GPU decoder's: grow-only, stepped ([`KV_STEP`]), and
+    /// a request that already fits costs one comparison.
+    pub fn ensure_capacity(&mut self, need: usize) -> usize {
+        let target = (need.div_ceil(KV_STEP) * KV_STEP).min(self.max_seq).max(self.cap);
+        if target == self.cap {
+            return self.cap;
+        }
+        let t0 = std::time::Instant::now();
+        let prev = self.cap;
+        let n = self.cfg.num_hidden_layers * self.cfg.num_key_value_heads * target * self.cfg.head_dim;
+        // Release before reallocating: the old contents are dead (every sequence
+        // writes its KV from position zero), and holding both would double the
+        // transient peak of an already large allocation.
+        self.k_cache = Vec::new();
+        self.v_cache = Vec::new();
+        self.k_cache = vec![0.0f32; n];
+        self.v_cache = vec![0.0f32; n];
+        self.cap = target;
+        eprintln!(
+            "[kv] cpu capacity {prev} -> {target} slots ({:.0} MiB host) in {:.1} ms",
+            (2 * n * 4) as f64 / (1024.0 * 1024.0),
+            t0.elapsed().as_secs_f64() * 1000.0,
+        );
+        self.cap
     }
 
     fn rope_at(&self, pos: usize, j: usize) -> (f32, f32) {
@@ -255,7 +293,7 @@ impl CpuTextDecoder {
         let (nqh, nkvh, hd) = (self.cfg.num_attention_heads, self.cfg.num_key_value_heads, self.cfg.head_dim);
         let scale = 1.0f32 / (hd as f32).sqrt();
         let rep = nqh / nkvh;
-        let kv_stride = self.max_seq * hd;
+        let kv_stride = self.cap * hd;
         let base = layer * nkvh * kv_stride;
         let _cur = (q0 + attn.len() / (nqh * hd)).min(self.max_seq);
 
@@ -265,7 +303,7 @@ impl CpuTextDecoder {
             .map_init(
                 || {
                     (
-                        vec![0.0f32; self.max_seq],
+                        vec![0.0f32; self.cap],
                         vec![0.0f32; hd],
                         vec![0.0f32; hd],
                     )
@@ -273,7 +311,7 @@ impl CpuTextDecoder {
                 |(scores, acc, qrow), (hi, out)| {
             let (r, h) = (hi / nqh, hi % nqh);
             let pos = q0 + r;
-            let valid = (pos + 1).min(self.max_seq);
+            let valid = (pos + 1).min(self.cap);
             {
                 let qh = &q[r * row_elems + h * hd..r * row_elems + (h + 1) * hd];
                 for (d, s) in qrow.iter_mut().zip(qh) {
@@ -331,7 +369,7 @@ impl CpuTextDecoder {
         let (nqh, nkvh, hd) = (self.cfg.num_attention_heads, self.cfg.num_key_value_heads, self.cfg.head_dim);
         let (q_dim, kv_dim) = (nqh * hd, nkvh * hd);
         let inter = self.cfg.intermediate_size;
-        let kv_stride = self.max_seq * hd;
+        let kv_stride = self.cap * hd;
 
         let mut normed = vec![f16::from_f32(0.0); rows * hs];
         let mut q = vec![f16::from_f32(0.0); rows * q_dim];
