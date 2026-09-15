@@ -100,6 +100,10 @@ struct GDims {
     bsb: u32,
     bsc: u32,
     beta: u32,
+    /// Key-tile row offset in the B operand; 0 for every tower GEMM (the field
+    /// exists because the tower shares `shaders::prefill_gemm` with the decoder,
+    /// where the slabbed attention uses it).
+    row0: u32,
 }
 
 /// Mirrors `shaders::audio_im2col`'s `Im2Cfg` field for field.
@@ -1550,7 +1554,7 @@ impl GpuAudioEncoder {
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &self.u_gd,
                         offset: 0,
-                        size: std::num::NonZeroU64::new(32),
+                        size: std::num::NonZeroU64::new(64),
                     }),
                 },
                 wgpu::BindGroupEntry { binding: 4, resource: bias.as_entire_binding() },
@@ -1573,7 +1577,7 @@ impl GpuAudioEncoder {
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &self.u_gd,
                         offset: 0,
-                        size: std::num::NonZeroU64::new(32),
+                        size: std::num::NonZeroU64::new(64),
                     }),
                 },
             ],
@@ -1838,6 +1842,7 @@ impl GpuAudioEncoder {
                 bsb: bsb as u32,
                 bsc: bsc as u32,
                 beta: 0,
+                row0: 0,
             }),
         );
         let bg = match bias {

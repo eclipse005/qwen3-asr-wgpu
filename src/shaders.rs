@@ -1580,7 +1580,7 @@ fn prefill_gemm_impl(
 
     let mut s = String::new();
     s.push_str(
-        "struct GDims { m: u32, n: u32, k: u32, ldc: u32, bsa: u32, bsb: u32, bsc: u32, beta: u32 };\n\
+        "struct GDims { m: u32, n: u32, k: u32, ldc: u32, bsa: u32, bsb: u32, bsc: u32, beta: u32, row0: u32 };\n\
          @group(0) @binding(0) var<storage, read>       A: array<u32>;\n\
          @group(0) @binding(1) var<storage, read>       W: array<u32>;\n\
          @group(0) @binding(2) var<storage, read_write> C: array<u32>;\n\
@@ -1646,14 +1646,14 @@ fn prefill_gemm_impl(
         if !transb {
             for e in 0..n_bs {
                 t.push_str(&format!(
-                    "  Bs[(ty + {}u) * PAD + tx] = halve(W[wb + (n0 + ty + {}u) * kk + ({kx} + tx) / 2u], (tx & 1u) == 1u);\n",
+                    "  Bs[(ty + {}u) * PAD + tx] = halve(W[wb + (gd.row0 + n0 + ty + {}u) * kk + ({kx} + tx) / 2u], (tx & 1u) == 1u);\n",
                     e * 16, e * 16
                 ));
             }
         } else {
             for e in 0..n_bs {
                 t.push_str(&format!(
-                    "  Bs[(ty + {}u) * PAD + tx] = halve(W[wb + ({kx} + tx) * (gd.n / 2u) + (n0 + ty + {}u) / 2u], ((n0 + ty + {}u) & 1u) == 1u);\n",
+                    "  Bs[(ty + {}u) * PAD + tx] = halve(W[wb + (gd.row0 + {kx} + tx) * (gd.n / 2u) + (n0 + ty + {}u) / 2u], ((n0 + ty + {}u) & 1u) == 1u);\n",
                     e * 16, e * 16, e * 16
                 ));
             }
@@ -1674,13 +1674,13 @@ fn prefill_gemm_impl(
         if !transb {
             for e in 0..n_bs {
                 t.push_str(&format!(
-                    "   pfb{e} = W[wb + (n0 + ty + {}u) * kk + ({kx} + tx) / 2u];\n", e * 16
+                    "   pfb{e} = W[wb + (gd.row0 + n0 + ty + {}u) * kk + ({kx} + tx) / 2u];\n", e * 16
                 ));
             }
         } else {
             for e in 0..n_bs {
                 t.push_str(&format!(
-                    "   pfb{e} = W[wb + ({kx} + tx) * (gd.n / 2u) + (n0 + ty + {}u) / 2u];\n", e * 16
+                    "   pfb{e} = W[wb + (gd.row0 + {kx} + tx) * (gd.n / 2u) + (n0 + ty + {}u) / 2u];\n", e * 16
                 ));
             }
         }

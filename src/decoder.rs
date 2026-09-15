@@ -135,6 +135,9 @@ struct GDims {
     bsb: u32,
     bsc: u32,
     beta: u32,
+    /// Row offset into the B operand — the key-tile start for the slabbed
+    /// attention (`transb=0`: K rows, `transb=1`: V rows).  Zero everywhere else.
+    row0: u32,
 }
 
 #[repr(C)]
@@ -1349,7 +1352,7 @@ impl WgpuTextDecoder {
                         resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                             buffer: u_gd,
                             offset: 0,
-                            size: std::num::NonZeroU64::new(32),
+                            size: std::num::NonZeroU64::new(64),
                         }),
                     },
                 ],
@@ -1373,6 +1376,7 @@ impl WgpuTextDecoder {
                         bsb: $bsb as u32,
                         bsc: $bsc as u32,
                         beta: 0,
+                        row0: 0,
                     }),
                 );
                 let bg = gemm_bg($pipe, $a, $w, $c, &u_gd);
