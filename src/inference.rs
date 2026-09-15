@@ -505,6 +505,13 @@ impl WgpuAsr {
         let cos_f16: Vec<f16> = cos.iter().copied().map(f16::from_f32).collect();
         let sin_f16: Vec<f16> = sin.iter().copied().map(f16::from_f32).collect();
         decoder.set_rope_tables(&cos_f16, &sin_f16);
+        // Everything that will ever be compiled has been compiled by now; persist
+        // it so the next process skips the compile (minutes on D3D12).
+        if let Some(gpu) = decoder.gpu() {
+            if let Err(e) = gpu.save_pipeline_cache() {
+                eprintln!("[pipeline cache] not saved: {e:#}");
+            }
+        }
         Ok(Self {
             config,
             tokenizer,

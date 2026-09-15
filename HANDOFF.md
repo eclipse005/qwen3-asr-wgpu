@@ -28,8 +28,15 @@
 > 而我们的 kernel 有大量手工展开 + 位精确 `expf_bt` 的整数序列，正是 FXC 最慢的形态；
 > ~40 条管线 × ~8 s）。加载之后相位健康：NVIDIA D3D12 enc 135 / prefill 183 / decode 29 ms
 > （比 Vulkan 慢 15–25%）；Intel D3D12 1847 / 3330 / 103 ms（慢 ~2×）。
-> **修法**：上 wgpu 的 `PipelineCache`（D3D12 = `ID3D12PipelineLibrary`，可落盘 ⇒ 第二次运行
-> 免重编）；次优是「按需建管线」（6 个 softmax 变体现在一次全建，每次只用一个）。
+> **落盘 `PipelineCache` 已实现（第五轮，`Gpu::pipeline_cache` + 退出时 `save_pipeline_cache()`）**，
+> 但实测**它救不了 D3D12**：`--list-devices` 现在会打印每个 runtime 的 `pso-cache yes/no`，
+> 结果是 **两家 Vulkan = yes、两家 D3D12 = no**（wgpu 30 的 D3D12 后端没暴露
+> `Features::PIPELINE_CACHE`）⇒ 缓存只对本来就不慢的 Vulkan 生效。
+> 而且**两家 D3D12 的 330 s 几乎一模一样**，这更像 **naga→HLSL 的翻译成本（CPU 侧、
+> vendor 无关）**而不是驱动的 FXC —— 若是如此，任何管线缓存都帮不上（key 要先算出来）。
+> 因此结论：**D3D12 这条路只在「Vulkan 不可用」时才用**；真要救它，得从
+> 「少喂/喂小一点 shader 给 HLSL 后端」入手（例如 6 个 softmax 变体改成按需编译），
+> 或者去推 naga 的 HLSL 后端。
 > 另外：`processor.rs`（原版三步 API：apply_transcription_request / generate /
 > decode(ReturnFormat)）、README/LICENSE/docs/PORTING.md（移植指南：11 个坑 + 死路表）。
 

@@ -26,8 +26,16 @@ A caveat that costs more than any of the above: on **D3D12 the pipeline build ta
 Vulkan for their own Vulkan adapters) — wgpu goes through naga → HLSL → FXC, and
 these kernels are heavily unrolled with the bit-exact integer `expf_bt` on the
 critical path, which is what FXC is slowest at (~40 pipelines x ~8 s).  The
-timings in this table are *after* that load; a `PipelineCache` (D3D12's
-`ID3D12PipelineLibrary`, persisted) is the fix and is on the list.
+timings in this table are *after* that load.
+
+The engine now *does* persist compiled pipelines (`VkPipelineCache` /
+`ID3D12PipelineLibrary`) when the runtime offers the capability — `--list-devices`
+prints `pso-cache yes|no` per target — but on this stack that is **Vulkan-only**:
+wgpu 30's D3D12 backend does not expose `Features::PIPELINE_CACHE`, so the 5.5
+minutes cannot be cached away there.  The near-identical cost on two different
+vendors also points at naga's HLSL translation (CPU, vendor-independent) rather
+than the driver's compiler.  D3D12 therefore stays a *fallback for when Vulkan is
+unavailable*, and the practical advice is: prefer `vulkan:N`.
 
 `cpu` is the host decoder (`--cpu-dec`): no adapter, f16 weights widened to f32
 once at load, rayon over output rows and over `(row, head)` in the attention.
