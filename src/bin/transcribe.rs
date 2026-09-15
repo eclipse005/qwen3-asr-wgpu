@@ -29,14 +29,18 @@ fn main() -> Result<()> {
     let wav = PathBuf::from(arg(&args, "--wav").unwrap_or_else(|| {
         r"D:\qwen3-asr-rs\tests\fixtures\15s_en.wav".to_string()
     }));
-    // Device selection: `--adapter nvidia` (name substring, the old spelling)
-    // or `--device <spec>` with `auto | name | #index | index | vulkan|dx12|metal|gl
-    // | integrated|discrete|virtual|cpu`.  `--list-devices` prints what is
-    // visible and exits.
+    // Device selection.  The axis is the *runtime* (`vulkan`, `dx12`, `metal`,
+    // `gl`, `cpu`), with an optional index for machines that have several
+    // devices on one runtime — the shape ONNX Runtime's execution providers and
+    // llama.cpp's `CUDA0`/`Vulkan0`/`CPU` names use.  Vendor is not a selector:
+    // `--list-devices` shows it as information.
     if flag(&args, "--list-devices") || flag(&args, "--devices") {
-        for (i, d) in WgpuAsr::devices().iter().enumerate() {
-            println!("[{i}] {}  timestamps={}", d.describe(), d.timestamps);
+        println!("runtimes are the axis; the vendor is information (a card is reachable");
+        println!("through several runtimes and those are different code paths).\n");
+        for t in WgpuAsr::device_targets() {
+            println!("{}", t.describe());
         }
+        println!("  {:<10} (not implemented yet — see the CPU section of HANDOFF.md)", "cpu");
         return Ok(());
     }
     let adapter = arg(&args, "--device").or_else(|| arg(&args, "--adapter"));

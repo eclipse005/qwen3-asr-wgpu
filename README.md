@@ -10,13 +10,15 @@ reference's arithmetic (down to accumulation order, the bit-exact `exp`, and
 where f16 rounding happens), and every claim below is measured on the machine
 described under [Measured envelope](#measured-envelope).
 
-**Verified devices** (same verbatim-parity gate on each, 180 s English clip):
+**Verified targets** (same verbatim-parity gate on each; 180 s English clip
+unless noted):
 
-| device | backend | subgroup | result |
+| target | device | subgroup | result |
 |---|---|---|---|
-| NVIDIA P104-100 | Vulkan | 32 | MATCH |
-| NVIDIA GTX 1070 | D3D12 | none | MATCH |
-| Intel iGPU | Vulkan | 8..32 | MATCH |
+| `vulkan:0` | NVIDIA P104-100 (dGPU) | 32 | MATCH |
+| `dx12:0` | NVIDIA GTX 1070 (dGPU) | none | MATCH |
+| `vulkan:1` | Intel iGPU | 8..32 | MATCH |
+| `gl:0` | Intel iGPU (OpenGL) | none | MATCH (15 s) |
 
 One portability bug had to be fixed to get there, and it is the best argument for
 this table existing: `Features::SUBGROUP` is a *capability*, not a width.  Intel's
@@ -73,37 +75,51 @@ Useful flags: `--lang en` (force a language; ISO code or full name), `--context`
 `--cpu-enc` (CPU audio tower, for A/B), `--baseline file.txt` (compare against a
 frozen reference text), `--dump dir/` (mel/embeddings/ids).
 
-### Choosing the device
+### Choosing the runtime and device
 
-Because the port's reason to exist is "one binary, several devices", the choice
-is a first-class part of the API rather than a hidden default:
+The selectable axis is the **runtime**, with an optional index for machines that
+have several devices on one runtime — the shape ONNX Runtime's execution
+providers and llama.cpp's `CUDA0`/`Vulkan0`/`CPU` names use.  The **vendor is
+not a selector**: a card of one vendor is reachable through several runtimes, and
+those are different code paths (they even differ in numerics — see the parity
+matrix above), so vendor and device class belong in the listing, not the choice.
 
 ```bash
 cargo run --release --bin transcribe -- --list-devices
-# [0] Intel(R) Graphics (Vulkan, IntegratedGpu) | ... binding 1023 MiB, subgroup 8..32
-# [1] NVIDIA P104-100   (Vulkan, DiscreteGpu)   | ... binding 2047 MiB, subgroup 32
-# [3] Intel(R) Graphics (Dx12, IntegratedGpu)   | ... binding 2047 MiB, subgroup none
+# * vulkan:0   NVIDIA P104-100 (NVIDIA, dGPU, driver 572.75) binding 2047 MiB, subgroup 32
+#   dx12:0     NVIDIA GeForce GTX 1070 (NVIDIA, dGPU, ...) binding 2047 MiB, no subgroup
+#   vulkan:1   Intel(R) Graphics (Intel, iGPU, ...) binding 1023 MiB, subgroup 8..32
+#   dx12:1     Intel(R) Graphics (Intel, iGPU, ...) binding 2047 MiB, no subgroup
+#   gl:0       Intel(R) Graphics (Intel, iGPU, ...) binding 1024 MiB, no subgroup
+#   dx12:3     Microsoft Basic Render Driver (Microsoft, CPU, ...)
+#   cpu        (not implemented yet — see the CPU section of HANDOFF.md)
 
-cargo run --release --bin transcribe -- --device intel …      # by name
-cargo run --release --bin transcribe -- --device 1 …          # or #1, by index
-cargo run --release --bin transcribe -- --device dx12 …       # first adapter on a backend
-cargo run --release --bin transcribe -- --device integrated … # by device class
+cargo run --release --bin transcribe -- --device vulkan:1 …   # iGPU through Vulkan
+cargo run --release --bin transcribe -- --device dx12:0 …     # dGPU through D3D12
 ```
+
+The runtimes are `vulkan`, `metal`, `dx12`, `gl` (the four wgpu drives) and
+`cpu` (our own implementation, still to come).  There is deliberately **no
+`cuda` and no `dml`**: this crate has no CUDA backend, and wgpu drives Windows
+through D3D12 *compute* — DirectML is a different API that would be a separate
+integration.  `gl` is wgpu's compatibility runtime (OpenGL/GLES, weakest feature
+set); it is kept in the list because old machines only have it, and it is
+verified here.
 
 ```rust
 use qwen3_asr_wgpu::{DeviceSelector, WgpuAsr};
 
-for d in WgpuAsr::devices() { println!("{}", d.describe()); }   // no device created
-let asr = WgpuAsr::load_on("model-dir".as_ref(), DeviceSelector::Name("intel".into()))?;
+for t in WgpuAsr::device_targets() { println!("{}", t.describe()); }  // no device created
+let asr = WgpuAsr::load_on("model-dir".as_ref(),
+                           DeviceSelector::Runtime { api: wgpu::Backend::Vulkan, index: 1 })?;
 println!("running on {}", asr.device_description());
 ```
 
-`--adapter <name>` (the older spelling) is still accepted and is exactly
-`DeviceSelector::Name`.  Whatever a device grants — binding limit, workgroup
-storage, subgroup width — the engine reads from the *negotiated* limits, so a
-device that cannot run a given clip is refused explicitly rather than producing
-garbage (that refusal is what the tiling in `docs/design-tiled-prefill.md` is
-about).
+`--adapter <name>` (the older spelling) still works and is the last-resort
+substring form.  Whatever a target grants — binding limit, workgroup storage,
+subgroup width — the engine reads from the *negotiated* limits, so a target that
+cannot run a given clip is refused explicitly rather than producing garbage
+(that refusal is what the tiling in `docs/design-tiled-prefill.md` is about).
 
 ### The reference pipeline's API
 

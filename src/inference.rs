@@ -428,6 +428,12 @@ impl WgpuAsr {
         pollster::block_on(crate::gpu::list_devices())
     }
 
+    /// The user-facing device list: each target named `<runtime>:<index>`, the
+    /// form `--device` accepts, with the default marked.
+    pub fn device_targets() -> Vec<crate::gpu::DeviceTarget> {
+        pollster::block_on(crate::gpu::list_targets())
+    }
+
     /// The device this instance actually runs on.
     pub fn device(&self) -> &wgpu::AdapterInfo {
         &self.decoder.gpu.info

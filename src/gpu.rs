@@ -29,66 +29,82 @@ pub struct Gpu {
 /// an A/B, or address the same machine's adapters by index.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DeviceSelector {
-    /// The default: first discrete GPU, else the first adapter.
+    /// The default: the best GPU, on the runtime this engine is tuned for
+    /// (Vulkan first, then Metal, then D3D12, then GL — see [`rank`]).
     #[default]
     Auto,
-    /// Case-insensitive substring of the adapter name (`"nvidia"`, `"arc"`).
-    Name(String),
-    /// Index into [`list_devices`].
+    /// A compute runtime and which device of it: `Runtime { api: Vulkan, index: 1 }`
+    /// for `vulkan:1`.  This is the axis users mean by "backend" — the same
+    /// shape as ONNX Runtime's execution providers and llama.cpp's
+    /// `CUDA0`/`Vulkan0`/`CPU` device names.
+    ///
+    /// Note what is *not* in here: the vendor.  Which vendor a card is belongs in
+    /// the listing, not in the choice — an NVIDIA card can be driven through
+    /// Vulkan, D3D12 or DML, and those are different code paths with different
+    /// numerics and different speeds.
+    Runtime { api: wgpu::Backend, index: usize },
+    /// Our own CPU implementation.  **Not implemented yet** (only the audio tower
+    /// has a CPU path so far); selecting it says so instead of silently falling
+    /// back to a GPU.
+    Cpu,
+    /// Debug/addressing view: index into [`list_devices`] (one entry per
+    /// *(device, runtime)* pair) — for disambiguating what the listing printed.
     Index(usize),
-    /// Only consider these backends (Vulkan / Dx12 / Metal / Gl).
-    Backend(wgpu::Backends),
-    /// Only consider this class of device (integrated / discrete / virtual / cpu).
-    Type(wgpu::DeviceType),
+    /// Last resort: a case-insensitive substring of the adapter name.
+    Name(String),
 }
 
+/// The compute runtimes this engine can run on, in the order it tries them.
+///
+/// `cpu` is our own implementation (see [`DeviceSelector::Cpu`]).  Note there is
+/// no `cuda` and no `dml`: this crate has no CUDA backend (that lives in the
+/// sibling CUDA port), and wgpu drives Windows through D3D12 **compute**, not
+/// DirectML.
+pub const RUNTIMES: &[(&str, wgpu::Backend)] = &[
+    ("vulkan", wgpu::Backend::Vulkan),
+    ("metal", wgpu::Backend::Metal),
+    ("dx12", wgpu::Backend::Dx12),
+    ("d3d12", wgpu::Backend::Dx12),
+    ("gl", wgpu::Backend::Gl),
+    ("webgpu", wgpu::Backend::BrowserWebGpu),
+];
+
 impl DeviceSelector {
-    /// Parse a CLI-style spec: `auto`, a name (`nvidia`), `#1`/`1` (index),
-    /// `vulkan|dx12|metal|gl|webgpu` (backend), or
-    /// `integrated|discrete|virtual|cpu` (device type).
+    /// Parse a CLI-style spec.
+    ///
+    /// * `auto` — the default policy
+    /// * `cpu` — the CPU implementation (currently refuses, see [`Self::Cpu`])
+    /// * `<runtime>[:<index>]` — `vulkan`, `vulkan:1`, `dx12`, `metal:0`, `gl`
+    /// * `#<n>` / `<n>` — raw index into [`list_devices`]
+    /// * anything else — substring of the adapter name
     pub fn parse(spec: &str) -> Result<Self> {
         let s = spec.trim();
         if s.is_empty() || s.eq_ignore_ascii_case("auto") {
             return Ok(Self::Auto);
         }
+        if s.eq_ignore_ascii_case("cpu") {
+            return Ok(Self::Cpu);
+        }
         if let Some(rest) = s.strip_prefix('#') {
-            return Self::parse_index(rest);
+            return Ok(Self::Index(rest.trim().parse().context("device index")?));
         }
         if let Ok(i) = s.parse::<usize>() {
             return Ok(Self::Index(i));
         }
-        let backends: &[(&str, wgpu::Backends)] = &[
-            ("vulkan", wgpu::Backends::VULKAN),
-            ("dx12", wgpu::Backends::DX12),
-            ("d3d12", wgpu::Backends::DX12),
-            ("metal", wgpu::Backends::METAL),
-            ("gl", wgpu::Backends::GL),
-            ("webgpu", wgpu::Backends::BROWSER_WEBGPU),
-        ];
-        if let Some((_, b)) = backends.iter().find(|(n, _)| s.eq_ignore_ascii_case(n)) {
-            return Ok(Self::Backend(*b));
-        }
-        let types: &[(&str, wgpu::DeviceType)] = &[
-            ("integrated", wgpu::DeviceType::IntegratedGpu),
-            ("discrete", wgpu::DeviceType::DiscreteGpu),
-            ("virtual", wgpu::DeviceType::VirtualGpu),
-            ("cpu", wgpu::DeviceType::Cpu),
-        ];
-        if let Some((_, t)) = types.iter().find(|(n, _)| s.eq_ignore_ascii_case(n)) {
-            return Ok(Self::Type(*t));
+        // `<runtime>[:<index>]`
+        let (name, index) = match s.split_once(':') {
+            Some((n, i)) => (n, i.trim().parse().context("runtime device index")?),
+            None => (s, 0usize),
+        };
+        if let Some((_, api)) = RUNTIMES.iter().find(|(n, _)| name.eq_ignore_ascii_case(n)) {
+            return Ok(Self::Runtime { api: *api, index });
         }
         Ok(Self::Name(s.to_lowercase()))
     }
 
-    fn parse_index(s: &str) -> Result<Self> {
-        Ok(Self::Index(
-            s.trim().parse::<usize>().context("device index")?,
-        ))
-    }
-
     fn backends(&self) -> wgpu::Backends {
         match self {
-            Self::Backend(b) => *b,
+            Self::Cpu => wgpu::Backends::empty(),
             _ => wgpu::Backends::all(),
         }
     }
@@ -97,18 +113,33 @@ impl DeviceSelector {
         match self {
             Self::Auto => true,
             Self::Name(n) => info.name.to_lowercase().contains(n),
-            Self::Index(_) => true,
-            Self::Backend(b) => match info.backend {
-                wgpu::Backend::Vulkan => b.contains(wgpu::Backends::VULKAN),
-                wgpu::Backend::Dx12 => b.contains(wgpu::Backends::DX12),
-                wgpu::Backend::Metal => b.contains(wgpu::Backends::METAL),
-                wgpu::Backend::Gl => b.contains(wgpu::Backends::GL),
-                wgpu::Backend::BrowserWebGpu => b.contains(wgpu::Backends::BROWSER_WEBGPU),
-                _ => false,
-            },
-            Self::Type(t) => info.device_type == *t,
+            Self::Index(_) | Self::Cpu => true,
+            Self::Runtime { api, .. } => info.backend == *api,
         }
     }
+}
+
+/// Default-selection order: discrete before integrated before virtual/CPU, then
+/// by graphics API.  Vulkan first because it is what this engine is tuned and
+/// verified against (`docs/PORTING.md`: the same 1070 decodes 54 % faster on
+/// Vulkan than on D3D12 here, and one iGPU finished a clip on Vulkan that D3D12
+/// did not finish in nine minutes), then Metal for macOS, then D3D12, then GL.
+fn rank(info: &wgpu::AdapterInfo) -> (u8, u8) {
+    let class = match info.device_type {
+        wgpu::DeviceType::DiscreteGpu => 0,
+        wgpu::DeviceType::IntegratedGpu => 1,
+        wgpu::DeviceType::VirtualGpu => 2,
+        wgpu::DeviceType::Cpu => 3,
+        _ => 4,
+    };
+    let api = match info.backend {
+        wgpu::Backend::Vulkan => 0,
+        wgpu::Backend::Metal => 1,
+        wgpu::Backend::Dx12 => 2,
+        wgpu::Backend::Gl => 3,
+        _ => 4,
+    };
+    (class, api)
 }
 
 /// `#0 NVIDIA … (Vulkan, DiscreteGpu), #1 Intel …` — for "no such device" errors.
@@ -142,6 +173,9 @@ pub struct DeviceInfo {
     pub subgroup_min: u32,
     pub subgroup_max: u32,
     pub timestamps: bool,
+    /// PCI ids — information for the listing, never a selector.
+    pub vendor_id: u32,
+    pub device_id: u32,
 }
 
 impl DeviceInfo {
@@ -182,12 +216,16 @@ impl DeviceInfo {
             subgroup_min: i.subgroup_min_size,
             subgroup_max: i.subgroup_max_size,
             timestamps: f.contains(wgpu::Features::TIMESTAMP_QUERY),
+            vendor_id: i.vendor,
+            device_id: i.device,
         }
     }
 }
 
 /// Every adapter this instance can see, in wgpu's enumeration order — the order
-/// [`DeviceSelector::Index`] indexes into.
+/// [`DeviceSelector::Index`] indexes into.  Note this is one entry per *(device,
+/// graphics API)* pair: the same physical GPU appears once per API it is
+/// reachable through.  Use [`list_device_groups`] for the device view.
 pub async fn list_devices() -> Vec<DeviceInfo> {
     let instance = wgpu::Instance::default();
     instance
@@ -196,6 +234,121 @@ pub async fn list_devices() -> Vec<DeviceInfo> {
         .iter()
         .map(DeviceInfo::from_adapter)
         .collect()
+}
+
+/// One selectable target, named the way [`DeviceSelector::parse`] wants it:
+/// `vulkan:0`, `dx12:1`, …  This is the user-facing list — the runtime is the
+/// axis, the vendor and device class are *information*, because a card of one
+/// vendor is reachable through several runtimes and those are different code
+/// paths (see the module docs and `docs/PORTING.md`).
+#[derive(Debug, Clone)]
+pub struct DeviceTarget {
+    /// `<runtime>:<index>`, e.g. `vulkan:1` — feed it back via `--device`.
+    pub spec: String,
+    pub info: DeviceInfo,
+    /// True when [`DeviceSelector::Auto`] would pick this target.
+    pub is_default: bool,
+}
+
+impl DeviceTarget {
+    /// `vulkan:0  NVIDIA P104-100 (NVIDIA, dGPU, driver 572.75) binding 2047 MiB, subgroup 32`
+    pub fn describe(&self) -> String {
+        let sg = if !self.info.subgroup {
+            "no subgroup".to_string()
+        } else if self.info.subgroup_min == self.info.subgroup_max {
+            format!("subgroup {}", self.info.subgroup_min)
+        } else {
+            format!("subgroup {}..{}", self.info.subgroup_min, self.info.subgroup_max)
+        };
+        format!(
+            "{}{:<10} {} ({}, {}, driver {}) binding {} MiB, {sg}",
+            if self.is_default { "* " } else { "  " },
+            self.spec,
+            self.info.name,
+            vendor_label(self.info.vendor_id),
+            self.info.device_type_str(),
+            self.info.driver,
+            self.info.max_binding_bytes / (1024 * 1024),
+        )
+    }
+}
+
+impl DeviceInfo {
+    fn device_type_str(&self) -> &'static str {
+        match self.device_type {
+            wgpu::DeviceType::DiscreteGpu => "dGPU",
+            wgpu::DeviceType::IntegratedGpu => "iGPU",
+            wgpu::DeviceType::VirtualGpu => "vGPU",
+            wgpu::DeviceType::Cpu => "CPU",
+            _ => "other",
+        }
+    }
+}
+
+fn vendor_label(id: u32) -> &'static str {
+    match id {
+        0x10DE => "NVIDIA",
+        0x1002 | 0x1022 => "AMD",
+        0x8086 => "Intel",
+        0x106B => "Apple",
+        0x1414 => "Microsoft",
+        _ => "other",
+    }
+}
+
+/// The user-facing device list: every adapter, named `<runtime>:<index>`, with
+/// the runtime's devices ordered discrete-before-integrated (so the index is
+/// stable), and the whole list ordered by [`rank`] with the default marked.
+pub async fn list_targets() -> Vec<DeviceTarget> {
+    let instance = wgpu::Instance::default();
+    let adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
+    let mut infos: Vec<DeviceInfo> = adapters.iter().map(DeviceInfo::from_adapter).collect();
+    infos.sort_by_key(|d| (rank_of(d), d.name.clone()));
+
+    let mut per_runtime: std::collections::HashMap<wgpu::Backend, usize> =
+        std::collections::HashMap::new();
+    let mut targets: Vec<DeviceTarget> = Vec::new();
+    for info in infos {
+        let api = info.backend;
+        let n = *per_runtime.entry(api).or_insert(0);
+        per_runtime.insert(api, n + 1);
+        targets.push(DeviceTarget {
+            spec: format!("{}:{n}", runtime_name(api)),
+            info,
+            is_default: false,
+        });
+    }
+    if let Some(first) = targets.first_mut() {
+        first.is_default = true;
+    }
+    targets
+}
+
+/// The name users type for a runtime (and what `warn`/`skip` messages say).
+pub fn runtime_name(api: wgpu::Backend) -> &'static str {
+    RUNTIMES
+        .iter()
+        .find(|(_, b)| *b == api)
+        .map(|(n, _)| *n)
+        .unwrap_or("other")
+}
+
+fn rank_of(d: &DeviceInfo) -> (u8, u8) {
+    let class = match d.device_type {
+        wgpu::DeviceType::DiscreteGpu => 0,
+        wgpu::DeviceType::IntegratedGpu => 1,
+        wgpu::DeviceType::VirtualGpu => 2,
+        wgpu::DeviceType::Cpu => 3,
+        _ => 4,
+    };
+    let api = match d.backend {
+        wgpu::Backend::Vulkan => 0,
+        wgpu::Backend::Metal => 1,
+        wgpu::Backend::Dx12 => 2,
+        wgpu::Backend::Gl => 3,
+        _ => 4,
+    };
+    (class, api)
 }
 
 impl Gpu {
@@ -212,8 +365,19 @@ impl Gpu {
         Self::new_with(sel).await
     }
 
-    /// The explicit form: choose by name, index, backend or device type.
+    /// The explicit form: choose a runtime (`vulkan`, `dx12`, `metal`, `gl`) and
+    /// which device of it, or a raw index / name.
+    ///
+    /// Shorthand: `Gpu::new(Some("vulkan:1"))`.
     pub async fn new_with(selector: DeviceSelector) -> Result<Self> {
+        if selector == DeviceSelector::Cpu {
+            bail!(
+                "the CPU backend is not implemented yet — only the audio tower has a \
+                 CPU path today (see the CPU section of HANDOFF.md).  A software \
+                 D3D12 device exists on this machine as a stopgap: run with \
+                 `--device dx12` and pick the adapter whose type is Cpu."
+            );
+        }
         let instance = wgpu::Instance::default();
         let adapters = instance.enumerate_adapters(selector.backends()).await;
         if adapters.is_empty() {
@@ -222,11 +386,11 @@ impl Gpu {
             );
         }
 
+        // `Runtime { api, index }` picks the index-th *device* of that runtime,
+        // ordered best-first (discrete before integrated), so `vulkan:1` is a
+        // stable name for "the second GPU Vulkan can see" — the llama.cpp
+        // convention.  `Auto` is that same ordering across all runtimes.
         let adapter = match &selector {
-            DeviceSelector::Auto => adapters
-                .iter()
-                .find(|a| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu)
-                .unwrap_or(&adapters[0]),
             DeviceSelector::Index(i) => adapters.get(*i).ok_or_else(|| {
                 anyhow::anyhow!(
                     "device #{i} does not exist ({} adapter(s) visible: {})",
@@ -234,12 +398,32 @@ impl Gpu {
                     list_names(&adapters)
                 )
             })?,
-            sel => adapters.iter().find(|a| sel.matches(&a.get_info())).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no adapter matches {sel:?} (visible: {})",
-                    list_names(&adapters)
-                )
-            })?,
+            sel => {
+                let mut hits: Vec<&wgpu::Adapter> = adapters
+                    .iter()
+                    .filter(|a| sel.matches(&a.get_info()))
+                    .collect();
+                if hits.is_empty() {
+                    let hint = if matches!(sel, DeviceSelector::Auto) {
+                        String::new()
+                    } else {
+                        format!(" matching {sel:?}")
+                    };
+                    bail!("no adapter{hint} (visible: {})", list_names(&adapters));
+                }
+                hits.sort_by_key(|a| rank(&a.get_info()));
+                match sel {
+                    DeviceSelector::Runtime { index, .. } => hits.get(*index).copied().ok_or_else(
+                        || {
+                            anyhow::anyhow!(
+                                "that runtime has {} device(s), index {index} is out of range",
+                                hits.len()
+                            )
+                        },
+                    )?,
+                    _ => hits[0],
+                }
+            }
         };
 
         let info = adapter.get_info();
