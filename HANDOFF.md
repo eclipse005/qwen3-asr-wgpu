@@ -335,6 +335,27 @@ CPU 参考抓出来的），也是查 Intel D3D12 那种「能跑但慢/错」�
 跑 prefill**（他们 `gemm_row_major` 那个 wrapper 可以直接抄，注意 `Parallelism::Rayon(0)`）。
 剩下还能拿的、不碰准确率的：prefill 换 `gemm` crate；decode 的注意力 AV 循环拆累加器。
 
+## 收尾状态（2026-09-15 第六轮）
+
+**`QASR_DEVICE=<spec>`**：`transcribe` 认这个环境变量（`--device`/`--adapter` 优先），
+于是 `verify_all.ps1` 这类工具可以**按运行时**跑门禁，不用给每个工具加 flag。
+
+**CPU 后端的覆盖面**（原来只验过 0.6B）：
+
+| 跑法 | 结果 |
+|---|---|
+| `--cpu-dec` 0.6B × 6 fixture | 6/6 MATCH（RTFx 4.25/3.77/3.95/4.17/3.61/3.47） |
+| `--cpu-dec` **1.7B** 15s_en | **MATCH**，RTFx 1.72（load 6.5 s） |
+| `--cpu-dec` **15m.wav**（12 065 token） | **跑通**：elapsed 639 s、RTFx 1.45、3343 token / 15 607 字符、正确结尾 |
+
+15m 的 CPU 相位：mel 110 / enc 12 585 / **prefill 212 114** / decode 414 110 ms，
+其中 prefill 的**注意力占 192 602 ms**（O(s²) 的 CPU 注意力，nqh·hd·3 FLOP/element，
+只有 ~2.3 GFLOP/s）—— 这是 CPU 长音频唯一的大头，要动就得给它分块/向量化。
+
+**已知差异（如实记录）**：15m 上 CPU 版与 GPU 版文本**差 ~150 字符（0.96%）**，首尾与
+token 数（3343）都一致 ⇒ 属 f16 边界的 tie-flip，不是退化。**15m 没有官方 gold 可判**
+（Python 在 8 GB 卡上 OOM），6 个 fixture 与 1.7B 15s 上两边都是逐字 MATCH。
+
 ## 下一步（RTFx；对齐已无欠账）
 
 1. **长音频现在是 decode 主导**：15 分钟那档 prefill 16.3 s、decode **76.6 s**（22.9 ms/token，

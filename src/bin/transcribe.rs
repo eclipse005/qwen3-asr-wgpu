@@ -44,10 +44,14 @@ fn main() -> Result<()> {
         return Ok(());
     }
     // `--cpu-dec` is `--device cpu`; `--cpu-enc` only swaps the audio tower.
+    // `QASR_DEVICE` lets a wrapper (e.g. tools/verify_all.ps1) pin the runtime
+    // without every tool growing a flag; `--device`/`--adapter` still win.
     let adapter = if flag(&args, "--cpu-dec") {
         Some("cpu".to_string())
     } else {
-        arg(&args, "--device").or_else(|| arg(&args, "--adapter"))
+        arg(&args, "--device")
+            .or_else(|| arg(&args, "--adapter"))
+            .or_else(|| std::env::var("QASR_DEVICE").ok().filter(|s| !s.is_empty()))
     };
     let max_new: usize = arg(&args, "--max-new")
         .and_then(|s| s.parse().ok())
