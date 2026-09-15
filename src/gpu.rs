@@ -7,11 +7,6 @@ pub struct Gpu {
     pub info: wgpu::AdapterInfo,
     pub limits: wgpu::Limits,
     pub features: wgpu::Features,
-    /// Compiled-pipeline cache (see [`pipeline_cache_path`]).  `None` when the
-    /// adapter does not offer the feature.
-    pub pipeline_cache: Option<wgpu::PipelineCache>,
-    /// Where that cache is persisted, if it is.
-    pub pipeline_cache_path: Option<std::path::PathBuf>,
 }
 
 /// Which device to run on.
@@ -141,9 +136,6 @@ pub struct DeviceInfo {
     pub subgroup_min: u32,
     pub subgroup_max: u32,
     pub timestamps: bool,
-    /// Whether this runtime can persist compiled pipelines (`VkPipelineCache` /
-    /// `ID3D12PipelineLibrary`) — the fix for D3D12's ~5.5-minute build.
-    pub pipeline_cache: bool,
     /// PCI ids — information for the listing, never a selector.
     pub vendor_id: u32,
     pub device_id: u32,
@@ -187,7 +179,6 @@ impl DeviceInfo {
             subgroup_min: i.subgroup_min_size,
             subgroup_max: i.subgroup_max_size,
             timestamps: f.contains(wgpu::Features::TIMESTAMP_QUERY),
-            pipeline_cache: f.contains(wgpu::Features::PIPELINE_CACHE),
             vendor_id: i.vendor,
             device_id: i.device,
         }
@@ -233,7 +224,7 @@ impl DeviceTarget {
             format!("subgroup {}..{}", self.info.subgroup_min, self.info.subgroup_max)
         };
         format!(
-            "{}{:<10} {} ({}, {}, driver {}) binding {} MiB, {sg}, pso-cache {}",
+            "{}{:<10} {} ({}, {}, driver {}) binding {} MiB, {sg}",
             if self.is_default { "* " } else { "  " },
             self.spec,
             self.info.name,
@@ -241,7 +232,6 @@ impl DeviceTarget {
             self.info.device_type_str(),
             self.info.driver,
             self.info.max_binding_bytes / (1024 * 1024),
-            if self.info.pipeline_cache { "yes" } else { "no" },
         )
     }
 }
@@ -404,8 +394,7 @@ impl Gpu {
                     & (wgpu::Features::TIMESTAMP_QUERY
                         | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
                         | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
-                        | wgpu::Features::SUBGROUP
-                        | wgpu::Features::PIPELINE_CACHE),
+                        | wgpu::Features::SUBGROUP),
                 required_limits: limits.clone(),
                 ..Default::default()
             })
@@ -416,53 +405,13 @@ impl Gpu {
             eprintln!("[wgpu uncaptured error] {e}");
         }));
 
-        let cache_supported = features.contains(wgpu::Features::PIPELINE_CACHE);
-        let (pipeline_cache, pipeline_cache_path) = match pipeline_cache_path(&info) {
-            Some(path) if cache_supported => {
-                let seed = std::fs::read(&path).ok();
-                let cache = unsafe {
-                    device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
-                        label: Some("pipeline_cache"),
-                        data: seed.as_deref(),
-                        fallback: true,
-                    })
-                };
-                (Some(cache), Some(path))
-            }
-            _ => (None, None),
-        };
-
         Ok(Self {
             device,
             queue,
             info,
             limits,
             features,
-            pipeline_cache,
-            pipeline_cache_path,
         })
-    }
-
-    /// Write the compiled pipelines back to disk so the next process starts
-    /// warm.  Called once, after the decoder and the audio tower have built
-    /// everything they are going to build.
-    pub fn save_pipeline_cache(&self) -> Result<()> {
-        let (Some(cache), Some(path)) = (&self.pipeline_cache, &self.pipeline_cache_path) else {
-            return Ok(());
-        };
-        let Some(data) = cache.get_data() else {
-            return Ok(());
-        };
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, &data)?;
-        eprintln!(
-            "[pipeline cache] wrote {} KiB to {}",
-            data.len() / 1024,
-            path.display()
-        );
-        Ok(())
     }
 
     /// One-line description for logs and reports.
@@ -581,7 +530,7 @@ impl Gpu {
             module: &module,
             entry_point: Some(entry),
             compilation_options: Default::default(),
-            cache: self.pipeline_cache.as_ref(),
+            cache: None,
         });
         let err = pollster::block_on(guard.pop());
         if let Some(e) = err {
@@ -589,23 +538,6 @@ impl Gpu {
         }
         Ok(pipe)
     }
-}
-
-fn pipeline_cache_path(info: &wgpu::AdapterInfo) -> Option<std::path::PathBuf> {
-    let root = std::env::var_os("QASR_CACHE_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from))
-        .or_else(|| std::env::var_os("XDG_CACHE_HOME").map(std::path::PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
-        .or_else(|| Some(std::env::temp_dir()))?;
-    let key = format!(
-        "{:04x}-{:04x}-{:?}-{}",
-        info.vendor,
-        info.device,
-        info.backend,
-        info.driver_info.replace(['\\', '/', ':', ' '], "_")
-    );
-    Some(root.join("qwen3-asr-wgpu").join(format!("{key}.pipeline_cache")))
 }
 
 const STAGING_BUDGET: u64 = 256 << 20;

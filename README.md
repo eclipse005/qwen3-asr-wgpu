@@ -22,10 +22,13 @@ against the frozen python-hf text) on every runtime this machine has:
 | `gl:0` | Intel iGPU (OpenGL) | 7083 | 12131 | 29992 | 51 s | 3.46× | MATCH |
 
 On **D3D12 the pipeline build takes ~5.5 minutes** (344 s on Intel, 328 s on
-NVIDIA, against 4.6 / 6.6 s on Vulkan for their own Vulkan adapters), and wgpu
-30's D3D12 backend does not expose `Features::PIPELINE_CACHE`, so it cannot be
-cached away there.  The timings above are *after* that load; D3D12 stays a
-fallback for when Vulkan is unavailable, and `vulkan:N` is the practical choice.
+NVIDIA, against 4.6 / 6.6 s on Vulkan for their own Vulkan adapters).  It is not
+cached away: wgpu 30's D3D12 backend does not expose
+`Features::PIPELINE_CACHE`, so there is no cache to persist the build into where
+it actually hurts — and on Vulkan, which does expose it, the build is a rounding
+error (cold and warm loads both measure 6.7 s).  The timings above are *after*
+that load; D3D12 stays a fallback for when Vulkan is unavailable, and `vulkan:N`
+is the practical choice.
 
 `cpu` is the host backend (`--cpu-dec`): no adapter, f16 weights widened to f32
 once at load, rayon over output rows and over `(row, head)` in the attention.
