@@ -3,7 +3,19 @@
 **新窗口请把工作区开在 `D:\qwen3-asr-wgpu`，把本文件全文交给 AI。**
 改完对齐或 RTFx 后同步更新本文。不要再写第二份启动提示词。
 
-> **本窗口（2026-09-15）做完的事一句话**：**prefill 的因果注意力分块了（slab），
+> **本窗口（2026-09-15，第二轮）**：**多设备真的通了**。给 API 加了一等的设备选择
+> （`DeviceSelector` / `list_devices()` / `--device` / `--list-devices`），
+> 顺手抓到并修掉一个跨厂商 bug：**`Features::SUBGROUP` 是能力位、不是宽度** ——
+> Intel Vulkan 给的是 `subgroup 8..32`，而 `gemv` 的 butterfly 假定 32 lane，
+> 于是**整个模型输出流利的垃圾而且不报任何错**（只有转写文本能看出）。
+> 现在 shuffle 路径只在 `min == max == 32` 时启用，其余走共享内存版（逐位相同）。
+> 验证矩阵（0.6B / 180s_en / 逐字对 python-hf）：**NVIDIA Vulkan ✓、NVIDIA D3D12 ✓、
+> Intel 集显 Vulkan ✓**（iGPU 总耗时 ~49 s、RTFx 3.6）；**Intel D3D12 没验完** ——
+> 180s 跑 9 分钟没结束（同机 Vulkan 只要 49 s），先记为待查。
+> 另外：`processor.rs`（原版三步 API：apply_transcription_request / generate /
+> decode(ReturnFormat)）、README/LICENSE/docs/PORTING.md（移植指南：11 个坑 + 死路表）。
+
+> **本窗口（2026-09-15，第一轮）做完的事一句话**：**prefill 的因果注意力分块了（slab），
 > 15 分钟音频第一次跑通，对齐一分不让。** 见 `docs/design-tiled-prefill.md`
 > 的「As built」一节（设计 + 实测 + 八个坑）。
 > * key 维按 `T = SLAB_T = 1024` 切块：scratch 从 `[nqh, mp, cur]`（15 分钟 2 × 4.7 GB，
@@ -217,6 +229,41 @@ prologue 可行但会多读 40 KB/workgroup）。silu 折进 dp **不可行**：
 而且 exp 会按 workgroup 数（128）重复计算。
 
 ---
+
+## 下一个大件：CPU 后端（文本解码器）
+
+**现状**：只有**音频塔**有 CPU 实现（`audio_encoder.rs`，`--cpu-enc`）；**文本解码器
+只有 GPU 版**，所以现在没有 GPU 适配器就跑不起来（`Gpu::new` 直接 bail）。
+参考实现是兄弟仓库的 **`D:\qwen3-asr-rs\src\cpu_engine.rs`**（约 1000 行，用户指定参考）：
+
+* 激活 `Vec<f32>`，**权重存 f16**（decode 的 m=1 GEMV 直接读 f16 ⇒ 带宽减半），
+  prefill（m>1）时把权重转 f32 交给 `gemm` crate（本仓库已经有 `gemm`/`rayon` 依赖）。
+* `gemm` 必须显式给 `Parallelism::Rayon(0)`：它对 m=1 的 GEMV 默认单线程
+  （阈值 m·n·k ≥ 7M），decode 永远到不了，20 核机器只用 1 个核。
+* rms_norm / silu / attention 全部用 rayon 按 head 或行并行；KV cache 预分配
+  `[b, nkvh, max_seq, d]`；embed_tokens 复用成 lm_head（权重共享）。
+* 他们还有 int8 权重（per-channel 对称量化，AVX2 GEMV）：**12/12 文本仍然过**，
+  CER ~1%、RTFx 1.2–1.6×。这是后话，先做 f16 版。
+* 关键结论：**他们的累加顺序和 GPU 不同，文本照样对**（12 组全 MATCH）⇒ 我们的
+  CPU 版不需要复刻 WGSL 的归约树，只要每个 op 边界的 **f16 舍入点**一致
+  （rms_norm 输出、每个 linear 的输出、KV cache、attention 输出），
+  然后用 `--baseline` 走 12/12 门禁来钉。
+
+**建议的落地顺序**（每步单独提交 + 门禁）：
+
+1. `src/cpu_decoder.rs`：`CpuTextDecoder::{load, set_rope_tables, prefill, step}` ——
+   接口形状照抄 `WgpuTextDecoder`，这样 `inference.rs` 里只需要一个
+   `enum Decoder { Gpu(WgpuTextDecoder), Cpu(CpuTextDecoder) }` 转发。
+   op 清单：rms_norm(+f16)、fused qkv / o / gu / dp 的 GEMV+GEMM+残差、
+   q/k 的 **q_norm/k_norm → rope**（顺序与 `shaders::qkv_extract` 一致，rope 用
+   f16 舍入后的 cos/sin 表 = GPU 上传的那份）、KV cache 写 f16、prefill 因果
+   attention（逐行 online softmax，省内存）、decode 的 GQA、silu、argmax、embed。
+2. `--cpu-dec`（以及**没有适配器时自动回落**：`Gpu::new` 失败 ⇒ CPU 塔 + CPU 解码器）。
+3. 门禁：`--cpu-dec` 跑 6 个 fixture × 0.6B 对 `--baseline`；通了再补 1.7B。
+4. 收尾：`--cpu-dec --device …` 互斥检查、README 的「不移植清单」里去掉 CPU 一行。
+
+**顺带的价值**：CPU 解码器就是 GPU 解码器的 **oracle**（音频塔那两个 bug 就是被
+CPU 参考抓出来的），也是查 Intel D3D12 那种「能跑但慢/错」问题的对照物。
 
 ## 下一步（RTFx；对齐已无欠账）
 
