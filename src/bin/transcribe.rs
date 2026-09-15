@@ -56,8 +56,12 @@ fn main() -> Result<()> {
 
     // Upstream parity knobs: `--context` (hotword/bias text, goes into the chat
     // template's system message) and `--lang` (force the output language).
+    // `--prompt` is the reference processor's name for the same thing, and the
+    // name `transformers` itself uses: `apply_transcription_request(prompt=…)`.
     let opts = TranscribeOptions {
-        context: arg(&args, "--context").unwrap_or_default(),
+        context: arg(&args, "--context")
+            .or_else(|| arg(&args, "--prompt"))
+            .unwrap_or_default(),
         language: arg(&args, "--lang"),
     };
     let dump = arg(&args, "--dump").map(PathBuf::from);

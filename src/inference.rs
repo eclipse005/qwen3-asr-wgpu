@@ -558,6 +558,15 @@ impl WgpuAsr {
         self.mel.extract(samples)
     }
 
+    /// The tokenizer's decode — the reference's `processor.decode` primitive.
+    /// `skip_special_tokens` is upstream's knob: left at its default (`false`)
+    /// for `return_format="raw"`, forced `true` for the other two formats.
+    pub(crate) fn decode_ids(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
+        self.tokenizer
+            .decode(ids, skip_special_tokens)
+            .map_err(|e| anyhow::anyhow!("decode: {e}"))
+    }
+
     /// Audio encoder only (probe hook — no GPU work).
     pub fn encode_mel(&mut self, mel: &[f32], n_mels: usize, n_frames: usize) -> Result<Vec<f32>> {
         self.encoder.forward(mel, n_mels, n_frames)
@@ -1168,10 +1177,8 @@ impl WgpuAsr {
         t_mel_ms: f64,
         t_enc_ms: f64,
         opts: &TranscribeOptions,
-        mut stream: Option<&mut dyn FnMut(StreamToken)>,
+        stream: Option<&mut dyn FnMut(StreamToken)>,
     ) -> Result<TranscribeResult> {
-        let hs = self.config.thinker_config.text_config.hidden_size;
-        let nat = audio_embeds.len() / hs;
         if let Some(dir) = dump_dir {
             std::fs::create_dir_all(dir)?;
             let mut bytes = Vec::with_capacity(audio_embeds.len() * 4);
@@ -1180,6 +1187,41 @@ impl WgpuAsr {
             }
             std::fs::write(dir.join("audio_embeds.f32"), bytes)?;
         }
+        let gen = self.generate_from_embeds(audio_embeds, max_new_tokens, opts, stream)?;
+        eprintln!(
+            "mel={:.0}ms enc={:.0}ms prefill={:.0}ms decode={:.0}ms [host submit {:.0} / read {:.0}] tokens={} seq={}",
+            t_mel_ms,
+            t_enc_ms,
+            gen.prefill_ms,
+            gen.decode_ms,
+            self.decoder.host_submit_ms,
+            self.decoder.host_read_ms,
+            gen.ids.len(),
+            gen.seq_len,
+        );
+        if let Some(dir) = dump_dir {
+            let ids: String = gen.ids.iter().map(|id| format!("{id}\n")).collect();
+            std::fs::write(dir.join("gen_ids.txt"), ids)?;
+        }
+        prompt::decode_result(&self.tokenizer, &gen.ids)
+    }
+
+    /// Prompt → prefill → greedy decode over pre-encoded audio embeddings.
+    ///
+    /// This is the reference pipeline's `model.generate(**inputs)`: everything
+    /// after the processor has produced the audio features.  The returned ids are
+    /// only the *generated* ones — the reference slices `output_ids[:,
+    /// input_ids.shape[1]:]` before `decode`, and every caller here starts from
+    /// the same point.
+    pub(crate) fn generate_from_embeds(
+        &mut self,
+        audio_embeds: &[f32],
+        max_new_tokens: usize,
+        opts: &TranscribeOptions,
+        mut stream: Option<&mut dyn FnMut(StreamToken)>,
+    ) -> Result<Generation> {
+        let hs = self.config.thinker_config.text_config.hidden_size;
+        let nat = audio_embeds.len() / hs;
         // Upstream normalises and validates a forced language before prompting,
         // and only then appends `language X<asr_text>` to the assistant turn.
         let language = opts.forced_language()?;
@@ -1246,23 +1288,22 @@ impl WgpuAsr {
             }
         }
         let t_decode = t3.elapsed();
-        eprintln!(
-            "mel={:.0}ms enc={:.0}ms prefill={:.0}ms decode={:.0}ms [host submit {:.0} / read {:.0}] tokens={} seq={}",
-            t_mel_ms,
-            t_enc_ms,
-            t_prefill.as_secs_f64() * 1000.0,
-            t_decode.as_secs_f64() * 1000.0,
-            self.decoder.host_submit_ms,
-            self.decoder.host_read_ms,
-            generated.len(),
+        Ok(Generation {
+            ids: generated,
             seq_len,
-        );
-        if let Some(dir) = dump_dir {
-            let ids: String = generated.iter().map(|id| format!("{id}\n")).collect();
-            std::fs::write(dir.join("gen_ids.txt"), ids)?;
-        }
-        prompt::decode_result(&self.tokenizer, &generated)
+            prefill_ms: t_prefill.as_secs_f64() * 1000.0,
+            decode_ms: t_decode.as_secs_f64() * 1000.0,
+        })
     }
+}
+
+/// One greedy generation (the reference's `model.generate`): the generated ids
+/// **without** the prompt, plus what the phase timings need.
+pub(crate) struct Generation {
+    pub ids: Vec<u32>,
+    pub seq_len: usize,
+    pub prefill_ms: f64,
+    pub decode_ms: f64,
 }
 
 /// Diagnostic envelope of one stage against the CPU reference.

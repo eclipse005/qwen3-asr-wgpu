@@ -6,10 +6,14 @@
 //! the parent repository, so the whole `wgpu/` tree can be renamed and moved
 //! elsewhere without edits.
 //!
-//! Text decoder (prefill + decode) runs on wgpu. Audio encoder currently uses
-//! the CPU reference (same math as qwen3-asr-rs) so end-to-end transcripts can
-//! be checked against the Python `-hf` baseline while the GPU audio tower is
-//! still being ported. See `ROADMAP-wgpu.md`.
+//! Both towers run on wgpu (the CPU audio tower is kept as `--cpu-enc`, a
+//! fallback and a reference).  Everything is verified against the Python
+//! `-hf` reference: see the README's parity gates, and
+//! `docs/design-tiled-prefill.md` for the long-context attention.
+//!
+//! The entry points are the reference pipeline's own three steps — see
+//! [`processor`] — plus convenience wrappers that do all three in one call
+//! ([`WgpuAsr::transcribe_file_opts`] and friends).
 
 pub mod audio_encoder;
 pub mod audio_encoder_gpu;
@@ -21,11 +25,13 @@ pub mod gpu;
 pub mod inference;
 pub mod mel;
 pub mod mrope;
+pub mod processor;
 pub mod prompt;
 pub mod shaders;
 pub mod weights;
 
 pub use decoder::{TextConfig, WgpuTextDecoder};
 pub use gpu::Gpu;
-pub use inference::WgpuAsr;
+pub use inference::{supported_languages, StreamToken, TranscribeOptions, WgpuAsr};
+pub use processor::{AsrTranscription, Decoded, ReturnFormat, TranscriptionRequest};
 pub use prompt::TranscribeResult;
