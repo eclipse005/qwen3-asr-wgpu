@@ -18,12 +18,17 @@ use crate::mrope::{compute_mrope_cos_sin, text_positions};
 use crate::prompt::{self, TranscribeResult, ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID};
 use crate::weights;
 
-/// KV + MRoPE size.  The binding limit, not this, is what really caps audio
-/// length: the prefill's causal-attention scratch is O(s²) per head
-/// (`scores`/`attn` in `decoder::prefill`), i.e. 16·s²·2 bytes each, which
-/// passes `max_storage_buffer_binding_size` (2047 MiB here) at s ≈ 8 200.
-/// `prefill` guards that explicitly; this constant just has to stay above it.
-const DECODER_MAX_SEQ: usize = 9216;
+/// KV + MRoPE size: 16 key slabs (`decoder::SLAB_T`) — a 15-minute clip plus its
+/// transcript, i.e. ~16 min of audio end to end.
+///
+/// Until the prefill attention was tiled, the real cap was the per-binding limit
+/// on the O(s²) `scores`/`attn` scratch (~8 200 tokens here), and this constant
+/// only had to stay above that guard.  The slabbed path is O(s · T) per head, so
+/// the binding limit is no longer what bounds the sequence — the KV cache is
+/// (nkvh · s · hd · 2 bytes per layer per K and V, ~1.9 GiB across 28 layers at
+/// this cap).  Both limits are checked where they bite: `prefill` before it
+/// allocates, and the caller below before it prompts.
+const DECODER_MAX_SEQ: usize = 16384;
 
 /// Which audio-tower implementation a [`WgpuAsr`] runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

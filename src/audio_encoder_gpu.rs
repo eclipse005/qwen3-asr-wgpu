@@ -104,6 +104,9 @@ struct GDims {
     /// exists because the tower shares `shaders::prefill_gemm` with the decoder,
     /// where the slabbed attention uses it).
     row0: u32,
+    /// A row stride in elements; `k` for every tower GEMM (same reason as
+    /// `row0` — the decoder's slabbed AV gives its score slab a wider stride).
+    lda: u32,
 }
 
 /// Mirrors `shaders::audio_im2col`'s `Im2Cfg` field for field.
@@ -1843,6 +1846,7 @@ impl GpuAudioEncoder {
                 bsc: bsc as u32,
                 beta: 0,
                 row0: 0,
+                lda: k as u32,
             }),
         );
         let bg = match bias {

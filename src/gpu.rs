@@ -132,6 +132,12 @@ impl Gpu {
         self.queue.write_buffer(buf, 0, data);
     }
 
+    /// [`Gpu::upload`] at an explicit offset — for uniform buffers carrying one
+    /// cfg per dispatch slot (see `decoder::prefill`'s slab cfgs).
+    pub fn write_at(&self, buf: &wgpu::Buffer, offset: u64, data: &[u8]) {
+        self.queue.write_buffer(buf, offset, data);
+    }
+
     /// Submit an empty command buffer and wait for the queue to drain.  This
     /// retires every deferred `write_buffer` copy and frees their staging.
     pub fn flush(&self) -> Result<()> {

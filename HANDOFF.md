@@ -3,6 +3,27 @@
 **新窗口请把工作区开在 `D:\qwen3-asr-wgpu`，把本文件全文交给 AI。**
 改完对齐或 RTFx 后同步更新本文。不要再写第二份启动提示词。
 
+> **本窗口（2026-09-15）做完的事一句话**：**prefill 的因果注意力分块了（slab），
+> 15 分钟音频第一次跑通，对齐一分不让。** 见 `docs/design-tiled-prefill.md`
+> 的「As built」一节（设计 + 实测 + 八个坑）。
+> * key 维按 `T = SLAB_T = 1024` 切块：scratch 从 `[nqh, mp, cur]`（15 分钟 2 × 4.7 GB，
+>   超 2047 MiB 单绑定）变成 `[nqh, mp, T]`（398 MB）+ 每块的 AV 输出 `[n_slab, mp, nqh·hd]`；
+> * 每块用自己的 max 做 softmax，块间用「它就是被除的那个 Σexp」加权合并
+>   （`slab_stats` / `slab_weights` / `slab_merge` 三个新 kernel，`softmax_causal` 与
+>   两个 causal GEMM 只加了 `row0`）；
+> * 门控 `s > 4096`（`QASR_SLAB=on|off` 可强制）⇒ 6 个 fixture + FLEURS 全走老路径，
+>   **12/12 逐字不变**（`QASR_SLAB=on` 强制也 12/12）；
+> * 实测：`5m` 两条路径**逐字相同**；`6m` 只差一个缩写（`you're`/`you are`，
+>   与 Python 参照本来就差的那一处）；`10m` 老路径已经 OOM（见下），新的 prefill 8.1 s；
+>   **`15m`（12 065 token）prefill 16.3 s、decode 76.6 s、3 343 token / 15 757 字符全文、
+>   RTFx 9.4、峰值 ~5.5 GiB**。
+> * 性能上的关键发现：第一版比老路径慢 2.6×（6 分钟 10.2 s），全部在「每块每行都开一个
+>   1024 线程 workgroup」的 softmax/`slab_stats` 上；`valid == 0` 的整组提前返回 + 归约块
+>   1024 → 256 之后回到 4.17 s（老路径 3.97 s）。
+> * `DECODER_MAX_SEQ` 9216 → **16384**（= 16 块；15 分钟 12 065 + 全文 3 343 token 装得下）。
+>   **代价**：KV cache 1.05 → 1.9 GiB，`10m` 的老路径（O(s²) scratch 3.9 GB）因此在 8 GB 卡上
+>   OOM —— 只影响 `QASR_SLAB=off` 的 A/B，默认路径在 10 分钟是 slab。
+
 > **本窗口（2026-09-14 第二轮）做完的事一句话**：**GPU 音频塔的 transformer 对齐了**。
 > conv stem 本来就是对的（上一窗口的结论没错，是诊断的 CPU 参考坏了，见 bug 23）；
 > 真正挡住 transformer 的是四个 bug：`enc.ex` uniform **从未写入**（extract 第一句就 return，
@@ -80,6 +101,11 @@ cargo run --release --bin transcribe -- --model D:\Qwen3-ASR\models\Qwen3-ASR-0.
 对齐要点（不要回退）：重采样 vendored soxr **HQ**；`180s_en` 是 44.1 kHz mono；
 STFT `center=True` 反射 pad；Encoder GELU 是 **erf**；`WgpuAsr::load` 只上一次 GPU；
 decode 的 GEMV 归约树与 attention 的加法顺序（见「RTFx 优化」一节）。
+
+**另一个门禁（2026-09-15 起）**：`QASR_SLAB=on` 强制走分块 prefill 注意力，同样要
+**12/12**（本窗口跑过两次）。默认只在 `s > 4096` 走它，所以默认路径的 12/12 与
+逐位行为未被触碰（老路径的 GEMM 只多了一个恒为 `k` 的 `lda` 字段和一个恒为 `row0 = 0`
+的因果偏移，构造上等价；`softmax_causal` 的 `valid==0` 提前返回在老路径上不可达）。
 
 ---
 
@@ -194,14 +220,48 @@ prologue 可行但会多读 40 KB/workgroup）。silu 折进 dp **不可行**：
 
 ## 下一步（RTFx；对齐已无欠账）
 
-1. prefill 1788 ms（CUDA 1414 ms）：`gemm_bench` 已扫空 TM/TN，要动数据流而不是 tile。
-2. 音频塔 enc 1050 ms：conv stem 只占 ~63 ms，其余是 18 层 transformer 的 GEMM。
-3. decode 6024 ms：上面那张表就是清单（注意力 AV 的指令数 / extract+merge 的气泡）。
+1. **长音频现在是 decode 主导**：15 分钟那档 prefill 16.3 s、decode **76.6 s**（22.9 ms/token，
+   因为每步都要扫全 12k 的 KV）。想再快就得动 decode 的注意力扫描（现在是 split-K 两块 +
+   merge，`gqa_p1` 3.45 + `gqa_merge` 0.78 ms/步 @180s）或者 KV 的读取方式。
+2. prefill 180s 那档仍是 1522 ms（CUDA 1414）：`gemm_bench` 已扫空 TM/TN，要动数据流而不是 tile。
+3. 音频塔 enc 1050 ms：conv stem 只占 ~63 ms，其余是 18 层 transformer 的 GEMM。
 4. `--diag-enc` 里 `layer 17` 还有 917/174720 个点超 5e-3（max 0.128）—— f16 逐层累积，预期内。
 
 ---
 
-## ★ 本窗口修掉的四个真 bug（都验证过，别再重复怀疑）
+## ★ 2026-09-15 那窗口修的真 bug（slab，别重复怀疑）
+
+细节与最小复现在 `docs/design-tiled-prefill.md` 的「Traps」一节，这里只记后果：
+
+**25. bind group 的 entry offset 与 dynamic offset 是「相加」的**。
+两处都写 `slot·256` ⇒ 实际读 `2·slot·256`：`slab_stats` 因此读到 `slab_weights` 的 cfg
+（`valid = 1` 之类的胡说），统计全错、合并权重是垃圾，**整条转写是空的但没有任何报错**。
+现在槽地址只由 dynamic offset 给。
+
+**26. `slab_stats` 的统计行号必须是 `head·mp + pos`**，不是 dispatch 的平坦行号
+（行网格是 `nqh·s`，不是 `nqh·mp`）—— 错了以后「每块的最大/Σexp」对应到别的行。
+
+**27. `slab_merge` 的两个操作数布局不同**：stats/weights 是 head-major（`head·mp + pos`），
+AV 输出是 GEMM 自己的 C 布局（`pos·nqh·hd + head·hd + …`）。用一个下标驱动两个 ⇒ 读错元素。
+
+**28. 音频塔与解码器共用 `shaders::prefill_gemm`，但各自有 `GDims`**。
+给解码器的结构体加了 `lda` 而没给音频塔加 ⇒ 塔读到的是 uniform 槽尾巴里的**未初始化字节**，
+A 操作数行距全错 ⇒ **embedding 全错，转写全空，而且 GPU 不报任何错**。
+识别特征是 `--cpu-enc` 正常。现在两边都写明 `row0`/`lda` 是共享字段。
+
+**29. softmax 不能原地归一化 slab**：wgpu 拒绝同一个 buffer 在一次 dispatch 里既是
+read-only 又是 read-write（`conflicting usages ... is an exclusive usage`）⇒ 两个 slab buffer。
+
+**30. `repeat_kv` 只写 `0..cur` 行，但注意力 GEMM 读整块**。AV 的 V 尾巴
+（`cur..cur16`）会被乘上 softmax 写出的**精确 0** —— 但 `0 · NaN = NaN`，
+所以 `k_rep`/`v_rep` 的尾巴现在显式清零（slab 路径读的尾巴比老路径长得多）。
+另外「最后一个位置之后的行」没有统计 ⇒ `total = 0` 时 `0 · (1/0)` 也是 NaN，已挡。
+
+**31. 长 prefill 的 TDR 是墙上时间，不是层数**。每 4 层 submit 在 slab 路径的
+~1 s/层 下超过 2 s ⇒ 设备丢失（10 分钟首跑：「map token / async map」失败）。
+`s >= 4096` 起改成每 2 层。
+
+## ★ 上一窗口修掉的四个真 bug（都验证过，别再重复怀疑）
 
 **20. `enc.ex` uniform 从未写入**（`audio_encoder_gpu.rs` 的 `layer()`）。
 `u_ex` 只被创建、绑定，没有任何 `write_buffer`，所以 `ExCfg.n_tokens = 0`，
@@ -493,7 +553,12 @@ prefill 4200 vs 1518 ms**（bank conflict + 占用率同时变坏）——`PAD =
 
 ---
 
-## 长音频（>4 分钟）：本窗口实测与遗留限制
+## 长音频（>4 分钟）：实测与限制
+
+**上限现在是 `DECODER_MAX_SEQ = 16384`**（= 16 块）：约 16 分钟音频 + 完整转写。
+超过时 `prefill` 会先给显式的错误（不是静默垃圾）；`max_seq` 的检查在
+`inference.rs`（`seq + max_new + 8 <= max_seq`）。再往上就要么缩 KV（现在 1.9 GiB，
+是唯一的大头），要么做 KV 的按需分配/分页。
 
 `15m.wav`（16 kHz mono PCM16，926.93 s ≈ **12,065 token**）把这个仓库从没走过的路走了一遍，
 暴露的都是**容量/网格上限**（不是数学错），而且 6 个 fixture 都 ≤180 s，所以以前从没碰到：
@@ -510,36 +575,40 @@ prefill 4200 vs 1518 ms**（bank conflict + 占用率同时变坏）——`PAD =
 
 算术一律没动（只是把平坦下标换成 `x + y·gx·threads`）⇒ 短音频 12 组仍全 MATCH。
 
-**真正的硬限制：prefill 的因果注意力 scratch 是 O(s²)**（`decoder::prefill` 里的 `scores`/`attn`
+**曾经的硬限制：prefill 的因果注意力 scratch 是 O(s²)**（`decoder::prefill` 里的 `scores`/`attn`
 两块，各 `nqh·s²·2` 字节）。12,065 token 时 **≈4.7 GB × 2** ⇒ 既超 8 GB 显存，也超单绑定
 **2047 MiB** 上限；wgpu 的失败方式是**静默出垃圾**（表现为「prefill 70 ms + 乱码」）。
 现在 `prefill` 会**显式报错**（并把可支持的最大 token 数算给用户看）。
-`DECODER_MAX_SEQ` 从 4096 提到 **8192**（与 scratch 上限自洽；KV cache +~450 MB）。
-参考实现（transformers）走 **SDPA**，没有 O(s²) scratch，所以它 15 分钟能跑 —— **这是我们在长音频上唯一
-与 Python 原版不一致的地方**，要补就得把 prefill 注意力分块（两遍式精确 softmax），是个正经的 kernel 工程。
+
+**已解决（本窗口）**：prefill 注意力改成分块（slab），见 `docs/design-tiled-prefill.md`。
+scratch 变 `[nqh, mp, 1024]`，`s > 4096` 自动走新路径（`QASR_SLAB=on|off` 强制）。
+**15 分钟音频现在跑得通**（下表），默认路径在 5 分钟以上都是 slab。
+参考实现（transformers）走 **SDPA**，在 Pascal 上反而会 materialize s²（所以它 15 分钟 OOM，
+见下）。
 
 **实测（0.6B）**
 
 | 输入 | 结果 |
 |---|---|
-| 15m.wav（12,065 token） | **明确拒绝**：`seq 12065 + max_new 512 exceeds decoder max_seq 8192`（之前是静默垃圾） |
-| 6m.wav（360 s / 4,695 token） | **跑通**：mel 50 / enc 1975 / prefill 4996 / decode 14397 ms，**峰值显存 4,600 MiB**；输出连贯 |
-| 同一 6m.wav 用官方 Python 跑 | prompt token **4,695 = 我们的 4,695**（逐 token 相同）；Python 83.2 s vs 我们 21.4 s；**文本 4,519 vs 4,520 字符，全长只有 1 处不同**（`you're` / `you are`，属 f16 边界处的取整抖动） |
+| **15m.wav（926.9 s / 12,065 token）** | **跑通（本窗口第一次）**：mel 121 / enc 5236 / **prefill 16 259** / decode 76 556 ms，`elapsed=98.25 s`、**RTFx 9.43**，3 343 token / 15 757 字符（到 EOS，全文，结尾是「see in the next video guys cheers」），峰值 ~**5.5 GiB** |
+| 10m.wav（7,815 token） | 默认（slab）跑通：prefill **8 115 ms**；**`QASR_SLAB=off` 已经 OOM**（`DECODER_MAX_SEQ` 变大后的 KV 1.9 GB + 老路径 3.9 GB scratch） |
+| 6m.wav（360 s / 4,695 token） | slab prefill 4 165 ms vs 老路径 3 968 ms；文本只差一处缩写 |
+| 5m.wav（3,915 token） | slab 与老路径 **逐字相同**（5 132 字符），prefill 2 857 vs 2 848 ms |
+| 同一 6m.wav 用官方 Python 跑 | prompt token **4,695 = 我们的 4,695**（逐 token 相同）；Python 83.2 s vs 我们 21.4 s；文本只差 `you're` / `you are` |
 
-⇒ 结论：**结果是逐字对齐的（连没见过的 6 分钟长音频都只差一个缩写），长音频的容量是设计限制**。
+⇒ 结论：**结果是逐字对齐的（连没见过的 6 分钟长音频都只差一个缩写）；15 分钟现在是能力，不是拒绝**。
 
 **官方 Python 在同一台机器上的长音频表现（同 15m.wav，0.6B fp16）**
 
 | 输入 | 官方 transformers（`attn_implementation: sdpa`） | 我们 |
 |---|---|---|
 | 6 min（4,695 token） | 跑通：83.2 s，torch 峰值分配 **5.25 GiB** | 跑通：21.4 s，nvidia-smi 峰值 **4,600 MiB** |
-| 15 min（12,065 token） | **`CUDA error: out of memory`**（`generate` 第一次 forward 就挂；nvidia-smi 峰值 8,009/8,192 MiB） | **明确拒绝**（scratch 超 2047 MiB 单绑定上限），不给垃圾 |
+| 15 min（12,065 token） | **`CUDA error: out of memory`**（`generate` 第一次 forward 就挂；nvidia-smi 峰值 8,009/8,192 MiB） | **跑通**（本窗口）：98.3 s、RTFx 9.4、峰值 ~5.5 GiB |
 
-⇒ 8 GB 卡上**两边都吃不下 15 分钟**（0.6B！）——它并不是「官方能跑我们不能」：
-Pascal(sm61) 没有 flash-attention kernel，torch 的 SDPA 在这张卡上退化成会materialize
-`s²` 分数矩阵的路径（16·12065²·2 ≈ 4.7 GB），所以它也是死在同一类内存上。
-我们这边可用上限约 **10 分钟**（scratch 守卫 ≈ 8.2k token，`max_seq` 8,192），比它略高；
-要真正支持任意长度，两边都得用分块/流式注意力（他们的 vLLM 后端即是）。
+⇒ 8 GB 卡上**官方的 SDPA 吃不下 15 分钟**：Pascal(sm61) 没有 flash-attention kernel，
+torch 的 SDPA 在这张卡上退化成会 materialize `s²` 分数矩阵的路径（16·12065²·2 ≈ 4.7 GB）。
+我们分块之后同样长度的 scratch 只有 398 MB，因此**在 15 分钟这一档我们是唯一能跑的**
+（6 分钟那边它反而更大方：5.25 GiB vs 4.6 GiB，两边都够）。
 
 ### 5 分钟三方实测（0.6B / 同一 `5m.wav` / max_new 2048）
 
@@ -559,18 +628,12 @@ CUDA 版在长上下文的表现（重复循环 + 语言字段垃圾）与它自
 
 | 输入 | 官方 transformers | CUDA 手写版 | 我们（wgpu） |
 |---|---|---|---|
-| 6 min | ✓ 5.25 GiB | 未测 | ✓ 4,600 MiB |
-| 10 min | ✗ OOM | ✗ `CUDA_ERROR_OUT_OF_MEMORY`（音频塔阶段） | ✓ **7,203 MiB** |
-| 15 min | ✗ OOM（峰值 8,009 MiB） | 未测（5 min 已不可复现） | ✗ 明确拒绝（单绑定 2047 MiB 上限） |
+| 6 min | ✓ 5.25 GiB | 未测 | ✓ 4,600 MiB（老路径） |
+| 10 min | ✗ OOM | ✗ `CUDA_ERROR_OUT_OF_MEMORY`（音频塔阶段） | ✓ slab，峰值 < 5.5 GiB |
+| 15 min | ✗ OOM（峰值 8,009 MiB） | 未测（5 min 已不可复现） | ✓ **slab，峰值 ~5.5 GiB、98.3 s** |
 
-**换成 16 GB 卡会怎样**（`max_storage_buffer_binding_size` 是驱动的固定值 2047 MiB，
-与显存大小无关）：
-
-| | 16 GB 能否跑 15 min | 说明 |
-|---|---|---|
-| 官方 | **预计可以** ✓ | 分数矩阵 f16 ≈ 4.7 GB + 权重 1.25 + KV 1.1 + 激活 ≈ 7–9 GB |
-| 我们 | **换卡没用** ✗ | 卡在单绑定 2047 MiB：scratch 是**两块整分配**（各 16·s²·2B）。必须先做**分块注意力**；做完后 15 min 只需 O(s·hd) ≈ 2–3 GB，8 GB 卡都够 |
-| CUDA 版 | 内存上或许够（f32 scratch 12k token ≈ 11.6 GB，16 GB 很紧，24 GB 稳） | 但它 5 min 就已不可复现，内存不是它的首要问题 |
+（老路径的 10 min 曾是 7,203 MiB；`DECODER_MAX_SEQ` 提到 16384 之后不再放得下，
+默认路径在那之上本来就都是 slab。）
 
 ---
 
@@ -598,6 +661,24 @@ attention 的 per-(head,window) 分块          z = head*n_win + win
     scores/probs[z][wpad][wpad]，attn_out[z][wpad][hd_pad]
 ```
 
+**文本 prefill 的 slab（`decoder::prefill`，`s > 4096` 才用）**
+
+```text
+slab 宽 T = SLAB_T = 1024，归约块 SLAB_BS = 256（softmax 与 slab_stats 必须一致）
+p.scores / p.attn   [nqh·mp][T] f16        行距 T 元素；scores 是原始分数，attn 是归一化后的块
+p.k_rep / p.v_rep   [nqh][n_slab·T][hd]    repeat_kv 只写 0..cur 行，尾巴显式清零
+p.slab_part         [n_slab][mp][nqh·hd]  每块的 AV 输出（AV GEMM 的 C，beta=0；按块做 bind-group 偏移）
+p.slab_stats        [n_slab][nqh·mp][2]   f32 (max, Σexp)，行号 = head·mp + pos
+p.slab_w            [n_slab][nqh·mp]      f32 归一化后的合并权重（同样的行号）
+每块的 dispatch 参数在 u_sl（256 B 槽，前 2·MAX_SLAB 个留给 slab）：
+  槽 t                = softmax cfg（n_w = n_x = T/2, valid = tl, row0 = t0）
+  槽 MAX_SLAB + t     = slab_stats cfg（同上 + rows = nqh·mp）
+  槽 2·MAX_SLAB       = slab_weights cfg（layer 无关）
+  槽 2·MAX_SLAB + 1   = slab_merge cfg（layer 无关）
+槽地址**只由 dynamic offset 给**：entry offset 与它相加（bug 25）。
+slab 的 GEMM 参数：scores 用 row0 = t0、lda = hd；AV 用 row0 = t0、lda = T、k = tl（16 对齐）。
+```
+
 * **哨兵只有一个**：`shaders::TAP_OOB`，由 Rust 注入 WGSL（`audio_im2col()` 里 `format!`）。
   两边曾经不一致（Rust `0xFFFF_FFFF` / WGSL `0xFFFF`），后果是每个越界 tap 都被当成合法地址。
 * **k 必须按 `GEMM_BK`(=16) 对齐**，不只是 4：k 循环按整 16 宽 tile 走，`k=12` 时最后 4 个 k
@@ -623,6 +704,13 @@ attention 的 per-(head,window) 分块          z = head*n_win + win
 | `cargo run --bin subgroup_bfly_bench` | butterfly A/B（含位一致性） |
 | `cargo run --bin feature_probe` | 本机 wgpu 能力 |
 | `cargo run --bin cpu_gemm_probe` | `gemm` crate 在编码器真实形状上的吞吐 |
+
+**环境变量旋钮**（都在 `decoder.rs`，都只影响 prefill）：
+
+| 变量 | 作用 |
+|---|---|
+| `QASR_SLAB=on｜off` | 强制走/不走分块 prefill 注意力（`on` 也能在短音频上用，见门禁一节） |
+| `QASR_DUP=p_scores｜p_softmax｜p_av` | 把该 op 再派发一次（幂等）⇒ 时差 = 该 op 的成本；slab 路径里是**每块**都重派发 |
 
 不要提交：`align_dump/`、`golden/`、`target/`、`*.bin`。
 

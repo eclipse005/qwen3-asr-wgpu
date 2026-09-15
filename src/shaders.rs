@@ -1532,6 +1532,11 @@ pub const PREFILL_GEMM_BN: usize = 16 * PREFILL_GEMM_TN;
 /// every block but the first by half a block.  `transb=1` reads W as a [k, n] f16
 /// matrix instead of [n, k] (attention AV: V is [cur, d]).
 ///
+/// `lda` is the A row stride in elements — `k` everywhere except the slabbed AV,
+/// whose A operand (a score slab) is `T` wide while the tile it sweeps is
+/// narrower.  `row0` shifts the B operand's rows (K or V rows = key positions)
+/// and, on the two causal variants, the diagonal they test against.
+///
 /// The tile geometry comes from the `PREFILL_GEMM_*` constants above; callers
 /// must pad `m`, `n` and the operand row strides with those same values.
 pub fn prefill_gemm(transb: bool, beta: bool) -> String {
@@ -1539,17 +1544,19 @@ pub fn prefill_gemm(transb: bool, beta: bool) -> String {
 }
 
 /// [`prefill_gemm`] with the causal-attention tile skip: a tile wholly above the
-/// diagonal (`n0 > m0 + BM - 1`) is entirely masked by the causal softmax, which
-/// never reads columns past `row + 1`, so skipping it is bit-identical — it just
-/// stops writing ~half of the `s × cur` score matrix.
+/// diagonal (`n0 + row0 > m0 + BM - 1`, `row0` = the key offset of the score
+/// slab) is entirely masked by the causal softmax, which never reads columns
+/// past `row + 1`, so skipping it is bit-identical — it just stops writing ~half
+/// of the `s × cur` score matrix.
 pub fn prefill_gemm_causal() -> String {
     prefill_gemm_impl(false, false, false, true, false)
 }
 
 /// [`prefill_gemm_bias`]-style AV form (`transb = 1`) with the causal *k* bound:
 /// the A operand is the softmax output, whose columns past `row + 1` are exactly
-/// zero, so a row block only has to sweep `k < m0 + BM`.  Skipping exact zeros
-/// from a sum is bit-identical.
+/// zero, so a row block only has to sweep `k < m0 + BM - row0` (`row0` = the
+/// slab's key offset; zero on the flat path).  Skipping exact zeros from a sum is
+/// bit-identical.
 pub fn prefill_gemm_causal_av() -> String {
     prefill_gemm_impl(true, false, false, false, true)
 }
@@ -1580,7 +1587,7 @@ fn prefill_gemm_impl(
 
     let mut s = String::new();
     s.push_str(
-        "struct GDims { m: u32, n: u32, k: u32, ldc: u32, bsa: u32, bsb: u32, bsc: u32, beta: u32, row0: u32 };\n\
+        "struct GDims { m: u32, n: u32, k: u32, ldc: u32, bsa: u32, bsb: u32, bsc: u32, beta: u32, row0: u32, lda: u32 };\n\
          @group(0) @binding(0) var<storage, read>       A: array<u32>;\n\
          @group(0) @binding(1) var<storage, read>       W: array<u32>;\n\
          @group(0) @binding(2) var<storage, read_write> C: array<u32>;\n\
@@ -1619,10 +1626,11 @@ fn prefill_gemm_impl(
                  @builtin(local_invocation_id) lid: vec3<u32>) {\n\
          let tx = lid.x;\n let ty = lid.y;\n\
          let m0 = wid.y * BM;\n let n0 = wid.x * BN;\n let kk = gd.k / 2u;\n\
+         let alda = gd.lda / 2u;\n\
          let abase = wid.z * gd.bsa;\n let wb = wid.z * gd.bsb;\n\
          let cbase = wid.z * gd.bsc;\n\
-         if (CAUSAL == 1u && n0 > m0 + BM - 1u) { return; }\n\
-         let klim = select(gd.k, min(gd.k, m0 + BM), CAUSAL_K == 1u);\n",
+         if (CAUSAL == 1u && n0 + gd.row0 > m0 + BM - 1u) { return; }\n\
+         let klim = select(gd.k, min(gd.k, max(m0 + BM, gd.row0) - gd.row0), CAUSAL_K == 1u);\n",
     );
 
     for i in 0..tm {
@@ -1635,7 +1643,7 @@ fn prefill_gemm_impl(
         let mut t = String::new();
         for e in 0..n_as {
             t.push_str(&format!(
-                "  As[(ty + {}u) * PAD + tx] = halve(A[abase + (m0 + ty + {}u) * kk + ({kx} + tx) / 2u], (tx & 1u) == 1u);\n",
+                "  As[(ty + {}u) * PAD + tx] = halve(A[abase + (m0 + ty + {}u) * alda + ({kx} + tx) / 2u], (tx & 1u) == 1u);\n",
                 e * 16, e * 16
             ));
         }
@@ -1664,7 +1672,7 @@ fn prefill_gemm_impl(
         let mut t = String::new();
         for e in 0..n_as {
             t.push_str(&format!(
-                "   pfa{e} = A[abase + (m0 + ty + {}u) * kk + ({kx} + tx) / 2u];\n", e * 16
+                "   pfa{e} = A[abase + (m0 + ty + {}u) * alda + ({kx} + tx) / 2u];\n", e * 16
             ));
         }
         t
@@ -1800,11 +1808,16 @@ fn prefill_gemm_impl(
 /// Causal scaled softmax over prefill scores — port of
 /// `softmax_scaled_causal_f16`.  One workgroup per score row; block size `bs`
 /// matches `block_for_reduction(n)` so the reduction trees line up.
-/// Row `p` (of the head) attends `min(p + 1, valid)` positions; columns
-/// `valid..n_pad` are written zero so downstream GEMMs read zeros.
+/// Row `p` (of the head) attends `min(p + 1 - row0, valid)` positions; columns
+/// `valid..n_w` are written zero so downstream GEMMs read zeros.
+///
+/// `row0` is the column offset of the score block this dispatch covers (0 = the
+/// whole row, the flat path): the row index is still absolute, so the causal
+/// bound is `p + 1 - row0` clamped at zero.  With `row0 = 0` the bound collapses
+/// to `min(p + 1, valid)` — the flat path is untouched.
 pub fn softmax_causal(bs: usize) -> String {
     format!(
-        "struct Cfg {{ n_w: u32, n_x: u32, valid: u32, m: u32, mp: u32, scale: f32, gx: u32, _p: u32 }};
+        "struct Cfg {{ n_w: u32, n_x: u32, valid: u32, m: u32, mp: u32, scale: f32, gx: u32, row0: u32 }};
 
 @group(0) @binding(0) var<storage, read>       X:   array<u32>;
 @group(0) @binding(1) var<storage, read_write> Out: array<u32>;
@@ -1829,8 +1842,21 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
     let base_x = (head * cfg.mp + pos) * cfg.n_x;
     let base_o = (head * cfg.mp + pos) * cfg.n_w;
     let row_in_head = pos;
-    let valid = min(cfg.valid, row_in_head + 1u);
+    // causal bound inside this dispatch's column window; row0 == 0 (flat path)
+    // leaves `min(row_in_head + 1, valid)` exactly as it was
+    let valid = min(cfg.valid, max(row_in_head + 1u, cfg.row0) - cfg.row0);
     let scale = cfg.scale;
+
+    // A row left of the whole slab has no live column there, but the AV GEMM of
+    // a straddling row block still reads its columns — they have to be zeros.
+    // Only the reductions are skipped; the branch is workgroup-uniform (it
+    // depends on the row alone), so it may skip the barriers.
+    if (valid == 0u) {{
+        for (var w = lid.x; w < cfg.n_w; w = w + BS) {{
+            Out[base_o + w] = 0u;
+        }}
+        return;
+    }}
 
     var lmax = bitcast<f32>(0xFF800000u);
     for (var j = lid.x; j < valid; j = j + BS) {{
@@ -1881,6 +1907,189 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
 }}
 ",
         bs = bs,
+    )
+}
+
+/// Per-*slab* softmax statistics for the tiled prefill attention: one
+/// `(max, Σexp)` pair per score row per key slab, written to
+/// `Stats[slab][row]` as `(max, sum)` f32 pairs.
+///
+/// The slab width is the workgroup size, so an element is read once and kept in
+/// a register across both reductions; the reduction trees and the exp are the
+/// ones [`softmax_causal`] runs internally, and the causal bound is the same
+/// `min(valid, row + 1 - row0)`.  That is what makes the pair recorded here
+/// exactly the pair the (normed) slab it describes was divided by — the merge
+/// weights are only meaningful under that agreement.
+///
+/// `row0` doubles as the slab index (`row0 / T`), which is how the dispatch
+/// knows its slot without a second uniform field.
+pub fn slab_stats(bs: usize, t: usize) -> String {
+    assert!(t.is_power_of_two(), "slab_stats: the slab width must be a power of two");
+    assert!(bs.is_power_of_two() && bs <= t, "slab_stats: block size");
+    format!(
+        "struct StatsCfg {{ n_x: u32, valid: u32, m: u32, mp: u32, scale: f32, row0: u32, gx: u32, rows: u32 }};
+
+@group(0) @binding(0) var<storage, read>       X:     array<u32>;
+@group(0) @binding(1) var<storage, read_write> Stats: array<f32>;
+@group(0) @binding(2) var<uniform>             cfg:   StatsCfg;
+
+const BS: u32 = {bs}u;
+const T: u32 = {t}u;
+
+{HALF_AT}
+var<workgroup> red_max: array<f32, BS>;
+var<workgroup> red_sum: array<f32, BS>;
+
+@compute @workgroup_size(BS)
+fn slab_stats(@builtin(workgroup_id) wgid: vec3<u32>,
+              @builtin(local_invocation_id) lid: vec3<u32>) {{
+    // Two grid axes: `nqh · mp` rows pass the 65535-per-dimension limit at a
+    // ~5-minute prefill (the softmax carries the same pair).
+    let row = wgid.x + wgid.y * cfg.gx;
+    let head = row / cfg.m;
+    let pos = row % cfg.m;
+    let base_x = (head * cfg.mp + pos) * cfg.n_x;
+    let valid = min(cfg.valid, max(pos + 1u, cfg.row0) - cfg.row0);
+    // rows are the head-major `head·mp + pos` of the score buffer, not the
+    // dispatch's flat row index (those differ: the grid spans `nqh · s`)
+    let r = head * cfg.mp + pos;
+
+    // Most rows of a given slab are entirely left of its first column — the
+    // dispatch covers the full `nqh · s` either way, and running the two
+    // reductions for them was two thirds of a long prefill's attention time.
+    // The branch is workgroup-uniform (`valid` depends on the row only), so it
+    // may skip the barriers.
+    if (valid == 0u) {{
+        if (lid.x == 0u) {{
+            Stats[(cfg.row0 / T * cfg.rows + r) * 2u] = bitcast<f32>(0xFF800000u);
+            Stats[(cfg.row0 / T * cfg.rows + r) * 2u + 1u] = 0.0;
+        }}
+        return;
+    }}
+
+    var lmax = bitcast<f32>(0xFF800000u);
+    for (var j = lid.x; j < valid; j = j + BS) {{
+        let sc = half_at(unpack2x16float(X[base_x + (j >> 1u)]), j) * cfg.scale;
+        if (sc > lmax) {{ lmax = sc; }}
+    }}
+    red_max[lid.x] = lmax;
+    workgroupBarrier();
+    for (var sh = BS >> 1u; sh > 0u; sh = sh >> 1u) {{
+        if (lid.x < sh) {{ red_max[lid.x] = max(red_max[lid.x], red_max[lid.x + sh]); }}
+        workgroupBarrier();
+    }}
+    let row_max = red_max[0];
+    workgroupBarrier();
+
+    var lsum = 0.0;
+    for (var j = lid.x; j < valid; j = j + BS) {{
+        let sc = half_at(unpack2x16float(X[base_x + (j >> 1u)]), j) * cfg.scale;
+        lsum = lsum + exp(sc - row_max);
+    }}
+    red_sum[lid.x] = lsum;
+    workgroupBarrier();
+    for (var sh = BS >> 1u; sh > 0u; sh = sh >> 1u) {{
+        if (lid.x < sh) {{ red_sum[lid.x] = red_sum[lid.x] + red_sum[lid.x + sh]; }}
+        workgroupBarrier();
+    }}
+    if (lid.x == 0u) {{
+        Stats[(cfg.row0 / T * cfg.rows + r) * 2u] = row_max;
+        Stats[(cfg.row0 / T * cfg.rows + r) * 2u + 1u] = red_sum[0];
+    }}
+}}
+",
+    )
+}
+
+/// Merge weights from the per-slab statistics: `w_t = exp(m_t − M) · Σexp_t`
+/// normalised by the row's total, where `M` is the row's global max over slabs.
+/// One thread per row — its own `n_slab` slots, read and written by nobody else.
+///
+/// A slab with no valid column for a row has `m_t = -inf, Σexp = 0`, so
+/// `w_t = 0` with no NaN: `exp(-inf − M)` is 0 and `0 · 0` is 0.  At least one
+/// slab (the first, `row0 = 0`) always has a valid column, so `M` is finite and
+/// the total cannot be zero.
+pub fn slab_weights(bs: usize) -> String {
+    format!(
+        "struct WCfg {{ rows: u32, n_slab: u32, gx: u32, _p: u32 }};
+
+@group(0) @binding(0) var<storage, read>       Stats: array<f32>;
+@group(0) @binding(1) var<storage, read_write> Wt:    array<f32>;
+@group(0) @binding(2) var<uniform>             cfg:   WCfg;
+
+@compute @workgroup_size({bs})
+fn slab_weights(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let row = gid.x + gid.y * (cfg.gx * {bs}u);
+    if (row >= cfg.rows) {{ return; }}
+
+    var m = bitcast<f32>(0xFF800000u);
+    for (var t = 0u; t < cfg.n_slab; t = t + 1u) {{
+        m = max(m, Stats[(t * cfg.rows + row) * 2u]);
+    }}
+    var total = 0.0;
+    for (var t = 0u; t < cfg.n_slab; t = t + 1u) {{
+        total = total + exp(Stats[(t * cfg.rows + row) * 2u] - m) * Stats[(t * cfg.rows + row) * 2u + 1u];
+    }}
+    // rows past the last position have no statistics at all (the stats dispatch
+    // only covers real positions); `total == 0` there, and 0 · (1/0) would be a
+    // NaN the merge would then hand to the padded output rows
+    let inv = select(0.0, 1.0 / total, total > 0.0);
+    for (var t = 0u; t < cfg.n_slab; t = t + 1u) {{
+        Wt[t * cfg.rows + row] =
+            exp(Stats[(t * cfg.rows + row) * 2u] - m) * Stats[(t * cfg.rows + row) * 2u + 1u] * inv;
+    }}
+}}
+",
+        bs = bs,
+    )
+}
+
+/// Weighted merge of the per-slab AV outputs into the attention output:
+/// `out[head][row] = Σ_t w_t[head][row] · part[t][head][row]`, the weights
+/// already normalised by [`slab_weights`].  Elementwise — `n_slab` f16 words
+/// per output word, accumulated in f32 and rounded once.
+///
+/// One grid axis per (row, head-dim word) band with the head on `wgid.y`, so
+/// neither index needs a division.  The two operands are laid out differently —
+/// the statistics/weights are head-major (`head · mp + pos`, one entry per row),
+/// the AV output is position-major (`pos · nqh·hd + head·hd + …`, the AV GEMM's
+/// own C layout) — hence the two independent indices.
+pub fn slab_merge(nqh: usize, hd: usize) -> String {
+    let hd2 = hd / 2;
+    format!(
+        "struct MCfg {{ rows: u32, n_slab: u32, gx: u32, _p: u32 }};
+
+@group(0) @binding(0) var<storage, read>       Part: array<u32>;
+@group(0) @binding(1) var<storage, read>       Wt:   array<f32>;
+@group(0) @binding(2) var<storage, read_write> Out:  array<u32>;
+@group(0) @binding(3) var<uniform>             cfg:  MCfg;
+
+const NQH: u32 = {nqh}u;
+const HD2: u32 = {hd2}u;
+
+@compute @workgroup_size(256)
+fn slab_merge(@builtin(global_invocation_id) gid: vec3<u32>,
+              @builtin(workgroup_id) wgid: vec3<u32>) {{
+    // `rows` = mp (padded positions); the stats/weights rows are `nqh · mp` with
+    // the head-major index `head · rows + row`.
+    let head = wgid.y;
+    let i = gid.x + gid.z * (cfg.gx * 256u);
+    if (i >= cfg.rows * HD2) {{ return; }}
+    let row = i / HD2;
+    let w = i - row * HD2;
+    // weights/stats: [t][head · mp + pos]; AV output: [t][pos][head · hd + col]
+    let wi = head * cfg.rows + row;
+    let pi = row * (NQH * HD2) + head * HD2 + w;
+
+    var acc = vec2<f32>(0.0, 0.0);
+    for (var t = 0u; t < cfg.n_slab; t = t + 1u) {{
+        acc = acc + Wt[t * (cfg.rows * NQH) + wi] * unpack2x16float(Part[t * (cfg.rows * NQH * HD2) + pi]);
+    }}
+    Out[pi] = pack2x16float(acc);
+}}
+",
+        nqh = nqh,
+        hd2 = hd2,
     )
 }
 

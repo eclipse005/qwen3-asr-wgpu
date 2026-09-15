@@ -138,6 +138,9 @@ struct GDims {
     /// Row offset into the B operand — the key-tile start for the slabbed
     /// attention (`transb=0`: K rows, `transb=1`: V rows).  Zero everywhere else.
     row0: u32,
+    /// A row stride in elements — `k` everywhere except the slabbed AV, whose A
+    /// operand (a score slab) is `SLAB_T` wide while its k sweep is narrower.
+    lda: u32,
 }
 
 #[repr(C)]
@@ -172,6 +175,52 @@ struct SoftmaxCfg {
     mp: u32,
     scale: f32,
     /// x-axis grid size; `y` continues the row index beyond it.
+    gx: u32,
+    /// Column offset of the score block this dispatch covers: 0 on the flat path
+    /// (the whole row), the slab's first key otherwise.  The row index stays
+    /// absolute, so the causal bound is `pos + 1 − row0`.
+    row0: u32,
+}
+
+/// Per-slab row statistics (`shaders::slab_stats`): one `(max, Σexp)` pair per
+/// row per key slab.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SlabStatsCfg {
+    /// score-row stride in words (slab width / 2)
+    n_x: u32,
+    /// columns of this slab that exist at all (≤ slab width, 16-aligned)
+    valid: u32,
+    /// rows in the head = `s`
+    m: u32,
+    /// padded rows per head = `mp`
+    mp: u32,
+    scale: f32,
+    /// first key column of this slab
+    row0: u32,
+    /// x-axis grid size; `y` continues the row index beyond it
+    gx: u32,
+    /// total rows in the stats buffer (`nqh · mp`)
+    rows: u32,
+}
+
+/// Merge weights (`shaders::slab_weights`): layer-independent, one slot.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SlabWeightsCfg {
+    rows: u32,
+    n_slab: u32,
+    gx: u32,
+    _p: u32,
+}
+
+/// Slab merge (`shaders::slab_merge`): layer-independent, one slot.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SlabMergeCfg {
+    /// output rows (`mp`, padded positions)
+    rows: u32,
+    n_slab: u32,
     gx: u32,
     _p: u32,
 }
@@ -311,10 +360,44 @@ struct Pipes {
     /// Causal softmax, one pipeline per block size (reduction tree depends on it).
     softmax: std::collections::HashMap<usize, wgpu::ComputePipeline>,
     repeat_kv: wgpu::ComputePipeline,
+    /// Slabbed causal attention: per-slab `(max, Σexp)`, the per-row merge
+    /// weights, and the weighted merge of the per-slab AV outputs.
+    slab_stats: wgpu::ComputePipeline,
+    slab_weights: wgpu::ComputePipeline,
+    slab_merge: wgpu::ComputePipeline,
 }
 
 /// Capacity of the single-block attention path — CUDA's `SPLIT_THRESHOLD`.
 pub const GQA_SINGLE_CAP: usize = 1024;
+
+/// Key-slab width for the tiled causal prefill attention (`docs/design-tiled-prefill.md`).
+const SLAB_T: usize = 1024;
+
+/// Reduction block size for the slabbed softmax and its statistics.
+///
+/// Both run one workgroup per score row over a `SLAB_T`-wide slab, and they
+/// must agree on the row sum to the bit (the merge weights are that sum), so
+/// this is shared.  It is deliberately smaller than `SLAB_T`: at 1024 threads a
+/// thread owned a single column and the two barrier trees — not the arithmetic
+/// or the traffic — dominated the pass, which measured as two thirds of a
+/// 6-minute prefill's attention time.
+const SLAB_BS: usize = 256;
+
+/// Uniform slots reserved for the per-slab cfg blocks (softmax + stats), i.e.
+/// the most key slabs a prefill may tile into.  Only the slabbed path uses
+/// them, and it only runs past 4096 tokens (~5 minutes).
+const MAX_SLAB: usize = 16;
+
+/// Sequence length above which prefill tiles its attention.  Below it the flat
+/// path runs — that is every fixture and every FLEURS clip, i.e. everything the
+/// alignment gate measures.  `QASR_SLAB=on|off` forces one path for A/B work.
+fn slab_path(s: usize) -> bool {
+    match std::env::var("QASR_SLAB").unwrap_or_default().to_ascii_lowercase().as_str() {
+        "1" | "on" | "yes" | "force" => true,
+        "0" | "off" | "no" => false,
+        _ => s > 4096,
+    }
+}
 
 /// Split-K attention chunk size — mirrors CUDA's `fused_gqa_decode_split_into`
 /// choice (`cur_len >= 2048` uses 512, else 256).  The P1 block size is always
@@ -412,7 +495,8 @@ impl WgpuTextDecoder {
             3,
             true,
         );
-        let sm_pl = family_layout(&gpu, "softmax", &[(0, true), (1, false)], 2);
+        // dynamic: the slabbed path gives every key slab its own cfg slot
+        let sm_pl = family_layout_dyn(&gpu, "softmax", &[(0, true), (1, false)], 2, true);
         let rk_pl = family_layout(&gpu, "repeat_kv", &[(0, true), (1, false)], 2);
 
         // ── pipelines ─────────────────────────────────────────────────────
@@ -472,6 +556,24 @@ impl WgpuTextDecoder {
                 (1024, build("softmax1024", &shaders::softmax_causal(1024), "softmax", Some(&sm_pl))?),
             ]),
             repeat_kv: build("repeat_kv", &shaders::repeat_kv(nqh / nkvh), "repeat_kv", Some(&rk_pl))?,
+            slab_stats: build(
+                "slab_stats",
+                &shaders::slab_stats(SLAB_BS, SLAB_T),
+                "slab_stats",
+                Some(&family_layout_dyn(&gpu, "slab_stats", &[(0, true), (1, false)], 2, true)),
+            )?,
+            slab_weights: build(
+                "slab_weights",
+                &shaders::slab_weights(256),
+                "slab_weights",
+                Some(&family_layout(&gpu, "slab_weights", &[(0, true), (1, false)], 2)),
+            )?,
+            slab_merge: build(
+                "slab_merge",
+                &shaders::slab_merge(nqh, hd),
+                "slab_merge",
+                Some(&family_layout(&gpu, "slab_merge", &[(0, true), (1, true), (2, false)], 3)),
+            )?,
         };
 
         // ── scratch ───────────────────────────────────────────────────────
@@ -1291,22 +1393,46 @@ impl WgpuTextDecoder {
         let cur16 = cur.div_ceil(16) * 16; // k-side zero pad for the AV GEMM
         anyhow::ensure!(hidden_words.len() >= s * hs * 2, "prefill hidden size mismatch");
 
-        // The causal-attention scratch is `nqh · mp · cur` *halves* and is not
-        // tiled: `scores` and `attn` are each allocated whole, so a long clip
-        // either blows the per-binding limit or runs out of VRAM, and wgpu's
-        // failure mode for that is garbage output rather than an error.  Refuse
-        // explicitly — the reference (SDPA) has no such scratch, this is ours.
-        let scratch = (nqh * mp * cur16 * 2) as u64;
+        // Slabbed causal attention (docs/design-tiled-prefill.md): tile the *key*
+        // dimension so the scratch is `[nqh, mp, T]` instead of `[nqh, mp, cur]`.
+        // The flat path's scratch is O(s²) — 4.7 GiB per matrix at 15 minutes,
+        // past both VRAM and the per-binding limit — and wgpu's failure mode for
+        // that is garbage rather than an error, so the flat path refuses
+        // explicitly.  Gated well above the 180 s fixtures: everything the
+        // alignment gate covers stays on the path it was verified on.
+        let slab_t = SLAB_T;
+        let n_slab = if slab_path(s) { cur.div_ceil(slab_t) } else { 0 };
+        let slabbed = n_slab > 0;
+        // k_rep/v_rep carry whole key slabs on the slabbed path, so their rows
+        // cover `n_slab · T` (a little past `cur`); the tail is never *read*
+        // meaningfully — the softmax zeroes the columns past the causal bound
+        // before the AV GEMM sees them.
+        let nkv_rows = if slabbed { n_slab * slab_t } else { np };
         let bind_limit = self.gpu.limits.max_storage_buffer_binding_size as u64;
-        anyhow::ensure!(
-            scratch <= bind_limit,
-            "prefill attention scratch is {:.2} GiB for {s} tokens ({:.1} min of audio), over the {:.2} GiB per-binding limit — \
-             the O(s²) prefill attention supports at most ~{} tokens",
-            scratch as f64 / (1u64 << 30) as f64,
-            s as f64 / 12.5 / 60.0,
-            bind_limit as f64 / (1u64 << 30) as f64,
-            ((bind_limit / (2 * nqh as u64)) as f64).sqrt() as usize,
-        );
+        if slabbed {
+            anyhow::ensure!(
+                n_slab <= MAX_SLAB,
+                "prefill: {n_slab} key slabs of {slab_t} exceed the {MAX_SLAB} uniform slots"
+            );
+            let part = (n_slab * mp * nqh * hd * 2) as u64;
+            anyhow::ensure!(
+                part <= bind_limit,
+                "prefill slab scratch is {:.2} GiB for {s} tokens, over the {:.2} GiB per-binding limit",
+                part as f64 / (1u64 << 30) as f64,
+                bind_limit as f64 / (1u64 << 30) as f64,
+            );
+        } else {
+            let scratch = (nqh * mp * cur16 * 2) as u64;
+            anyhow::ensure!(
+                scratch <= bind_limit,
+                "prefill attention scratch is {:.2} GiB for {s} tokens ({:.1} min of audio), over the {:.2} GiB per-binding limit — \
+                 the O(s²) prefill attention supports at most ~{} tokens",
+                scratch as f64 / (1u64 << 30) as f64,
+                s as f64 / 12.5 / 60.0,
+                bind_limit as f64 / (1u64 << 30) as f64,
+                ((bind_limit / (2 * nqh as u64)) as f64).sqrt() as usize,
+            );
+        }
 
         let words = |rows: usize, cols: usize| (rows * cols / 2 * 4) as u64;
         let mut up = self.gpu.uploader();
@@ -1315,10 +1441,22 @@ impl WgpuTextDecoder {
         let norm2 = up.storage("p.norm2", words(mp, hs));
         let qkv = up.storage("p.qkv", words(mp, cfg.fused_qkv_cols()));
         let q_out = up.storage("p.q_out", words(nqh * mp, hd));
-        let scores = up.storage("p.scores", words(nqh * mp, np));
-        let k_rep = up.storage("p.k_rep", words(nqh * np, hd));
-        let v_rep = up.storage("p.v_rep", words(nqh * np, hd));
-        let attn = up.storage("p.attn", words(nqh * mp, cur16));
+        // `scores` is the score slab on the slabbed path (softmaxed in place) and
+        // the whole `[nqh, mp, cur]` matrix otherwise; `attn` only exists flat.
+        let slab_cols = if slabbed { slab_t } else { np };
+        let scores = up.storage("p.scores", words(nqh * mp, slab_cols));
+        let k_rep = up.storage("p.k_rep", words(nqh * nkv_rows, hd));
+        let v_rep = up.storage("p.v_rep", words(nqh * nkv_rows, hd));
+        // softmax output / AV operand: `cur16` columns flat, the slab width when
+        // tiled.  Separate from `scores` on both paths — wgpu refuses to bind one
+        // buffer as both read-only and read-write in a single dispatch, so the
+        // softmax cannot normalise the slab in place.
+        let attn = up.storage("p.attn", words(nqh * mp, if slabbed { slab_t } else { cur16 }));
+        // `[n_slab, mp, nqh·hd]`: each slab's own (already normalised) AV output,
+        // combined by `slab_merge` with the per-slab softmax weights
+        let slab_part = slabbed.then(|| up.storage("p.slab_part", words(n_slab * mp, nqh * hd)));
+        let slab_stats = slabbed.then(|| up.storage("p.slab_stats", (n_slab * nqh * mp * 2 * 4) as u64));
+        let slab_w = slabbed.then(|| up.storage("p.slab_w", (n_slab * nqh * mp * 4) as u64));
         let attn_flat = up.storage("p.attn_flat", words(mp, nqh * hd));
         let gu = up.storage("p.gu", words(mp, 2 * inter));
         let activated = up.storage("p.activated", words(mp, inter));
@@ -1328,16 +1466,21 @@ impl WgpuTextDecoder {
         // written value
         const MAX_GEMMS: u64 = 256;
         let u_gd = up.uniform("p.gd", MAX_GEMMS * 256);
-        let u_sm = up.uniform("p.sm", 32);
+        // slab cfgs, one 256B slot each: [0, MAX_SLAB) softmax, [MAX_SLAB, 2·MAX_SLAB)
+        // slab_stats, then the layer-independent weights and merge cfgs
+        let u_sl = up.uniform("p.sl", (2 * MAX_SLAB as u64 + 2) * 256);
         let u_rk = up.uniform("p.rk", 32);
         up.upload(&h_buf, hidden_words)?;
         up.finish()?;
 
         let gpu = &self.gpu;
+        // `coff` = element offset of C's batch 0 — non-zero only for the slabbed
+        // AV GEMM, whose per-slab outputs all live in one buffer.
         let gemm_bg = |pipe: &wgpu::ComputePipeline,
                        a: &wgpu::Buffer,
                        w: &wgpu::Buffer,
                        c: &wgpu::Buffer,
+                       coff: u64,
                        u_gd: &wgpu::Buffer|
          -> wgpu::BindGroup {
             gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1346,7 +1489,18 @@ impl WgpuTextDecoder {
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: a.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 1, resource: w.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: c.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: if coff == 0 {
+                            c.as_entire_binding()
+                        } else {
+                            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: c,
+                                offset: coff,
+                                size: None,
+                            })
+                        },
+                    },
                     wgpu::BindGroupEntry {
                         binding: 3,
                         resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -1358,16 +1512,30 @@ impl WgpuTextDecoder {
                 ],
             })
         };
-        let mut gd_slot = 0usize;
+        // Slab dispatches write their cfg into a slot of their own (the tile's),
+        // so they never go through `gd_slot`; the first `2 · MAX_SLAB` slots are
+        // reserved for them and the counter restarts there after every submit.
+        let mut gd_slot = 2 * MAX_SLAB;
+        macro_rules! gemm_at {
+            ($cp:expr, $pipe:expr, $a:expr, $w:expr, $c:expr, $coff:expr, $slot:expr, $gdims:expr,
+             $gx:expr, $gy:expr, $gz:expr) => {{
+                assert!($slot < MAX_GEMMS as usize, "prefill: GEMM uniform slots exhausted");
+                let off = (($slot) * 256) as u64;
+                gpu.queue.write_buffer(&u_gd, off, bytemuck::bytes_of(&$gdims));
+                let bg = gemm_bg($pipe, $a, $w, $c, $coff, &u_gd);
+                $cp.set_pipeline($pipe);
+                $cp.set_bind_group(0, &bg, &[off as u32]);
+                $cp.dispatch_workgroups($gx, $gy, $gz);
+            }};
+        }
         macro_rules! gemm {
             ($cp:expr, $pipe:expr, $a:expr, $w:expr, $c:expr, $m:expr, $n:expr, $k:expr,
              $ldc:expr, $bsa:expr, $bsb:expr, $bsc:expr, $gx:expr, $gy:expr, $gz:expr) => {{
-                let off = (gd_slot * 256) as u64;
+                let slot = gd_slot;
                 gd_slot += 1;
-                gpu.queue.write_buffer(
-                    &u_gd,
-                    off,
-                    bytemuck::bytes_of(&GDims {
+                gemm_at!(
+                    $cp, $pipe, $a, $w, $c, 0u64, slot,
+                    GDims {
                         m: $m as u32,
                         n: $n as u32,
                         k: $k as u32,
@@ -1377,17 +1545,16 @@ impl WgpuTextDecoder {
                         bsc: $bsc as u32,
                         beta: 0,
                         row0: 0,
-                    }),
+                        lda: $k as u32,
+                    },
+                    $gx, $gy, $gz
                 );
-                let bg = gemm_bg($pipe, $a, $w, $c, &u_gd);
-                $cp.set_pipeline($pipe);
-                $cp.set_bind_group(0, &bg, &[off as u32]);
-                $cp.dispatch_workgroups($gx, $gy, $gz);
             }};
         }
 
         // per-call uniforms: multi-position extract + silu rows + softmax + repeat
         let silu_grid = self.write_silu_rows(s);
+        // One workgroup per (head, position) score row.
         let softmax_grid = grid_xy(nqh * s);
         gpu.upload(
             &self.scratch.u_qkvx,
@@ -1403,19 +1570,97 @@ impl WgpuTextDecoder {
                 _c: 0,
             }),
         );
-        gpu.upload(
-            &u_sm,
-            bytemuck::bytes_of(&SoftmaxCfg {
-                n_w: (cur16 / 2) as u32,
-                n_x: (np / 2) as u32,
-                valid: cur as u32,
-                m: s as u32,
-                mp: mp as u32,
-                scale: cfg.scale(),
-                gx: softmax_grid.0,
-                _p: 0,
-            }),
-        );
+        // grids of the two layer-independent slab merges (used inside the loop):
+        // the weights cover every stats row, the merge one head-dim band per head
+        let w_grid = grid_xy((nqh * mp).div_ceil(256));
+        let slab_m_grid = (mp * hd / 2).div_ceil(256) as u32;
+        if slabbed {
+            // One softmax + stats cfg per key slab; a slot's bytes are live for
+            // the whole submit, so every tile needs its own.
+            for t in 0..n_slab {
+                let t0 = t * slab_t;
+                let tl = (cur16 - t0).min(slab_t);
+                gpu.write_at(
+                    &u_sl,
+                    (t * 256) as u64,
+                    bytemuck::bytes_of(&SoftmaxCfg {
+                        n_w: (slab_t / 2) as u32,
+                        n_x: (slab_t / 2) as u32,
+                        valid: tl as u32,
+                        m: s as u32,
+                        mp: mp as u32,
+                        scale: cfg.scale(),
+                        gx: softmax_grid.0,
+                        row0: t0 as u32,
+                    }),
+                );
+                gpu.write_at(
+                    &u_sl,
+                    ((MAX_SLAB + t) * 256) as u64,
+                    bytemuck::bytes_of(&SlabStatsCfg {
+                        n_x: (slab_t / 2) as u32,
+                        valid: tl as u32,
+                        m: s as u32,
+                        mp: mp as u32,
+                        scale: cfg.scale(),
+                        row0: t0 as u32,
+                        gx: softmax_grid.0,
+                        rows: (nqh * mp) as u32,
+                    }),
+                );
+            }
+            gpu.write_at(
+                &u_sl,
+                (2 * MAX_SLAB * 256) as u64,
+                bytemuck::bytes_of(&SlabWeightsCfg {
+                    rows: (nqh * mp) as u32,
+                    n_slab: n_slab as u32,
+                    gx: w_grid.0,
+                    _p: 0,
+                }),
+            );
+            gpu.write_at(
+                &u_sl,
+                ((2 * MAX_SLAB + 1) * 256) as u64,
+                bytemuck::bytes_of(&SlabMergeCfg {
+                    rows: mp as u32,
+                    n_slab: n_slab as u32,
+                    gx: slab_m_grid,
+                    _p: 0,
+                }),
+            );
+        } else {
+            gpu.write_at(
+                &u_sl,
+                0,
+                bytemuck::bytes_of(&SoftmaxCfg {
+                    n_w: (cur16 / 2) as u32,
+                    n_x: (np / 2) as u32,
+                    valid: cur as u32,
+                    m: s as u32,
+                    mp: mp as u32,
+                    scale: cfg.scale(),
+                    gx: softmax_grid.0,
+                    row0: 0,
+                }),
+            );
+        }
+        // `repeat_kv` writes rows `0..cur` only, but both attention GEMMs address
+        // whole key slabs: the score GEMM reads K up to the slab end and the AV
+        // GEMM reads V rows `cur..cur16`, whose weights the softmax has written as
+        // exact zeros.  `0 · NaN` is NaN, so those rows have to be real zeros
+        // rather than whatever the allocator last handed out — the slabbed path
+        // reads a much longer tail than the flat one (a whole 1024-wide slab
+        // against a 128-wide pad), which is what makes it worth pinning down.
+        let tail_rows = nkv_rows - cur;
+        if tail_rows > 0 {
+            let zero = vec![0u8; tail_rows * hd * 2];
+            for h in 0..nqh {
+                let off = ((h * nkv_rows + cur) * hd * 2) as u64;
+                gpu.write_at(&k_rep, off, &zero);
+                gpu.write_at(&v_rep, off, &zero);
+            }
+        }
         let repeat_grid = grid_xy((nqh * cur * hd / 2).div_ceil(256));
         gpu.upload(
             &u_rk,
@@ -1424,7 +1669,7 @@ impl WgpuTextDecoder {
                 max_seq: self.max_seq as u32,
                 cur: cur as u32,
                 hd: hd as u32,
-                npw: (np * hd / 2) as u32,
+                npw: (nkv_rows * hd / 2) as u32,
                 gx: repeat_grid.0,
             }),
         );
@@ -1502,55 +1747,232 @@ impl WgpuTextDecoder {
                 }
             }
 
-            // 5. scores GEMM, batched over heads: [s, cur] = q × Kᵀ  (K is [cur, hd])
-            // batch strides in WORDS (the shader indexes array<u32> directly);
-            // bsc stays in ELEMENTS (the epilogue divides the sum by 2)
-            gemm!(
-                &mut cp, &self.pipes.gemm_causal, &q_out, &k_rep, &scores,
-                s, cur, hd, np, mp * hd / 2, np * hd / 2, mp * np,
-                (np / 128) as u32, (mp / 128) as u32, nqh as u32
-            );
-            // Ablation hook: re-dispatching is idempotent (the GEMM overwrites its
-            // output), so the token stream is unchanged and the delta is the cost.
-            if dup == "p_scores" {
+            if slabbed {
+                // 5-8 (slabbed): one key slab of scores at a time, three passes
+                // over the slabs.  `slab_stats` records each slab's (max, Σexp)
+                // while the slab is live, the softmax normalises the slab against
+                // its own max, the AV GEMM turns it into that slab's output, and
+                // `slab_weights` + `slab_merge` combine the slabs weighted by
+                // `exp(m_t − M)·Σexp_t` — the exact per-slab softmax masses.
+                // See docs/design-tiled-prefill.md.
+                let spart = slab_part.as_ref().unwrap();
+                let sstats = slab_stats.as_ref().unwrap();
+                let swt = slab_w.as_ref().unwrap();
+                for t in 0..n_slab {
+                    let t0 = t * slab_t;
+                    let tl = (cur16 - t0).min(slab_t); // 16-aligned columns in this slab
+                    // score tile [mp, T] = q × K[t0..t0+T)ᵀ, tiles above the
+                    // diagonal skipped (row0 shifts the diagonal to this slab)
+                    let sg = GDims {
+                        m: s as u32,
+                        n: slab_t as u32,
+                        k: hd as u32,
+                        ldc: slab_t as u32,
+                        bsa: (mp * hd / 2) as u32,
+                        bsb: (nkv_rows * hd / 2) as u32,
+                        bsc: (mp * slab_t) as u32,
+                        beta: 0,
+                        row0: t0 as u32,
+                        lda: hd as u32,
+                    };
+                    let sgrid = ((slab_t / 128) as u32, (mp / 128) as u32, nqh as u32);
+                    gemm_at!(
+                        &mut cp, &self.pipes.gemm_causal, &q_out, &k_rep, &scores,
+                        0u64, t, sg,
+                        sgrid.0, sgrid.1, sgrid.2
+                    );
+                    // Ablation hook (as in the flat path): the GEMM overwrites its
+                    // output, so re-dispatching leaves the token stream alone.
+                    if dup == "p_scores" {
+                        gemm_at!(
+                            &mut cp, &self.pipes.gemm_causal, &q_out, &k_rep, &scores,
+                            0u64, t, sg,
+                            sgrid.0, sgrid.1, sgrid.2
+                        );
+                    }
+
+                    // per-slab (max, Σexp) for the merge weights
+                    let bg_st = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("p.slab_stats"),
+                        layout: &self.pipes.slab_stats.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: scores.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: sstats.as_entire_binding() },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    // the dynamic offset is the whole slot
+                                    // address — an entry offset here would be
+                                    // *added* to it (and silently read another
+                                    // cfg: this dispatch reads the weights slot
+                                    // if both are set)
+                                    buffer: &u_sl,
+                                    offset: 0,
+                                    size: std::num::NonZeroU64::new(32),
+                                }),
+                            },
+                        ],
+                    });
+                    cp.set_pipeline(&self.pipes.slab_stats);
+                    cp.set_bind_group(0, &bg_st, &[((MAX_SLAB + t) * 256) as u32]);
+                    cp.dispatch_workgroups(softmax_grid.0, softmax_grid.1, 1);
+
+                    // causal softmax on the slab: the normalised slab lands in
+                    // `attn` (the AV GEMM's A operand; the same buffer cannot be
+                    // both operands of this dispatch)
+                    let bg_sm = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("p.slab_sm"),
+                        layout: &self.pipes.softmax[&slab_t].get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: scores.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: attn.as_entire_binding() },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    // slot address via the dynamic offset alone
+                                    buffer: &u_sl,
+                                    offset: 0,
+                                    size: std::num::NonZeroU64::new(32),
+                                }),
+                            },
+                        ],
+                    });
+                    cp.set_pipeline(&self.pipes.softmax[&SLAB_BS]);
+                    cp.set_bind_group(0, &bg_sm, &[(t * 256) as u32]);
+                    cp.dispatch_workgroups(softmax_grid.0, softmax_grid.1, 1);
+                    if dup == "p_softmax" {
+                        cp.dispatch_workgroups(softmax_grid.0, softmax_grid.1, 1);
+                    }
+
+                    // this slab's AV output: [mp, nqh·hd], k bounded by the
+                    // diagonal inside the slab (row0 = t0)
+                    let ag = GDims {
+                        m: s as u32,
+                        n: hd as u32,
+                        k: tl as u32,
+                        ldc: (nqh * hd) as u32,
+                        bsa: (mp * slab_t / 2) as u32,
+                        bsb: (nkv_rows * hd / 2) as u32,
+                        bsc: hd as u32,
+                        beta: 0,
+                        row0: t0 as u32,
+                        lda: slab_t as u32,
+                    };
+                    gemm_at!(
+                        &mut cp, &self.pipes.gemm_av_causal, &attn, &v_rep, spart,
+                        (t * mp * nqh * hd * 2) as u64, n_slab + t, ag,
+                        1, (mp / 128) as u32, nqh as u32
+                    );
+                    if dup == "p_av" {
+                        gemm_at!(
+                            &mut cp, &self.pipes.gemm_av_causal, &attn, &v_rep, spart,
+                            (t * mp * nqh * hd * 2) as u64, n_slab + t, ag,
+                            1, (mp / 128) as u32, nqh as u32
+                        );
+                    }
+                }
+
+                // per-row slab weights, then the weighted merge into attn_flat
+                let bg_w = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("p.slab_w"),
+                    layout: &self.pipes.slab_weights.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: sstats.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: swt.as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &u_sl,
+                                // static: the weights cfg is layer-independent
+                                offset: (2 * MAX_SLAB * 256) as u64,
+                                size: std::num::NonZeroU64::new(32),
+                            }),
+                        },
+                    ],
+                });
+                cp.set_pipeline(&self.pipes.slab_weights);
+                cp.set_bind_group(0, &bg_w, &[]);
+                cp.dispatch_workgroups(w_grid.0, w_grid.1, 1);
+
+                let bg_m = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("p.slab_merge"),
+                    layout: &self.pipes.slab_merge.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: spart.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: swt.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: attn_flat.as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &u_sl,
+                                // static: one merge cfg for the whole prefill
+                                offset: ((2 * MAX_SLAB + 1) * 256) as u64,
+                                size: std::num::NonZeroU64::new(32),
+                            }),
+                        },
+                    ],
+                });
+                cp.set_pipeline(&self.pipes.slab_merge);
+                cp.set_bind_group(0, &bg_m, &[]);
+                cp.dispatch_workgroups(slab_m_grid, nqh as u32, 1);
+            } else {
+                // 5. scores GEMM, batched over heads: [s, cur] = q × Kᵀ  (K is [cur, hd])
+                // batch strides in WORDS (the shader indexes array<u32> directly);
+                // bsc stays in ELEMENTS (the epilogue divides the sum by 2)
                 gemm!(
-                    &mut cp, &self.pipes.gemm, &q_out, &k_rep, &scores,
+                    &mut cp, &self.pipes.gemm_causal, &q_out, &k_rep, &scores,
                     s, cur, hd, np, mp * hd / 2, np * hd / 2, mp * np,
                     (np / 128) as u32, (mp / 128) as u32, nqh as u32
                 );
-            }
+                // Ablation hook: re-dispatching is idempotent (the GEMM overwrites its
+                // output), so the token stream is unchanged and the delta is the cost.
+                if dup == "p_scores" {
+                    gemm!(
+                        &mut cp, &self.pipes.gemm, &q_out, &k_rep, &scores,
+                        s, cur, hd, np, mp * hd / 2, np * hd / 2, mp * np,
+                        (np / 128) as u32, (mp / 128) as u32, nqh as u32
+                    );
+                }
 
-            // 6. causal softmax, in place on scores
-            let bs = block_for_reduction(cur) as usize;
-            // softmax reads scores, writes straight into the AV input buffer
-            let bg_sm = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("p.sm"),
-                layout: &self.pipes.softmax[&bs].get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: scores.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: attn.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: u_sm.as_entire_binding() },
-                ],
-            });
-            cp.set_pipeline(&self.pipes.softmax[&bs]);
-            cp.set_bind_group(0, &bg_sm, &[]);
-            cp.dispatch_workgroups(softmax_grid.0, softmax_grid.1, 1);
-            if dup == "p_softmax" {
+                // 6. causal softmax, in place on scores
+                let bs = block_for_reduction(cur) as usize;
+                // softmax reads scores, writes straight into the AV input buffer
+                let bg_sm = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("p.sm"),
+                    layout: &self.pipes.softmax[&bs].get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: scores.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: attn.as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &u_sl,
+                                offset: 0,
+                                size: std::num::NonZeroU64::new(32),
+                            }),
+                        },
+                    ],
+                });
+                cp.set_pipeline(&self.pipes.softmax[&bs]);
+                cp.set_bind_group(0, &bg_sm, &[0]);
                 cp.dispatch_workgroups(softmax_grid.0, softmax_grid.1, 1);
-            }
+                if dup == "p_softmax" {
+                    cp.dispatch_workgroups(softmax_grid.0, softmax_grid.1, 1);
+                }
 
-            // 7. AV GEMM, batched: attn_flat[s, nqh*hd] = attn × V  (V is [cur, hd])
-            gemm!(
-                &mut cp, &self.pipes.gemm_av_causal, &attn, &v_rep, &attn_flat,
-                s, hd, cur16, nqh * hd, mp * cur16 / 2, np * hd / 2, hd,
-                1, (mp / 128) as u32, nqh as u32
-            );
-            if dup == "p_av" {
+                // 7. AV GEMM, batched: attn_flat[s, nqh*hd] = attn × V  (V is [cur, hd])
                 gemm!(
-                    &mut cp, &self.pipes.gemm_av, &attn, &v_rep, &attn_flat,
+                    &mut cp, &self.pipes.gemm_av_causal, &attn, &v_rep, &attn_flat,
                     s, hd, cur16, nqh * hd, mp * cur16 / 2, np * hd / 2, hd,
                     1, (mp / 128) as u32, nqh as u32
                 );
+                if dup == "p_av" {
+                    gemm!(
+                        &mut cp, &self.pipes.gemm_av, &attn, &v_rep, &attn_flat,
+                        s, hd, cur16, nqh * hd, mp * cur16 / 2, np * hd / 2, hd,
+                        1, (mp / 128) as u32, nqh as u32
+                    );
+                }
             }
 
             // 8. o projection + residual:  h += attn_flat × o_wᵀ
@@ -1608,9 +2030,12 @@ impl WgpuTextDecoder {
             );
 
             // Long prefills (s>=512) must submit+poll or Pascal/WDDM TDR
-            // device-loses. Every 4 layers is enough; every layer is safer
-            // but ~4× the poll tax.
-            if s >= 512 && (li + 1) % 4 == 0 {
+            // device-loses.  The interval is in *layers*, but what the driver
+            // times is wall clock, and the slabbed path spends ~1 s per layer at
+            // 8k tokens: four layers there is past the 2 s TDR timeout and the
+            // device is lost mid-prefill.  Halve it once the slab path is in.
+            let submit_every = if s >= 4096 { 2 } else { 4 };
+            if s >= 512 && (li + 1) % submit_every == 0 {
                 drop(cp);
                 gpu.queue.submit([enc.finish()]);
                 if let Err(e) = gpu.device.poll(wgpu::PollType::wait_indefinitely()) {
@@ -1618,6 +2043,9 @@ impl WgpuTextDecoder {
                 }
                 enc = gpu.device.create_command_encoder(&Default::default());
                 cp = enc.begin_compute_pass(&Default::default());
+                // the submitted cfgs are retired, so the per-dispatch slots can
+                // be handed out again (the slab slots are static, never reused)
+                gd_slot = 2 * MAX_SLAB;
             }
         }
 
