@@ -1,13 +1,3 @@
-//! MRoPE (multi-axis RoPE) cos/sin tables — self-contained.
-//!
-//! The text decoder rotates `head_dim`-wide rows where the *first half* of the
-//! frequency index space is split across three position axes (temporal / height /
-//! width for multimodal input, all three equal for pure text) according to
-//! `mrope_section`, and the second half duplicates the first.
-//!
-//! Everything is computed in f64 and rounded to f32 once, exactly like the
-//! reference implementation, so the resulting table is bit-identical.
-
 /// Expand `section` (one quota per axis) into a per-frequency axis index.
 ///
 /// `interleaved` picks the Qwen2-VL layout (`0,1,2,0,1,2,…` while quotas last)
@@ -113,7 +103,6 @@ mod tests {
     fn text_positions_duplicate_halves() {
         let (c, _s) = compute_mrope_cos_sin(&text_positions(3), 8, 1e6, &[2, 1, 1], true);
         assert_eq!(c.len(), 3 * 8);
-        // second half duplicates the first
         assert_eq!(c[0..4], c[4..8]);
     }
 }

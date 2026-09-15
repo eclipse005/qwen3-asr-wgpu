@@ -1,13 +1,3 @@
-//! Isolated CPU f32 GEMM probe for the audio-encoder conv shapes.
-//!
-//! The conv stem dominates CPU encode time; this measures what the `gemm`
-//! crate actually achieves on the exact (m, n, k) the stem uses, split by
-//! tile size, so "the GEMM is slow" can be separated from "im2col is slow".
-//!
-//! ```text
-//! cargo run --release --bin cpu_gemm_probe
-//! ```
-
 use std::time::Instant;
 
 use gemm::{gemm, Parallelism};
@@ -79,8 +69,6 @@ fn bench_im2col(b: usize, c_in: usize, h: usize, w: usize) -> f64 {
     e
 }
 
-/// Reproduce the real `CpuConvStem::conv_block` loop exactly (same Vec sizes,
-/// same zero-init, same epilogue) so the difference from `bench()` is visible.
 fn loop_probe() {
     for tile in [8usize, 16, 32, 72] {
         let b = 177usize;
@@ -160,11 +148,11 @@ fn main() {
         loop_probe();
         return;
     }
-    println!("\n-- CUDA-shaped conv gemm (per TILE=8 batch of chunks) --");
-    bench(240, 4320, 1600, 5);   // c2, TILE=8
-    bench(480, 4320, 1600, 5);   // c2, TILE=16
-    bench(960, 4320, 1600, 5);   // c2, TILE=32
-    bench(2160, 4320, 1600, 3);  // c2, TILE=72
+    println!("\n-- conv gemm, batched per TILE=8 chunks --");
+    bench(240, 4320, 1600, 5);
+    bench(480, 4320, 1600, 5);
+    bench(960, 4320, 1600, 5);
+    bench(2160, 4320, 1600, 3);
 
     println!("\n-- conv1 (k=27) / conv3 (k=1200) --");
     bench(240, 27, 1600, 5);

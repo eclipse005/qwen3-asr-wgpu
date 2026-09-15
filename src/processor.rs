@@ -1,65 +1,19 @@
-//! The reference pipeline's API, mirrored — `transformers`' `Qwen3ASRProcessor`
-//! plus `Qwen3ASRForConditionalGeneration.generate`.
-//!
-//! Upstream is three steps, and a caller coming from the Python side should find
-//! the same three here:
-//!
-//! ```python
-//! processor = AutoProcessor.from_pretrained(model_dir)
-//! inputs    = processor.apply_transcription_request(audio=wav, language=None, prompt="hotwords")
-//! out_ids   = model.generate(**inputs, max_new_tokens=512, do_sample=False)
-//! gen_ids   = out_ids[:, inputs["input_ids"].shape[1]:]
-//! parsed    = processor.decode(gen_ids, return_format="parsed")[0]   # {"language", "transcription"}
-//! raw       = processor.decode(gen_ids, return_format="raw")[0]
-//! ```
-//!
-//! ```no_run
-//! # use qwen3_asr_wgpu::{WgpuAsr, TranscribeOptions, ReturnFormat};
-//! # fn main() -> anyhow::Result<()> {
-//! let mut asr = WgpuAsr::load(std::path::Path::new("model-dir"), Some("nvidia"))?;
-//! let opts = TranscribeOptions::default();
-//!
-//! // processor.apply_transcription_request(audio=…)
-//! let req = asr.apply_transcription_request_file(std::path::Path::new("clip.wav"), &opts)?;
-//! // model.generate(**inputs, max_new_tokens=…)
-//! let ids = asr.generate(&req, 512)?;
-//! // processor.decode(ids, return_format="parsed")
-//! let parsed = asr.decode(&ids, ReturnFormat::Parsed)?;
-//! assert!(!parsed.transcription_text().is_empty());
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! | reference (Python) | here | notes |
-//! |---|---|---|
-//! | `Qwen3ASRProcessor.apply_transcription_request(audio, language, prompt)` | [`WgpuAsr::apply_transcription_request`] / [`WgpuAsr::apply_transcription_request_file`] | `prompt` is the hotword/system context — [`TranscribeOptions::context`] |
-//! | `Qwen3ASRForConditionalGeneration.generate(**inputs, max_new_tokens, do_sample=False)` | [`WgpuAsr::generate`] | always greedy; the ids are the *generated* tail, like `out_ids[:, prompt_len:]` |
-//! | `Qwen3ASRProcessor.decode(ids, return_format=…)` | [`WgpuAsr::decode`] + [`Decoded`] | all three formats, same semantics |
-//! | `Qwen3ASRProcessor.get_supported_languages()` | [`WgpuAsr::get_supported_languages`] | the same 30 canonical names |
-//! | `return_time_stamps=True` (needs `Qwen3-ForcedAligner`) | — | a second model, not ported; [`AsrTranscription`] has no time stamps |
-//!
-//! The audio tower runs inside [`WgpuAsr::generate`] (upstream encodes the audio
-//! inside the model too); the request carries the mel features the processor
-//! produced, not yet-encoded embeddings.
+use std::path::Path;
 
-use anyhow::Result;
-
-use crate::inference::{supported_languages, TranscribeOptions, WgpuAsr};
+use crate::error::{AsrError, Result};
+use crate::inference::{supported_languages, AsrInference, TranscribeOptions};
 use crate::mel::{load_audio_wav, HOP_LENGTH, MEL_SAMPLE_RATE};
 use crate::prompt;
 
 /// `return_format` of the reference's `processor.decode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReturnFormat {
-    /// The tokenizer's raw decode, special tokens included.
     Raw,
-    /// `{"language": …, "transcription": …}`, exactly upstream's dict.
     Parsed,
-    /// Just the text after `<asr_text>`.
     TranscriptionOnly,
 }
 
-/// Upstream's parsed dict (`_parse_single_output`): `language` and
+/// The parsed dict (`_parse_single_output`): `language` and
 /// `transcription`.  `language` is empty when the language was forced — the
 /// metadata then lives in the *prompt*, exactly like the reference.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -68,7 +22,7 @@ pub struct AsrTranscription {
     pub transcription: String,
 }
 
-/// What [`WgpuAsr::decode`] returns, one variant per `return_format`.
+/// What [`AsrInference::decode`] returns, one variant per `return_format`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decoded {
     Raw(String),
@@ -99,17 +53,18 @@ impl Decoded {
 /// What `processor.apply_transcription_request` hands to `model.generate`: the
 /// log-mel features plus the request's options.
 ///
-/// Upstream puts `input_ids` in here as well; ours are built inside
-/// [`WgpuAsr::generate`] because the number of audio placeholder tokens is the
-/// audio tower's *output* length, and deriving it a second time (from the mel
-/// length) is exactly the kind of duplicated geometry this port avoids.
+/// The reference puts `input_ids` in here as well; ours are built inside
+/// [`AsrInference::generate`] because the number of audio placeholder tokens is
+/// the audio tower's *output* length, and deriving it a second time (from the mel
+/// length) is exactly the kind of duplicated geometry this design avoids.
 #[derive(Debug, Clone)]
 pub struct TranscriptionRequest {
     /// `[n_mels, n_frames]` f32, the same layout the tower's im2col reads.
     pub mel: Vec<f32>,
     pub n_mels: usize,
     pub n_frames: usize,
-    /// `language` + `prompt`/context, i.e. [`TranscribeOptions`].
+    /// `language` + `prompt`/context, i.e. [`TranscribeOptions`] — including the
+    /// `max_new_tokens` [`AsrInference::generate`] will use.
     pub options: TranscribeOptions,
 }
 
@@ -126,7 +81,7 @@ impl TranscriptionRequest {
     }
 }
 
-impl WgpuAsr {
+impl AsrInference {
     /// `processor.apply_transcription_request(audio=…, language=…, prompt=…)`
     /// for in-memory samples at 16 kHz.
     pub fn apply_transcription_request(
@@ -134,46 +89,57 @@ impl WgpuAsr {
         samples: &[f32],
         options: &TranscribeOptions,
     ) -> Result<TranscriptionRequest> {
-        let (mel, n_mels, n_frames) = self.extract_mel(samples)?;
+        let (mel, n_mels, n_frames) = crate::diagnostics::extract_mel(self, samples)?;
         Ok(TranscriptionRequest { mel, n_mels, n_frames, options: options.clone() })
     }
 
     /// The same, reading a wav file (any sample rate; resampled exactly like
-    /// every other entry point, vendored soxr HQ).
+    /// every other entry point).
     pub fn apply_transcription_request_file(
         &self,
-        wav: &std::path::Path,
+        wav: &Path,
         options: &TranscribeOptions,
     ) -> Result<TranscriptionRequest> {
         let samples = load_audio_wav(wav, MEL_SAMPLE_RATE)?;
         self.apply_transcription_request(&samples, options)
     }
 
-    /// `model.generate(**inputs, max_new_tokens=…, do_sample=False)`.
+    /// `model.generate(**inputs, do_sample=False)`.
     ///
     /// Runs the audio tower, builds the prompt and the mixed hidden states, then
     /// prefill + one greedy step per token (stopping at the EOS set, like
-    /// upstream's `generate`).  Returns **only the generated ids** — the
+    /// `generate`).  Returns **only the generated ids** — the
     /// reference slices `output_ids[:, input_ids.shape[1]:]` before `decode`.
-    pub fn generate(&mut self, req: &TranscriptionRequest, max_new_tokens: usize) -> Result<Vec<u32>> {
-        let embeds = self.encode_mel(&req.mel, req.n_mels, req.n_frames)?;
-        Ok(self
-            .generate_from_embeds(&embeds, max_new_tokens, &req.options, None)?
+    ///
+    /// `max_new_tokens` is read from [`TranscriptionRequest::options`], so the
+    /// ceiling is fixed where the request is built, exactly as
+    /// [`AsrInference::transcribe`] fixes it from its own options.
+    pub fn generate(&self, req: &TranscriptionRequest) -> Result<Vec<u32>> {
+        let mut g = self.lock()?;
+        let embeds = g
+            .encode_mel(&req.mel, req.n_mels, req.n_frames)
+            .map_err(AsrError::Inference)?;
+        Ok(g
+            .generate_from_embeds(&embeds, req.options.max_new_tokens, &req.options, None)
+            .map_err(AsrError::Inference)?
             .ids)
     }
 
     /// `processor.decode(ids, return_format=…)`.
     pub fn decode(&self, generated_ids: &[u32], format: ReturnFormat) -> Result<Decoded> {
+        let g = self.lock()?;
         match format {
-            // Upstream leaves `skip_special_tokens` at its default here, which is
-            // why the raw string still shows `<|im_start|>assistant …`.
-            ReturnFormat::Raw => Ok(Decoded::Raw(self.decode_ids(generated_ids, false)?)),
+            ReturnFormat::Raw => Ok(Decoded::Raw(
+                g.decode_ids(generated_ids, false).map_err(AsrError::Inference)?,
+            )),
             ReturnFormat::Parsed => {
-                let (language, transcription) = prompt::parse_asr_output(&self.decode_ids(generated_ids, true)?);
+                let text = g.decode_ids(generated_ids, true).map_err(AsrError::Inference)?;
+                let (language, transcription) = prompt::parse_asr_output(&text);
                 Ok(Decoded::Parsed(AsrTranscription { language, transcription }))
             }
             ReturnFormat::TranscriptionOnly => {
-                let (_, transcription) = prompt::parse_asr_output(&self.decode_ids(generated_ids, true)?);
+                let text = g.decode_ids(generated_ids, true).map_err(AsrError::Inference)?;
+                let (_, transcription) = prompt::parse_asr_output(&text);
                 Ok(Decoded::TranscriptionOnly(transcription))
             }
         }
@@ -189,19 +155,11 @@ impl WgpuAsr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Backend, DeviceSelector};
 
-    /// The three-step reference API and the one-call wrapper share every line
-    /// after the processor, so they must agree exactly — this is the test that
-    /// says so.  It needs a GPU and the `-hf` weights, hence `#[ignore]`:
-    ///
-    /// ```text
-    /// QASR_TEST_MODEL=D:\Qwen3-ASR\models\Qwen3-ASR-0.6B-hf
-    /// QASR_TEST_WAV=D:\qwen3-asr-rs\tests\fixtures\15s_en.wav
-    /// cargo test --release -- --ignored upstream_api
-    /// ```
     #[test]
     #[ignore = "needs a GPU and the -hf weights (see the doc comment)"]
-    fn upstream_api_matches_the_one_call_wrapper() {
+    fn processor_api_matches_the_one_call_wrapper() {
         let (Ok(model), Ok(wav)) = (
             std::env::var("QASR_TEST_MODEL"),
             std::env::var("QASR_TEST_WAV"),
@@ -210,16 +168,19 @@ mod tests {
             return;
         };
         let wav = std::path::PathBuf::from(wav);
-        let opts = TranscribeOptions::default();
-        let mut asr = WgpuAsr::load(std::path::Path::new(&model), Some("nvidia")).expect("load decoder");
+        let opts = TranscribeOptions::default().with_max_new_tokens(512);
+        let asr = AsrInference::load_on(
+            std::path::Path::new(&model),
+            DeviceSelector::parse("nvidia").expect("selector"),
+        )
+        .expect("load decoder");
 
-        // processor.apply_transcription_request → model.generate → processor.decode
         let req = asr
             .apply_transcription_request_file(&wav, &opts)
             .expect("apply_transcription_request");
         assert_eq!(req.n_mels, 128);
         assert!(req.audio_seconds() > 0.0);
-        let ids = asr.generate(&req, 512).expect("generate");
+        let ids = asr.generate(&req).expect("generate");
         let parsed = asr.decode(&ids, ReturnFormat::Parsed).expect("decode parsed");
         let only = asr
             .decode(&ids, ReturnFormat::TranscriptionOnly)
@@ -229,15 +190,14 @@ mod tests {
         assert_eq!(parsed.transcription_text(), only.transcription_text());
         assert!(!parsed.transcription_text().is_empty());
         assert!(parsed.language().is_some(), "auto-detected language should be set");
-        // `raw` is the tokenizer's decode with special tokens: it still carries
-        // the metadata the parsed form strips.
         assert!(raw.transcription_text().contains("<asr_text>"));
 
         let one_call = asr
-            .transcribe_file_opts(&wav, 512, None, false, &opts)
-            .expect("transcribe_file_opts");
+            .transcribe(wav.to_str().expect("utf-8 path"), opts.clone())
+            .expect("transcribe");
         assert_eq!(one_call.text, parsed.transcription_text());
         assert_eq!(Some(one_call.language.as_str()), parsed.language());
         assert_eq!(asr.get_supported_languages().len(), 30);
+        assert_eq!(Backend::best().tag(), "auto");
     }
 }

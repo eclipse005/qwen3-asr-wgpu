@@ -1,34 +1,8 @@
-//! wgpu text decoder — a structural port of `src/cudarc_engine.rs`'s decode path.
-//!
-//! One decode step is **one command buffer, one submit** (~256 dispatches batched
-//! together).  That discipline is not stylistic: measured on this machine,
-//! batching costs 0.64 µs/dispatch while submitting per-op costs 32.8 µs — a 50×
-//! difference that would add ~8 ms to every token.  See `wgpu/FEASIBILITY.md` §4.
-//!
-//! Operator order per step mirrors `GpuDecoderLayer::forward_decode` exactly:
-//!
-//! ```text
-//! embed_lookup(token_buf[0], embed_table) -> h
-//! for each of 28 layers:
-//!   rms_norm(h, input_layernorm)          -> norm1
-//!   gemv(norm1, qkv_w)                    -> qkv            (4096)
-//!   qkv_extract(qkv)                      -> q_out, k_cache[i], v_cache[i]
-//!   gqa_decode(q_out, k/v_cache[i])       -> attn_out       (2048)
-//!   gemv(attn_out, o_w, accum)            -> h              (residual fused)
-//!   rms_norm(h, post_attention_layernorm) -> norm2
-//!   gemv(norm2, gate_up_w)                -> gate_up        (6144)
-//!   silu_mul_split(gate_up)               -> activated      (3072)
-//!   gemv(activated, down_proj_w, accum)   -> h
-//! rms_norm(h, final_norm)                 -> final_norm
-//! gemv(final_norm, embed_table)           -> logits         (151936)
-//! argmax(logits)                          -> token_buf[0]
-//! ```
-
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::gpu::{BulkUpload, Gpu};
 use crate::shaders;
@@ -79,8 +53,6 @@ impl TextConfig {
     }
 }
 
-/// `block_for_reduction` from `cudarc_engine.rs` — kept identical so the reduction
-/// tree matches the CUDA kernels bit for bit.
 fn block_for_reduction(last: usize) -> u32 {
     let mut bs: u32 = 32;
     let target = last as u32;
@@ -90,10 +62,6 @@ fn block_for_reduction(last: usize) -> u32 {
     bs.min(1024).max(32)
 }
 
-/// Split a flat workgroup count across two grid axes.  `max_compute_workgroups_
-/// per_dimension` is 65535: a 15-minute clip's prefill needs 85k workgroups for
-/// the SiLU and 194k rows for the causal softmax, and wgpu rejects the whole
-/// command buffer rather than clamping.
 pub(crate) fn grid_xy(workgroups: usize) -> (u32, u32) {
     let gx = workgroups.clamp(1, 65_535) as u32;
     let gy = workgroups.div_ceil(gx as usize).max(1) as u32;
@@ -115,7 +83,6 @@ struct QkvxCfg {
     max_seq: u32,
     start: u32,
     pos_offset: u32,
-    /// positions in this dispatch (1 for decode, s for prefill)
     s: u32,
     eps: f32,
     _a: u32,
@@ -123,7 +90,6 @@ struct QkvxCfg {
     _c: u32,
 }
 
-/// Prefill GEMM dimensions — mirrors the bench kernel's uniform block.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GDims {
@@ -135,11 +101,7 @@ struct GDims {
     bsb: u32,
     bsc: u32,
     beta: u32,
-    /// Row offset into the B operand — the key-tile start for the slabbed
-    /// attention (`transb=0`: K rows, `transb=1`: V rows).  Zero everywhere else.
     row0: u32,
-    /// A row stride in elements — `k` everywhere except the slabbed AV, whose A
-    /// operand (a score slab) is `SLAB_T` wide while its k sweep is narrower.
     lda: u32,
 }
 
@@ -148,7 +110,6 @@ struct GDims {
 struct SiluCfg {
     inter2: u32,
     total2: u32,
-    /// x-axis grid size; `y` continues the flat index space beyond it.
     gx: u32,
     _b: u32,
 }
@@ -161,7 +122,6 @@ struct RepeatKvCfg {
     cur: u32,
     hd: u32,
     npw: u32,
-    /// x-axis grid size; `y` continues the flat index space beyond it.
     gx: u32,
 }
 
@@ -174,37 +134,23 @@ struct SoftmaxCfg {
     m: u32,
     mp: u32,
     scale: f32,
-    /// x-axis grid size; `y` continues the row index beyond it.
     gx: u32,
-    /// Column offset of the score block this dispatch covers: 0 on the flat path
-    /// (the whole row), the slab's first key otherwise.  The row index stays
-    /// absolute, so the causal bound is `pos + 1 − row0`.
     row0: u32,
 }
 
-/// Per-slab row statistics (`shaders::slab_stats`): one `(max, Σexp)` pair per
-/// row per key slab.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SlabStatsCfg {
-    /// score-row stride in words (slab width / 2)
     n_x: u32,
-    /// columns of this slab that exist at all (≤ slab width, 16-aligned)
     valid: u32,
-    /// rows in the head = `s`
     m: u32,
-    /// padded rows per head = `mp`
     mp: u32,
     scale: f32,
-    /// first key column of this slab
     row0: u32,
-    /// x-axis grid size; `y` continues the row index beyond it
     gx: u32,
-    /// total rows in the stats buffer (`nqh · mp`)
     rows: u32,
 }
 
-/// Merge weights (`shaders::slab_weights`): layer-independent, one slot.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SlabWeightsCfg {
@@ -214,11 +160,9 @@ struct SlabWeightsCfg {
     _p: u32,
 }
 
-/// Slab merge (`shaders::slab_merge`): layer-independent, one slot.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SlabMergeCfg {
-    /// output rows (`mp`, padded positions)
     rows: u32,
     n_slab: u32,
     gx: u32,
@@ -270,7 +214,7 @@ struct EmbedCfg {
     _b: u32,
 }
 
-/// Buffers reused by every layer (the CUDA `DecodeScratch`).
+/// Buffers reused by every layer.
 pub struct Scratch {
     pub h: wgpu::Buffer,
     pub norm1: wgpu::Buffer,
@@ -292,17 +236,15 @@ pub struct Scratch {
     u_gp1: wgpu::Buffer,
     u_gp2: wgpu::Buffer,
     u_silu: wgpu::Buffer,
-    /// Split-K attention partials, `[nqh, max_chunks, …]` — f32, CUDA layout.
+    /// Split-K attention partials, `[nqh, max_chunks, …]` — f32.
     pub split_part_out: wgpu::Buffer,
     pub split_part_max: wgpu::Buffer,
     pub split_part_sum: wgpu::Buffer,
 }
 
-/// Everything a single decoder layer needs, including its own KV cache slice.
 struct Layer {
     k_cache: wgpu::Buffer,
     v_cache: wgpu::Buffer,
-    /// weight buffers kept alive for prefill-time re-binding
     iln_w: wgpu::Buffer,
     pln_w: wgpu::Buffer,
     qn_w: wgpu::Buffer,
@@ -315,7 +257,6 @@ struct Layer {
     bg_gemv_o: wgpu::BindGroup,
     bg_gemv_gu: wgpu::BindGroup,
     bg_gemv_dp: wgpu::BindGroup,
-    /// The two GEMVs whose input is a layer norm, with the norm folded in.
     bg_gemv_qkv_norm: wgpu::BindGroup,
     bg_gemv_gu_norm: wgpu::BindGroup,
     bg_rms1: wgpu::BindGroup,
@@ -332,8 +273,6 @@ struct Pipes {
     gemv_gu: wgpu::ComputePipeline,
     gemv_dp: wgpu::ComputePipeline,
     gemv_lm: wgpu::ComputePipeline,
-    /// `gemv` + the RMSNorm that produces its input, for the three sites where
-    /// the activation is a normed row (see [`shaders::gemv_norm`]).
     gemv_qkv_norm: wgpu::ComputePipeline,
     gemv_gu_norm: wgpu::ComputePipeline,
     gemv_lm_norm: wgpu::ComputePipeline,
@@ -347,50 +286,27 @@ struct Pipes {
     silu: wgpu::ComputePipeline,
     argmax: wgpu::ComputePipeline,
     embed: wgpu::ComputePipeline,
-    /// Prefill GEMMs (cuBLAS stand-ins): plain and residual-accumulating
-    /// (transb=0), plus the attention AV form (transb=1, batched).
     gemm: wgpu::ComputePipeline,
     gemm_acc: wgpu::ComputePipeline,
     gemm_av: wgpu::ComputePipeline,
-    /// Plain GEMM with the causal score-tile skip (scores only, never read above
-    /// the diagonal — see `shaders::prefill_gemm_causal`).
     gemm_causal: wgpu::ComputePipeline,
-    /// AV GEMM with the causal k bound (skips the softmax's exact zeros).
     gemm_av_causal: wgpu::ComputePipeline,
-    /// Causal softmax, one pipeline per block size (reduction tree depends on it).
     softmax: std::collections::HashMap<usize, wgpu::ComputePipeline>,
     repeat_kv: wgpu::ComputePipeline,
-    /// Slabbed causal attention: per-slab `(max, Σexp)`, the per-row merge
-    /// weights, and the weighted merge of the per-slab AV outputs.
     slab_stats: wgpu::ComputePipeline,
     slab_weights: wgpu::ComputePipeline,
     slab_merge: wgpu::ComputePipeline,
 }
 
-/// Capacity of the single-block attention path — CUDA's `SPLIT_THRESHOLD`.
+/// Capacity of the single-block attention path.
 pub const GQA_SINGLE_CAP: usize = 1024;
 
-/// Key-slab width for the tiled causal prefill attention (`docs/design-tiled-prefill.md`).
 const SLAB_T: usize = 1024;
 
-/// Reduction block size for the slabbed softmax and its statistics.
-///
-/// Both run one workgroup per score row over a `SLAB_T`-wide slab, and they
-/// must agree on the row sum to the bit (the merge weights are that sum), so
-/// this is shared.  It is deliberately smaller than `SLAB_T`: at 1024 threads a
-/// thread owned a single column and the two barrier trees — not the arithmetic
-/// or the traffic — dominated the pass, which measured as two thirds of a
-/// 6-minute prefill's attention time.
 const SLAB_BS: usize = 256;
 
-/// Uniform slots reserved for the per-slab cfg blocks (softmax + stats), i.e.
-/// the most key slabs a prefill may tile into.  Only the slabbed path uses
-/// them, and it only runs past 4096 tokens (~5 minutes).
 const MAX_SLAB: usize = 16;
 
-/// Sequence length above which prefill tiles its attention.  Below it the flat
-/// path runs — that is every fixture and every FLEURS clip, i.e. everything the
-/// alignment gate measures.  `QASR_SLAB=on|off` forces one path for A/B work.
 fn slab_path(s: usize) -> bool {
     match std::env::var("QASR_SLAB").unwrap_or_default().to_ascii_lowercase().as_str() {
         "1" | "on" | "yes" | "force" => true,
@@ -399,9 +315,6 @@ fn slab_path(s: usize) -> bool {
     }
 }
 
-/// Split-K attention chunk size — mirrors CUDA's `fused_gqa_decode_split_into`
-/// choice (`cur_len >= 2048` uses 512, else 256).  The P1 block size is always
-/// 256 regardless of the chunk width.
 fn gqa_split_chunk(cur_len: usize) -> usize {
     if cur_len >= 2048 {
         512
@@ -429,12 +342,10 @@ pub struct WgpuTextDecoder {
 
     bg_final_rms: wgpu::BindGroup,
     bg_gemv_lm: wgpu::BindGroup,
-    /// Final norm folded into the LM head's GEMV (decode path).
     bg_gemv_lm_norm: wgpu::BindGroup,
     bg_silu: wgpu::BindGroup,
     bg_argmax: wgpu::BindGroup,
     bg_embed: wgpu::BindGroup,
-    /// decoder-final norm weight, kept for prefill-time re-binding
     norm_buf: wgpu::Buffer,
     /// port-time scaffolding: the prefill output hidden states [s, hs] f16
     pub debug_prefill_h: Option<wgpu::Buffer>,
@@ -445,8 +356,8 @@ pub struct WgpuTextDecoder {
 impl WgpuTextDecoder {
     /// Build the decoder and upload `{prefix}.*` weights.
     ///
-    /// `max_seq` sizes the KV cache (`seq_len + max_new_tokens`, exactly as the
-    /// CUDA backend does); `rope_positions` sizes the MRoPE tables.
+    /// `max_seq` sizes the KV cache (`seq_len + max_new_tokens`);
+    /// `rope_positions` sizes the MRoPE tables.
     pub fn load(
         gpu: Gpu,
         model_dir: &Path,
@@ -458,7 +369,6 @@ impl WgpuTextDecoder {
         let w = weights::load_tensors(model_dir)?;
         let hs = cfg.hidden_size;
         let q_dim = cfg.q_dim();
-        let kv_dim = cfg.kv_dim();
         let nqh = cfg.num_attention_heads;
         let nkvh = cfg.num_key_value_heads;
         let hd = cfg.head_dim;
@@ -472,10 +382,6 @@ impl WgpuTextDecoder {
                     .with_context(|| format!("build pipeline {label}"))
             };
 
-        // Single-block and split-K attention each come in two sibling variants
-        // (workgroup 256/512, chunk 256/512) that *share* one bind group per
-        // layer.  wgpu's implicit layouts are pipeline-exclusive, so each family
-        // gets one explicit pipeline layout of its own.
         let gqa_pl = family_layout(
             &gpu,
             "gqa_single",
@@ -495,23 +401,10 @@ impl WgpuTextDecoder {
             3,
             true,
         );
-        // dynamic: the slabbed path gives every key slab its own cfg slot
         let sm_pl = family_layout_dyn(&gpu, "softmax", &[(0, true), (1, false)], 2, true);
         let rk_pl = family_layout(&gpu, "repeat_kv", &[(0, true), (1, false)], 2);
 
-        // ── pipelines ─────────────────────────────────────────────────────
         let rms_bs = block_for_reduction(hs) as usize;
-        // `gemv`'s 32-lane xor butterfly can use `subgroupShuffleXor` instead of
-        // 5 shared-memory rounds.  Both produce the SAME reduction tree, so the
-        // results are bit-identical (A/B: 1.17-1.18x, 0 differing outputs on
-        // 18992 rows) — see `shaders::gemv` and `docs/wgpu-best-practices-audit.md`.
-        //
-        // The capability bit alone is NOT enough: the butterfly folds lane xors
-        // 16/8/4/2/1 and maps output rows with `warp = lid >> 5`, i.e. it assumes
-        // exactly 32 lanes.  Intel's Vulkan driver reports SUBGROUP as a range
-        // (8..32) and taking it produced a model's worth of garbage with no
-        // error anywhere — the failure was visible only in the transcript.  Use
-        // the shuffle path only when the adapter promises exactly 32 lanes.
         let subgroup = gpu.features.contains(wgpu::Features::SUBGROUP)
             && gpu.info.subgroup_min_size == 32
             && gpu.info.subgroup_max_size == 32;
@@ -521,8 +414,6 @@ impl WgpuTextDecoder {
             gemv_gu: build("gemv_gu", &shaders::gemv(2 * inter, hs, false, subgroup), "gemv", None)?,
             gemv_dp: build("gemv_dp", &shaders::gemv(hs, inter, true, subgroup), "gemv", None)?,
             gemv_lm: build("gemv_lm", &shaders::gemv(vocab, hs, false, subgroup), "gemv", None)?,
-            // The three sites whose activation is a normed row: the norm is folded
-            // into the GEMV prologue instead of being its own 1-workgroup dispatch.
             gemv_qkv_norm: build(
                 "gemv_qkv_norm",
                 &shaders::gemv_norm(cfg.fused_qkv_cols(), hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
@@ -585,10 +476,6 @@ impl WgpuTextDecoder {
             )?,
         };
 
-        // ── scratch ───────────────────────────────────────────────────────
-        // Split partials are sized for the smallest chunk (256) — CUDA's
-        // conservative max_chunks; the merge kernel only ever reads the
-        // `n_chunks` slots P1 actually wrote for the launched chunk width.
         let max_chunks = max_seq.div_ceil(256);
         let mut up = gpu.uploader();
         let scratch = Scratch {
@@ -626,7 +513,6 @@ impl WgpuTextDecoder {
             bytemuck::bytes_of(&RmsCfg { eps: cfg.rms_norm_eps, _a: 0.0, _b: 0.0, _c: 0.0 }),
         )?;
 
-        // ── global weights ────────────────────────────────────────────────
         let embed = weights::get_matrix(&w, &format!("{prefix}.embed_tokens.weight"))?;
         if embed.rows != vocab || embed.cols != hs {
             bail!(
@@ -642,7 +528,6 @@ impl WgpuTextDecoder {
             &weights::get_vector(&w, &format!("{prefix}.norm.weight"))?,
         )?;
 
-        // ── per-layer ─────────────────────────────────────────────────────
         let kv_words = nkvh * max_seq * hd / 2;
         let u_argmax = up.uniform("u_argmax", 16);
         let u_embed = up.uniform("u_embed", 16);
@@ -670,8 +555,6 @@ impl WgpuTextDecoder {
                 ],
             })
         };
-        // `gemv_norm`: weights, raw activation, output, and the layer-norm weight
-        // the prologue applies.
         let gemv_norm_bg = |pipe: &wgpu::ComputePipeline,
                             wt: &wgpu::Buffer,
                             x: &wgpu::Buffer,
@@ -760,9 +643,6 @@ impl WgpuTextDecoder {
                     wgpu::BindGroupEntry { binding: 4, resource: scratch.u_gqa.as_entire_binding() },
                 ],
             });
-            // Split-K: both chunk-width pipelines share one binding shape, so the
-            // group is built from the 256-wide layout and used for both (wgpu
-            // dedupes equal layouts — the same trick as the single-path gqa256/512).
             let bg_gqa_split = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("gqa_split"),
                 layout: &pipes.gqa_split256.get_bind_group_layout(0),
@@ -878,8 +758,6 @@ impl WgpuTextDecoder {
         1 + self.cfg.num_hidden_layers * per_layer + 3
     }
 
-    // ── KV cache / RoPE plumbing ─────────────────────────────────────────
-
     /// The device the decoder lives on — shared with the GPU audio tower.
     pub fn gpu(&self) -> &Gpu {
         &self.gpu
@@ -902,8 +780,6 @@ impl WgpuTextDecoder {
     pub fn set_input_token(&self, t: i32) {
         self.gpu.upload(&self.scratch.token, &t.to_le_bytes());
     }
-
-    // ── the step ─────────────────────────────────────────────────────────
 
     fn write_step_uniforms(&self, pos: usize) {
         let cur_len = pos + 1;
@@ -947,9 +823,6 @@ impl WgpuTextDecoder {
         );
     }
 
-    /// SiLU row count: decode processes one `[gate|up]` row; prefill s rows.
-    /// Returns the `(x, y)` grid that covers `rows · inter/2` words — wgpu caps
-    /// each grid dimension at 65535, which a long prefill exceeds.
     fn write_silu_rows(&self, rows: usize) -> (u32, u32) {
         let words = rows * self.cfg.intermediate_size / 2;
         let workgroups = words.div_ceil(256);
@@ -970,16 +843,8 @@ impl WgpuTextDecoder {
         let cfg = &self.cfg;
         let cur_len = pos + 1;
         let gemv_grid = |rows: usize| (rows / 8) as u32;
-        // One row of `[gate|up]`: the grid is tiny here, the helper just keeps
-        // the uniform's `gx` consistent with what the prefill writes.
         let silu_grid = grid_xy((cfg.intermediate_size / 2).div_ceil(256));
 
-        // Ablation hook for RTFx work: `QASR_DUP=<op>` dispatches that op twice.
-        // Every one of these ops is a pure function of its inputs writing the same
-        // buffer, so the second dispatch recomputes the same values: the token
-        // stream is unchanged and `t(dup) - t(base)` is that op's true cost —
-        // including its launch bubble, which op-by-op profiling cannot separate.
-        // Default: unset, zero effect.
         let dup = std::env::var("QASR_DUP").unwrap_or_default();
         let d = |name: &str| dup == name;
 
@@ -990,8 +855,6 @@ impl WgpuTextDecoder {
         cp.dispatch_workgroups(1, 1, 1);
 
         for l in &self.layers {
-            // No standalone `rms_norm` here: `gemv_qkv_norm` / `gemv_gu_norm` carry
-            // the norm in their prologue (bit-identical tree, see `shaders::gemv_norm`).
             cp.set_pipeline(&self.pipes.gemv_qkv_norm);
             cp.set_bind_group(0, &l.bg_gemv_qkv_norm, &[]);
             cp.dispatch_workgroups(gemv_grid(cfg.fused_qkv_cols()), 1, 1);
@@ -1052,13 +915,9 @@ impl WgpuTextDecoder {
         cp.dispatch_workgroups(1, 1, 1);
 
         drop(cp);
-        // D2H staging for the token — 4 bytes, one copy, no extra submit.
         enc.copy_buffer_to_buffer(&self.scratch.token, 0, &self.scratch.token_staging, 0, 4);
     }
 
-    /// Attention dispatch for one layer: single-block kernel up to
-    /// `GQA_SINGLE_CAP`, CUDA's split-K pair beyond (chunk 256/512 per
-    /// `gqa_split_chunk`).
     fn encode_gqa<'pass>(&self, cp: &mut wgpu::ComputePass<'pass>, l: &Layer, cur_len: usize) {
         if cur_len <= GQA_SINGLE_CAP {
             let gqa = if cur_len > 512 { &self.pipes.gqa512 } else { &self.pipes.gqa256 };
@@ -1101,10 +960,6 @@ impl WgpuTextDecoder {
         self.pos += 1;
         Ok(v)
     }
-
-    // ── port-time debug scaffolding ──────────────────────────────────────
-    // Used by `src/bin/probe_layers.rs` to run one decode step layer-by-layer
-    // with host readbacks in between, localising the first divergent op.
 
     /// Dispatch only the embedding lookup.
     pub fn debug_encode_embed(&self, enc: &mut wgpu::CommandEncoder) {
@@ -1174,7 +1029,7 @@ impl WgpuTextDecoder {
         cp.dispatch_workgroups(1, 1, 1);
         cp.set_pipeline(&self.pipes.gemv_lm);
         cp.set_bind_group(0, &self.bg_gemv_lm, &[]);
-        cp.dispatch_workgroups(((self.cfg.vocab_size / 8) as u32), 1, 1);
+        cp.dispatch_workgroups((self.cfg.vocab_size / 8) as u32, 1, 1);
         cp.set_pipeline(&self.pipes.argmax);
         cp.set_bind_group(0, &self.bg_argmax, &[]);
         cp.dispatch_workgroups(1, 1, 1);
@@ -1228,7 +1083,6 @@ impl WgpuTextDecoder {
             let d = slice.get_mapped_range()?;
             i32::from_le_bytes([d[0], d[1], d[2], d[3]])
         };
-        drop(slice);
         self.scratch.token_staging.unmap();
         Ok(v)
     }
@@ -1291,8 +1145,6 @@ impl WgpuTextDecoder {
     }
 }
 
-/// Explicit pipeline layout for a kernel family whose sibling variants share
-/// bind groups: `storage` entries (binding, read_only) plus one uniform.
 fn family_layout(
     gpu: &Gpu,
     label: &str,
@@ -1302,8 +1154,6 @@ fn family_layout(
     family_layout_dyn(gpu, label, storage, uniform_binding, false)
 }
 
-/// Same, with `uniform_dynamic` enabling per-dispatch dynamic offsets
-/// (required when one uniform buffer carries per-dispatch values).
 fn family_layout_dyn(
     gpu: &Gpu,
     label: &str,
@@ -1351,7 +1201,6 @@ fn upload_weight(up: &mut BulkUpload, label: &str, w: &PackedWeight) -> Result<w
     Ok(b)
 }
 
-/// f16 vector -> `array<u32>` binding.
 fn upload_vec(up: &mut BulkUpload, label: &str, v: &[half::f16]) -> Result<wgpu::Buffer> {
     let b = up.storage(label, (v.len() * 2) as u64);
     up.upload(&b, &weights::words_bytes(v))?;
@@ -1373,10 +1222,6 @@ fn fused_gate_up(w: &HashMap<String, weights::RawTensor>, prefix: &str) -> Resul
     PackedWeight::concat_rows(&[g, u], cols)
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-//  Prefill (stage 2) — the cuBLAS stand-in chain
-// ═══════════════════════════════════════════════════════════════════════
-
 impl WgpuTextDecoder {
     /// Prefill: run `s` input positions (hidden states `[s, hs]` f16
     /// little-endian words) through every layer with causal attention, writing
@@ -1384,10 +1229,8 @@ impl WgpuTextDecoder {
     /// position.  Returns the argmax token (the first decode token) and leaves
     /// `self.pos` at `kv_start + s` so `step()` continues the sequence.
     ///
-    /// This is the wgpu stand-in for the CUDA engine's cuBLAS-based prefill:
-    /// f32 accumulate / f16 round like cuBLAS Hgemm, but with our own
-    /// accumulation order — the KV cache and logits are validated against the
-    /// CUDA golden at f16 tolerance, not bit-exactly.
+    /// The prefill GEMM chain: f32 accumulate with a single f16 rounding, in
+    /// this engine's own accumulation order.
     #[allow(clippy::too_many_lines)]
     pub fn prefill(&mut self, hidden_words: &[u8], s: usize, kv_start: usize) -> Result<i32> {
         let cfg = self.cfg.clone();
@@ -1397,25 +1240,14 @@ impl WgpuTextDecoder {
         let hd = cfg.head_dim;
         let inter = cfg.intermediate_size;
         let cur = kv_start + s;
-        let mp = s.div_ceil(128) * 128; // m-side tile rows
-        let np = cur.div_ceil(128) * 128; // n-side tile columns
-        let cur16 = cur.div_ceil(16) * 16; // k-side zero pad for the AV GEMM
+        let mp = s.div_ceil(128) * 128;
+        let np = cur.div_ceil(128) * 128;
+        let cur16 = cur.div_ceil(16) * 16;
         anyhow::ensure!(hidden_words.len() >= s * hs * 2, "prefill hidden size mismatch");
 
-        // Slabbed causal attention (docs/design-tiled-prefill.md): tile the *key*
-        // dimension so the scratch is `[nqh, mp, T]` instead of `[nqh, mp, cur]`.
-        // The flat path's scratch is O(s²) — 4.7 GiB per matrix at 15 minutes,
-        // past both VRAM and the per-binding limit — and wgpu's failure mode for
-        // that is garbage rather than an error, so the flat path refuses
-        // explicitly.  Gated well above the 180 s fixtures: everything the
-        // alignment gate covers stays on the path it was verified on.
         let slab_t = SLAB_T;
         let n_slab = if slab_path(s) { cur.div_ceil(slab_t) } else { 0 };
         let slabbed = n_slab > 0;
-        // k_rep/v_rep carry whole key slabs on the slabbed path, so their rows
-        // cover `n_slab · T` (a little past `cur`); the tail is never *read*
-        // meaningfully — the softmax zeroes the columns past the causal bound
-        // before the AV GEMM sees them.
         let nkv_rows = if slabbed { n_slab * slab_t } else { np };
         let bind_limit = self.gpu.limits.max_storage_buffer_binding_size as u64;
         if slabbed {
@@ -1450,41 +1282,25 @@ impl WgpuTextDecoder {
         let norm2 = up.storage("p.norm2", words(mp, hs));
         let qkv = up.storage("p.qkv", words(mp, cfg.fused_qkv_cols()));
         let q_out = up.storage("p.q_out", words(nqh * mp, hd));
-        // `scores` is the score slab on the slabbed path (softmaxed in place) and
-        // the whole `[nqh, mp, cur]` matrix otherwise; `attn` only exists flat.
         let slab_cols = if slabbed { slab_t } else { np };
         let scores = up.storage("p.scores", words(nqh * mp, slab_cols));
         let k_rep = up.storage("p.k_rep", words(nqh * nkv_rows, hd));
         let v_rep = up.storage("p.v_rep", words(nqh * nkv_rows, hd));
-        // softmax output / AV operand: `cur16` columns flat, the slab width when
-        // tiled.  Separate from `scores` on both paths — wgpu refuses to bind one
-        // buffer as both read-only and read-write in a single dispatch, so the
-        // softmax cannot normalise the slab in place.
         let attn = up.storage("p.attn", words(nqh * mp, if slabbed { slab_t } else { cur16 }));
-        // `[n_slab, mp, nqh·hd]`: each slab's own (already normalised) AV output,
-        // combined by `slab_merge` with the per-slab softmax weights
         let slab_part = slabbed.then(|| up.storage("p.slab_part", words(n_slab * mp, nqh * hd)));
         let slab_stats = slabbed.then(|| up.storage("p.slab_stats", (n_slab * nqh * mp * 2 * 4) as u64));
         let slab_w = slabbed.then(|| up.storage("p.slab_w", (n_slab * nqh * mp * 4) as u64));
         let attn_flat = up.storage("p.attn_flat", words(mp, nqh * hd));
         let gu = up.storage("p.gu", words(mp, 2 * inter));
         let activated = up.storage("p.activated", words(mp, inter));
-        // one 256B slot per GEMM dispatch (dynamic-offset alignment); writes
-        // land at submit start, so per-dispatch values MUST live in distinct
-        // slots — a single reused uniform would give every dispatch the last
-        // written value
         const MAX_GEMMS: u64 = 256;
         let u_gd = up.uniform("p.gd", MAX_GEMMS * 256);
-        // slab cfgs, one 256B slot each: [0, MAX_SLAB) softmax, [MAX_SLAB, 2·MAX_SLAB)
-        // slab_stats, then the layer-independent weights and merge cfgs
         let u_sl = up.uniform("p.sl", (2 * MAX_SLAB as u64 + 2) * 256);
         let u_rk = up.uniform("p.rk", 32);
         up.upload(&h_buf, hidden_words)?;
         up.finish()?;
 
         let gpu = &self.gpu;
-        // `coff` = element offset of C's batch 0 — non-zero only for the slabbed
-        // AV GEMM, whose per-slab outputs all live in one buffer.
         let gemm_bg = |pipe: &wgpu::ComputePipeline,
                        a: &wgpu::Buffer,
                        w: &wgpu::Buffer,
@@ -1521,9 +1337,6 @@ impl WgpuTextDecoder {
                 ],
             })
         };
-        // Slab dispatches write their cfg into a slot of their own (the tile's),
-        // so they never go through `gd_slot`; the first `2 · MAX_SLAB` slots are
-        // reserved for them and the counter restarts there after every submit.
         let mut gd_slot = 2 * MAX_SLAB;
         macro_rules! gemm_at {
             ($cp:expr, $pipe:expr, $a:expr, $w:expr, $c:expr, $coff:expr, $slot:expr, $gdims:expr,
@@ -1561,9 +1374,7 @@ impl WgpuTextDecoder {
             }};
         }
 
-        // per-call uniforms: multi-position extract + silu rows + softmax + repeat
         let silu_grid = self.write_silu_rows(s);
-        // One workgroup per (head, position) score row.
         let softmax_grid = grid_xy(nqh * s);
         gpu.upload(
             &self.scratch.u_qkvx,
@@ -1571,7 +1382,6 @@ impl WgpuTextDecoder {
                 max_seq: self.max_seq as u32,
                 start: kv_start as u32,
                 pos_offset: kv_start as u32,
-                // QOut row stride per head — mp (tile-padded), not s
                 s: mp as u32,
                 eps: cfg.rms_norm_eps,
                 _a: 0,
@@ -1579,13 +1389,9 @@ impl WgpuTextDecoder {
                 _c: 0,
             }),
         );
-        // grids of the two layer-independent slab merges (used inside the loop):
-        // the weights cover every stats row, the merge one head-dim band per head
         let w_grid = grid_xy((nqh * mp).div_ceil(256));
         let slab_m_grid = (mp * hd / 2).div_ceil(256) as u32;
         if slabbed {
-            // One softmax + stats cfg per key slab; a slot's bytes are live for
-            // the whole submit, so every tile needs its own.
             for t in 0..n_slab {
                 let t0 = t * slab_t;
                 let tl = (cur16 - t0).min(slab_t);
@@ -1654,13 +1460,6 @@ impl WgpuTextDecoder {
                 }),
             );
         }
-        // `repeat_kv` writes rows `0..cur` only, but both attention GEMMs address
-        // whole key slabs: the score GEMM reads K up to the slab end and the AV
-        // GEMM reads V rows `cur..cur16`, whose weights the softmax has written as
-        // exact zeros.  `0 · NaN` is NaN, so those rows have to be real zeros
-        // rather than whatever the allocator last handed out — the slabbed path
-        // reads a much longer tail than the flat one (a whole 1024-wide slab
-        // against a 128-wide pad), which is what makes it worth pinning down.
         let tail_rows = nkv_rows - cur;
         if tail_rows > 0 {
             let zero = vec![0u8; tail_rows * hd * 2];
@@ -1686,11 +1485,9 @@ impl WgpuTextDecoder {
         let mut enc = gpu.device.create_command_encoder(&Default::default());
         let mut cp = enc.begin_compute_pass(&Default::default());
 
-        // Ablation hook for prefill RTFx work (see `encode_step` for the scheme).
         let dup = std::env::var("QASR_DUP").unwrap_or_default();
 
         for (li, layer) in self.layers.iter().enumerate() {
-            // 1. rms_norm(h, iln) → normed   [s, hs]
             let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("p.rms1"),
                 layout: &self.pipes.rms_norm.get_bind_group_layout(0),
@@ -1705,14 +1502,12 @@ impl WgpuTextDecoder {
             cp.set_bind_group(0, &bg, &[]);
             cp.dispatch_workgroups(s as u32, 1, 1);
 
-            // 2. qkv GEMM  [s, fused] = normed × qkv_wᵀ
             gemm!(
                 &mut cp, &self.pipes.gemm, &normed, &layer.qkv_w, &qkv,
                 s, cfg.fused_qkv_cols(), hs, cfg.fused_qkv_cols(), 0, 0, 0,
                 (cfg.fused_qkv_cols() / 128) as u32, (mp / 128) as u32, 1
             );
 
-            // 3. extract Q/K/V for all positions (K/V land in the cache)
             let bg_ex = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("p.extract"),
                 layout: &self.pipes.extract.get_bind_group_layout(0),
@@ -1735,7 +1530,6 @@ impl WgpuTextDecoder {
                 cp.dispatch_workgroups(s as u32, (nqh + nkvh) as u32, 1);
             }
 
-            // 4. repeat_kv (K and V) — GQA head duplication
             for (cache, out) in [(&layer.k_cache, &k_rep), (&layer.v_cache, &v_rep)] {
                 let bg_rk = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("p.rk"),
@@ -1749,29 +1543,18 @@ impl WgpuTextDecoder {
                 cp.set_pipeline(&self.pipes.repeat_kv);
                 cp.set_bind_group(0, &bg_rk, &[]);
                 cp.dispatch_workgroups(repeat_grid.0, repeat_grid.1, 1);
-                // Ablation hook (see `encode_step`): re-dispatching is idempotent,
-                // so the token stream is unchanged and the time delta is the cost.
                 if dup == "p_repeat" {
                     cp.dispatch_workgroups(repeat_grid.0, repeat_grid.1, 1);
                 }
             }
 
             if slabbed {
-                // 5-8 (slabbed): one key slab of scores at a time, three passes
-                // over the slabs.  `slab_stats` records each slab's (max, Σexp)
-                // while the slab is live, the softmax normalises the slab against
-                // its own max, the AV GEMM turns it into that slab's output, and
-                // `slab_weights` + `slab_merge` combine the slabs weighted by
-                // `exp(m_t − M)·Σexp_t` — the exact per-slab softmax masses.
-                // See docs/design-tiled-prefill.md.
                 let spart = slab_part.as_ref().unwrap();
                 let sstats = slab_stats.as_ref().unwrap();
                 let swt = slab_w.as_ref().unwrap();
                 for t in 0..n_slab {
                     let t0 = t * slab_t;
-                    let tl = (cur16 - t0).min(slab_t); // 16-aligned columns in this slab
-                    // score tile [mp, T] = q × K[t0..t0+T)ᵀ, tiles above the
-                    // diagonal skipped (row0 shifts the diagonal to this slab)
+                    let tl = (cur16 - t0).min(slab_t);
                     let sg = GDims {
                         m: s as u32,
                         n: slab_t as u32,
@@ -1790,8 +1573,6 @@ impl WgpuTextDecoder {
                         0u64, t, sg,
                         sgrid.0, sgrid.1, sgrid.2
                     );
-                    // Ablation hook (as in the flat path): the GEMM overwrites its
-                    // output, so re-dispatching leaves the token stream alone.
                     if dup == "p_scores" {
                         gemm_at!(
                             &mut cp, &self.pipes.gemm_causal, &q_out, &k_rep, &scores,
@@ -1800,7 +1581,6 @@ impl WgpuTextDecoder {
                         );
                     }
 
-                    // per-slab (max, Σexp) for the merge weights
                     let bg_st = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("p.slab_stats"),
                         layout: &self.pipes.slab_stats.get_bind_group_layout(0),
@@ -1810,11 +1590,6 @@ impl WgpuTextDecoder {
                             wgpu::BindGroupEntry {
                                 binding: 2,
                                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                    // the dynamic offset is the whole slot
-                                    // address — an entry offset here would be
-                                    // *added* to it (and silently read another
-                                    // cfg: this dispatch reads the weights slot
-                                    // if both are set)
                                     buffer: &u_sl,
                                     offset: 0,
                                     size: std::num::NonZeroU64::new(32),
@@ -1826,9 +1601,6 @@ impl WgpuTextDecoder {
                     cp.set_bind_group(0, &bg_st, &[((MAX_SLAB + t) * 256) as u32]);
                     cp.dispatch_workgroups(softmax_grid.0, softmax_grid.1, 1);
 
-                    // causal softmax on the slab: the normalised slab lands in
-                    // `attn` (the AV GEMM's A operand; the same buffer cannot be
-                    // both operands of this dispatch)
                     let bg_sm = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("p.slab_sm"),
                         layout: &self.pipes.softmax[&slab_t].get_bind_group_layout(0),
@@ -1838,7 +1610,6 @@ impl WgpuTextDecoder {
                             wgpu::BindGroupEntry {
                                 binding: 2,
                                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                    // slot address via the dynamic offset alone
                                     buffer: &u_sl,
                                     offset: 0,
                                     size: std::num::NonZeroU64::new(32),
@@ -1853,8 +1624,6 @@ impl WgpuTextDecoder {
                         cp.dispatch_workgroups(softmax_grid.0, softmax_grid.1, 1);
                     }
 
-                    // this slab's AV output: [mp, nqh·hd], k bounded by the
-                    // diagonal inside the slab (row0 = t0)
                     let ag = GDims {
                         m: s as u32,
                         n: hd as u32,
@@ -1881,7 +1650,6 @@ impl WgpuTextDecoder {
                     }
                 }
 
-                // per-row slab weights, then the weighted merge into attn_flat
                 let bg_w = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("p.slab_w"),
                     layout: &self.pipes.slab_weights.get_bind_group_layout(0),
@@ -1892,7 +1660,6 @@ impl WgpuTextDecoder {
                             binding: 2,
                             resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                                 buffer: &u_sl,
-                                // static: the weights cfg is layer-independent
                                 offset: (2 * MAX_SLAB * 256) as u64,
                                 size: std::num::NonZeroU64::new(32),
                             }),
@@ -1914,7 +1681,6 @@ impl WgpuTextDecoder {
                             binding: 3,
                             resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                                 buffer: &u_sl,
-                                // static: one merge cfg for the whole prefill
                                 offset: ((2 * MAX_SLAB + 1) * 256) as u64,
                                 size: std::num::NonZeroU64::new(32),
                             }),
@@ -1925,16 +1691,11 @@ impl WgpuTextDecoder {
                 cp.set_bind_group(0, &bg_m, &[]);
                 cp.dispatch_workgroups(slab_m_grid, nqh as u32, 1);
             } else {
-                // 5. scores GEMM, batched over heads: [s, cur] = q × Kᵀ  (K is [cur, hd])
-                // batch strides in WORDS (the shader indexes array<u32> directly);
-                // bsc stays in ELEMENTS (the epilogue divides the sum by 2)
                 gemm!(
                     &mut cp, &self.pipes.gemm_causal, &q_out, &k_rep, &scores,
                     s, cur, hd, np, mp * hd / 2, np * hd / 2, mp * np,
                     (np / 128) as u32, (mp / 128) as u32, nqh as u32
                 );
-                // Ablation hook: re-dispatching is idempotent (the GEMM overwrites its
-                // output), so the token stream is unchanged and the delta is the cost.
                 if dup == "p_scores" {
                     gemm!(
                         &mut cp, &self.pipes.gemm, &q_out, &k_rep, &scores,
@@ -1943,9 +1704,7 @@ impl WgpuTextDecoder {
                     );
                 }
 
-                // 6. causal softmax, in place on scores
                 let bs = block_for_reduction(cur) as usize;
-                // softmax reads scores, writes straight into the AV input buffer
                 let bg_sm = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("p.sm"),
                     layout: &self.pipes.softmax[&bs].get_bind_group_layout(0),
@@ -1969,7 +1728,6 @@ impl WgpuTextDecoder {
                     cp.dispatch_workgroups(softmax_grid.0, softmax_grid.1, 1);
                 }
 
-                // 7. AV GEMM, batched: attn_flat[s, nqh*hd] = attn × V  (V is [cur, hd])
                 gemm!(
                     &mut cp, &self.pipes.gemm_av_causal, &attn, &v_rep, &attn_flat,
                     s, hd, cur16, nqh * hd, mp * cur16 / 2, np * hd / 2, hd,
@@ -1984,14 +1742,12 @@ impl WgpuTextDecoder {
                 }
             }
 
-            // 8. o projection + residual:  h += attn_flat × o_wᵀ
             gemm!(
                 &mut cp, &self.pipes.gemm_acc, &attn_flat, &layer.o_w, &h_buf,
                 s, hs, nqh * hd, hs, 0, 0, 0,
                 (hs / 128) as u32, (mp / 128) as u32, 1
             );
 
-            // 9. rms_norm(h, pln) → norm2
             let bg_rms2 = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("p.rms2"),
                 layout: &self.pipes.rms_norm.get_bind_group_layout(0),
@@ -2009,7 +1765,6 @@ impl WgpuTextDecoder {
                 cp.dispatch_workgroups(s as u32, 1, 1);
             }
 
-            // 10. gate/up GEMM → silu → down GEMM + residual
             gemm!(
                 &mut cp, &self.pipes.gemm, &norm2, &layer.gu_w, &gu,
                 s, 2 * inter, hs, 2 * inter, 0, 0, 0,
@@ -2038,11 +1793,6 @@ impl WgpuTextDecoder {
                 (hs / 128) as u32, (mp / 128) as u32, 1
             );
 
-            // Long prefills (s>=512) must submit+poll or Pascal/WDDM TDR
-            // device-loses.  The interval is in *layers*, but what the driver
-            // times is wall clock, and the slabbed path spends ~1 s per layer at
-            // 8k tokens: four layers there is past the 2 s TDR timeout and the
-            // device is lost mid-prefill.  Halve it once the slab path is in.
             let submit_every = if s >= 4096 { 2 } else { 4 };
             if s >= 512 && (li + 1) % submit_every == 0 {
                 drop(cp);
@@ -2052,13 +1802,10 @@ impl WgpuTextDecoder {
                 }
                 enc = gpu.device.create_command_encoder(&Default::default());
                 cp = enc.begin_compute_pass(&Default::default());
-                // the submitted cfgs are retired, so the per-dispatch slots can
-                // be handed out again (the slab slots are static, never reused)
                 gd_slot = 2 * MAX_SLAB;
             }
         }
 
-        // tail: final norm of the LAST row → lm head → argmax
         let last_off = ((s - 1) * hs * 2) as u64;
         let bg_fn = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("p.final_rms"),
@@ -2090,7 +1837,6 @@ impl WgpuTextDecoder {
         enc.copy_buffer_to_buffer(&self.scratch.token, 0, &self.scratch.token_staging, 0, 4);
         gpu.queue.submit([enc.finish()]);
 
-        // scaffolding: snapshot L0's row-0 output for offline bisection
         {
             let dbg = gpu.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("p.dbg_h0"),

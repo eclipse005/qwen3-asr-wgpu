@@ -1,38 +1,16 @@
-//! WGSL sources for the decode chain.
-//!
-//! Every kernel here is a structural port of the matching CUDA kernel in
-//! `src/kernels/kernels.cu`, and the *arithmetic order is deliberately mirrored*:
-//! lane-strided accumulation, the same reduction tree, the same operand grouping.
-//! f32 addition is not associative, so a different order would give a different
-//! last-ulp result, and the CUDA backend has already shown that last-ulp
-//! differences get amplified by 600+ autoregressive steps into different text
-//! (see `ROADMAP.md` §1.4.2).  Mirroring the order is what makes a token-id-level
-//! comparison against the CUDA golden meaningful.
-//!
-//! Two layout conventions are shared with the CUDA backend so values are
-//! bit-comparable:
-//!
-//! * **activations** are f16 stored as `array<u32>`, word `j` holding elements
-//!   `2j` / `2j+1` — byte-identical to CUDA's `__half2` view;
-//! * **weights** are f16 stored as `array<vec4<u32>>` (8 halves = 16 B per
-//!   element) — byte-identical to CUDA's `uint4` view, and the reason a plain
-//!   `array<f16>` binding is never needed (Pascal exposes 16-bit storage but not
-//!   `shaderFloat16`).
-
 #![allow(dead_code)]
 
 pub const LOG2_E: f32 = std::f32::consts::LOG2_E;
 
-/// Read element `i` out of a packed f16 word (`v.x` = even index, `v.y` = odd).
 const HALF_AT: &str = "\
 fn half_at(v: vec2<f32>, i: u32) -> f32 { return select(v.y, v.x, (i & 1u) == 0u); }
 ";
 
 /// `rms_norm_f16` — one workgroup per row, block tree reduction over `LAST`.
 ///
-/// Bits that matter: `local += vx*vx + vy*vy` per `__half2` word (CUDA's odd/even
+/// Bits that matter: `local += vx*vx + vy*vy` per `__half2` word (the odd/even
 /// tail is irrelevant because every model dim is even), the `s`-halving tree, and
-/// the two passes reading `x` twice exactly as CUDA does.
+/// the two passes reading `x` twice.
 pub fn rms_norm(last: usize, bs: usize) -> String {
     assert!(last % 2 == 0 && last >= bs, "rms_norm: last must be even and >= bs");
     format!(
@@ -135,8 +113,6 @@ pub fn gemv_split(n: usize, k: usize, subgroup: bool, splits: usize) -> String {
 var<workgroup> bt1: array<f32, 256>;
 "
     };
-    // One granule = 4 u32 words = 8 f16 columns; the four words feed the four
-    // accumulators, exactly as in `gemv`.
     let mut body = String::new();
     for g in 0..gpt {
         body.push_str(&format!(
@@ -240,9 +216,6 @@ pub fn gemv(n: usize, k: usize, accum: bool, subgroup: bool) -> String {
     assert_eq!(tiles % 4, 0, "gemv: k/256 must be a multiple of 4 (unrolled x4)");
     let accum_lit = if accum { 1u32 } else { 0u32 };
     let subgroup_lit = if subgroup { 1u32 } else { 0u32 };
-    // The two bodies compute the SAME tree; see `bfly`'s doc comment.  The
-    // shared-memory form alternates two buffers so each round's read cannot
-    // observe another lane's write from the same round -- exactly as before.
     let subgroup_body = if subgroup {
         "    var t = v;
     t = t + subgroupShuffleXor(t, 16u);
@@ -270,7 +243,6 @@ pub fn gemv(n: usize, k: usize, accum: bool, subgroup: bool) -> String {
     t = bt0[lid] + bt0[wb + (lane ^ 1u)];
     return t;"
     };
-    // The shared-memory form still needs its staging buffers declared.
     let bfly_scratch = if subgroup {
         ""
     } else {
@@ -436,7 +408,6 @@ pub fn gemv_norm(
     );
     let accum_lit = u32::from(accum);
     let subgroup_lit = u32::from(subgroup);
-    // The folded tree rounds, in the reference's pairing.
     let folded = match vc {
         1 => "l0".to_string(),
         2 => "l0 + l1".to_string(),
@@ -667,8 +638,8 @@ const BS: u32 = 128u;
 
 var<workgroup> red: array<f32, 128>;
 
-/// Sum of squares + tree reduction + inverse RMS, exactly as the CUDA block does it
-/// (one element per thread, `s` halving from `bs/2`).
+/// Sum of squares + tree reduction + inverse RMS (one element per thread,
+/// `s` halving from `bs/2`).
 fn head_inv_rms(base: u32, lid: u32) -> f32 {{
     var local = 0.0;
     for (var j = lid; j < D; j = j + BS) {{
@@ -758,22 +729,8 @@ fn qkv_extract(@builtin(workgroup_id) wgid: vec3<u32>,
 }
 
 /// `fused_gqa_decode_f16` — single-block-per-(b,q_head) flash-style attention.
-/// `bs` mirrors CUDA's adaptive choice (256 for `cur_len <= 512`, else 512);
-/// CUDA also has a 1024 case that only the split path ever uses.
-// Bit-exact port of CUDA's expf (sm_61, CUDA 12.8 — PTX probed) for the decode
-// attention softmax.  WGSL's builtin exp() differs from CUDA expf by 1..58 ulp
-// on ~92% of inputs, which the decode chain amplifies into token flips at
-// near-tie steps (q06_180s_en @ 363).  This port reproduces CUDA expf bit for
-// bit over the whole finite domain (probe: wgpu/exp_probe, 0/2^20 mismatch):
-//   fma.rn(x,c1,0.5) -> sat -> fma.rm(f5,252,12582913) -> f8 grid index
-//   f12 = fma.rn(x,LOG2E,126-Q); f14 = fma.rn(x,c2,f12)
-//   result = ex2.approx.ftz(f14) * 2^(Q-126)
-// The three correctly-rounded fmas and the final power-of-two scaling are done
-// in PURE u32 integer arithmetic (integer ops are exact and associative, so no
-// driver transform — FFMA contraction, reassociation, CSE — can perturb them;
-// empirically the driver *does* fold float-domain two_sum residuals to zero).
-// WGSL exp2 == ex2.approx.ftz bit-for-bit (measured), incl. the subnormal
-// output flush; the remaining exactness lives in scale_pow2's integer GRS.
+/// `bs` follows the adaptive choice (256 for `cur_len <= 512`, else 512); a
+/// 1024 case exists that only the split path ever uses.
 const EXP_BT: &str = "
 fn lead32(v0: u32) -> i32 {
     var n = 0i;
@@ -965,7 +922,7 @@ fn fma_int(a: f32, b: f32, c: f32) -> f32 {
 }
 // rn(A * 2^(q-126)) for normal A > 0, q in [0,252]: power-of-two scaling with
 // integer GRS rounding in the subnormal grid (the driver's OpFMul flushes
-// subnormal outputs; CUDA's mul.rn does not).
+// subnormal outputs; a correctly-rounded multiply does not).
 fn scale_pow2(Abits: u32, q: u32) -> u32 {
     let sgn = Abits & 0x80000000u;
     if ((Abits & 0x7FFFFFFFu) == 0u) { return sgn; }
@@ -1129,8 +1086,8 @@ fn gqa(@builtin(workgroup_id) wgid: vec3<u32>,
     }}
     workgroupBarrier();
 
-    // CUDA writes one element per thread; writing whole f16 words here keeps the
-    // per-element arithmetic (and its order) identical.
+    // exactly one element per thread, written as whole f16 words — the
+    // per-element arithmetic, and its order, is unchanged.
     if (lid.x < D2) {{
         var a0 = 0.0;
         var a1 = 0.0;
@@ -1148,8 +1105,8 @@ fn gqa(@builtin(workgroup_id) wgid: vec3<u32>,
     )
 }
 
-/// `silu_mul_split_f16` — `gu` holds `[gate | up]` per row; CUDA uses `__expf`,
-/// which is `ex2.approx(x * log2(e))`, so `exp2` is used here rather than `exp`.
+/// `silu_mul_split_f16` — `gu` holds `[gate | up]` per row.  The reference's
+/// approx exp is `ex2.approx(x * log2(e))`, so `exp2` is used rather than `exp`.
 pub fn silu_mul_split(inter: usize) -> String {
     assert!(inter % 2 == 0);
     let inter2 = inter / 2;
@@ -1192,11 +1149,11 @@ fn silu_mul_split(@builtin(global_invocation_id) gid: vec3<u32>) {{
 /// `fused_gqa_decode_split_p1_f16` — long-context (cur_len > 1024) split-K
 /// attention, phase 1: one workgroup per (q_head, chunk).  Chunk-local scores →
 /// chunk max/sum via the shared block-reduction tree → unnormalized partial
-/// numerator.  Block size is fixed at 256 (CUDA's choice) regardless of chunk
-/// width; `t_split = 256/d = 2` threads cooperate per output element.
+/// numerator.  Block size is fixed at 256 regardless of chunk width;
+/// `t_split = 256/d = 2` threads cooperate per output element.
 ///
-/// Empty chunks (t_start >= cur_len) write max=-inf, sum=0, partial=0 exactly as
-/// CUDA does — the merge kernel's `> -inf` guard depends on it.
+/// Empty chunks (t_start >= cur_len) write max=-inf, sum=0, partial=0 — the
+/// merge kernel's `> -inf` guard depends on it.
 pub fn gqa_decode_split_p1(nqh: usize, nkvh: usize, d: usize, chunk: usize) -> String {
     assert_eq!(d % 2, 0);
     let t_split = 256 / d;
@@ -1407,7 +1364,7 @@ fn gqa_merge(@builtin(workgroup_id) wgid: vec3<u32>,
 }
 
 /// `argmax_into_slot_f16` — single block of 1024, strict `>` so the lowest index
-/// wins a tie (identical tie-breaking to CUDA, which matters for reproducibility).
+/// wins a tie (which matters for reproducibility).
 pub fn argmax_into_slot() -> String {
     format!(
         "{HALF_AT}
@@ -1489,29 +1446,22 @@ pub fn format_f32(v: f32) -> String {
     if exp == 0 && man == 0 {
         return format!("{sign}0.0");
     }
-    // WGSL hex float literal: 0x1.<mantissa>p<exponent>.  Six hex digits are 24
-    // fractional bits but the f32 mantissa is 23, so emit `man << 1` (always <
-    // 2^24) — otherwise every non-dyadic constant comes out half-ish wrong
-    // (1.4427 -> 1.2213, which silently bent every SiLU in the network).
     let man = man << 1;
     let e = exp - 127;
     format!("{sign}0x1.{man:06x}p{e}")
 }
 
-
 /// Prefill GEMM:  C[m,n] f16 = A[m,k] f16 × W[n,k]ᵀ (or × W[n,k] when
-/// `transb`), f32 accumulate, one f16 rounding — the wgpu stand-in for the
-/// CUDA engine's cuBLAS calls.  Tile 128×128 per workgroup (16×16 threads,
-/// 8×8 micro-tile), BK=16, software-pipelined (next tile prefetched into
-/// registers during compute).  `beta=1` folds the residual add into the
-/// epilogue (mirrors cuBLAS beta=1: acc + f16(C_in), one rounding).
+/// `transb`), f32 accumulate, one f16 rounding.  Tile 128×128 per workgroup
+/// (16×16 threads, 8×8 micro-tile), BK=16, software-pipelined (next tile
+/// prefetched into registers during compute).  `beta=1` folds the residual add
+/// into the epilogue: acc + f16(C_in), one rounding.
 /// Tile of [`prefill_gemm`], as a single source of truth.
 ///
 /// The kernel's own `BM`/`BN`/`BK` constants and **every caller's** padding and
 /// dispatch grids must agree.  They are exported here so a caller cannot drift:
 /// passing 64 where the kernel uses 128 leaves half of each axis uncomputed and
-/// the result is silently wrong rather than an error (this happened — see
-/// `ROADMAP-wgpu.md`, "GPU audio encoder 调查记录").
+/// the result is silently wrong rather than an error.
 pub const PREFILL_GEMM_TM: usize = 8;
 pub const PREFILL_GEMM_TN: usize = 8;
 pub const PREFILL_GEMM_BK: usize = 16;
@@ -1616,10 +1566,6 @@ fn prefill_gemm_impl(
          }\n",
     );
 
-    // A element (m-row r, k-col c): word abase + r*kk + c/2, half c&1.
-    // W element: transb=0 -> [n, k] f16: word wb + r*kk + c/2, half c&1;
-    //   transb=1 -> [k, n] f16: element (r, c) at (k0+c)*(n/2) + (n0+r)/2,
-    //   half (n0+r)&1 (n padded even, n0 multiple of BN).
     s.push_str(
         "@compute @workgroup_size(16, 16)\n\
          fn gemm(@builtin(workgroup_id) wid: vec3<u32>,\n\
@@ -1716,12 +1662,6 @@ fn prefill_gemm_impl(
     let store_bs = || {
         let mut t = String::new();
         for e in 0..n_bs {
-            // the prefetched word's halves follow the SAME layout as load_bs:
-            // transb=0 -> k parity (= tx parity); transb=1 -> n parity of the
-            // n-element this word was fetched for.  Using tx parity for
-            // transb=1 swapped every odd-n B value in every prefetched tile
-            // (tile 0 loads directly and is fine — AV output rows 0-15 exact,
-            // rows 16+ garbage).
             let sel = if transb {
                 format!("((n0 + ty + {}u) & 1u) == 1u", e * 16)
             } else {
@@ -1771,8 +1711,6 @@ fn prefill_gemm_impl(
     s.push_str("  }\n  workgroupBarrier();\n");
     s.push_str("  k0 = kn;\n }\n");
 
-    // epilogue: f16 words along n; a thread owns TN consecutive columns so
-    // pairs stay in-thread.  beta=1 adds the f16 C_in before the rounding.
     for i in 0..tm {
         s.push_str(&format!("let row{i} = m0 + ty * {tm}u + {i}u;\n"));
     }
@@ -1786,8 +1724,6 @@ fn prefill_gemm_impl(
             s.push_str(&format!(
                 "var v{i}{e} = vec2<f32>(c{i}{je}, c{i}{jo});\n"
             ));
-            // `Bias` is the per-column vector, two columns per word: the pair a
-            // thread owns is exactly one word, so no half select is needed.
             if bias {
                 s.push_str(&format!(
                     "v{i}{e} = v{i}{e} + unpack2x16float(Bias[(n0 + tx * {tn}u + {je}u) / 2u]);\n"
@@ -1887,8 +1823,8 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
     let inv_sum = 1.0 / red_sum[0];
     workgroupBarrier();
 
-    // one thread per f16 word — no read-modify-write races; the per-element
-    // arithmetic is identical to CUDA's one-element-per-thread form
+    // one thread per f16 word — no read-modify-write races, and the per-element
+    // arithmetic is the same as one element per thread
     for (var w = lid.x; w < cfg.n_w; w = w + BS) {{
         let j0 = w * 2u;
         let j1 = j0 + 1u;
@@ -2094,7 +2030,7 @@ fn slab_merge(@builtin(global_invocation_id) gid: vec3<u32>,
 }
 
 /// repeat_kv:  K cache `[nkvh, max_seq, hd]` rows `0..cur` duplicated per GQA
-/// group into `[nqh, cur, hd]` (CUDA `repeat_kv_from_cache`).
+/// group into `[nqh, cur, hd]`.
 pub fn repeat_kv(nrep: usize) -> String {
     format!(
         "struct Cfg {{ nkvh: u32, max_seq: u32, cur: u32, hd: u32, npw: u32, gx: u32 }};
@@ -2127,15 +2063,6 @@ fn repeat_kv(@builtin(global_invocation_id) gid: vec3<u32>) {{
         nrep = nrep,
     )
 }
-
-// ═══════════════════════════════════════════════════════════════════════
-//  GPU audio encoder
-//
-//  Every kernel here works on the packed-f16 `array<u32>` convention the text
-//  decoder established (`Gpu::storage` pads to 16 B, one `u32` = two halves).
-//  All GEMMs are the decoder's `prefill_gemm` tile, so no accumulation order is
-//  invented twice.
-// ═══════════════════════════════════════════════════════════════════════
 
 /// Out-of-plane tap sentinel.  **One definition for both sides** — it is
 /// interpolated into the WGSL below *and* written into the tap table by the

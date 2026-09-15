@@ -1,17 +1,8 @@
-//! End-to-end transcribe on wgpu (CPU audio encoder + wgpu text decoder).
-//!
-//! Alignment target: Python Transformers-native `-hf` greedy dumps.
-//!
-//! ```text
-//! cargo run --release --bin transcribe -- --model D:\Qwen3-ASR\models\Qwen3-ASR-0.6B-hf --wav D:\qwen3-asr-rs\tests\fixtures\15s_en.wav --adapter nvidia
-//! ```
-
 use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
-use qwen3_asr_wgpu::inference::{EncoderBackend, TranscribeOptions};
-use qwen3_asr_wgpu::WgpuAsr;
+use qwen3_asr_wgpu::{diagnostics, AsrInference, DeviceSelector, EncoderBackend, TranscribeOptions};
 
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
@@ -21,31 +12,32 @@ fn flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
+fn required(args: &[String], name: &str, env: &str) -> Result<String> {
+    arg(args, name)
+        .or_else(|| std::env::var(env).ok().filter(|s| !s.is_empty()))
+        .ok_or_else(|| anyhow::anyhow!("{name} is required (or set {env})"))
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let model = PathBuf::from(arg(&args, "--model").unwrap_or_else(|| {
-        r"D:\Qwen3-ASR\models\Qwen3-ASR-0.6B-hf".to_string()
-    }));
-    let wav = PathBuf::from(arg(&args, "--wav").unwrap_or_else(|| {
-        r"D:\qwen3-asr-rs\tests\fixtures\15s_en.wav".to_string()
-    }));
-    // Device selection.  The axis is the *runtime* (`vulkan`, `dx12`, `metal`,
-    // `gl`, `cpu`), with an optional index for machines that have several
-    // devices on one runtime — the shape ONNX Runtime's execution providers and
-    // llama.cpp's `CUDA0`/`Vulkan0`/`CPU` names use.  Vendor is not a selector:
-    // `--list-devices` shows it as information.
+    // These two answer without a model, so they run before the paths are
+    // required — `transcribe --list-devices` on a fresh machine is the first
+    // thing anyone types.
+    if flag(&args, "--languages") {
+        println!("{}", qwen3_asr_wgpu::supported_languages().join(", "));
+        return Ok(());
+    }
     if flag(&args, "--list-devices") || flag(&args, "--devices") {
         println!("runtimes are the axis; the vendor is information (a card is reachable");
         println!("through several runtimes and those are different code paths).\n");
-        for t in WgpuAsr::device_targets() {
+        for t in AsrInference::device_targets() {
             println!("{}", t.describe());
         }
         println!("* {:<10} host backend: CPU audio tower + CPU text decoder (--cpu-dec)", "cpu");
         return Ok(());
     }
-    // `--cpu-dec` is `--device cpu`; `--cpu-enc` only swaps the audio tower.
-    // `QASR_DEVICE` lets a wrapper (e.g. tools/verify_all.ps1) pin the runtime
-    // without every tool growing a flag; `--device`/`--adapter` still win.
+    let model = PathBuf::from(required(&args, "--model", "QASR_MODEL")?);
+    let wav = PathBuf::from(required(&args, "--wav", "QASR_WAV")?);
     let adapter = if flag(&args, "--cpu-dec") {
         Some("cpu".to_string())
     } else {
@@ -56,43 +48,33 @@ fn main() -> Result<()> {
     let max_new: usize = arg(&args, "--max-new")
         .and_then(|s| s.parse().ok())
         .unwrap_or(512);
-    // The GPU audio tower is the default: it is bit-aligned with the CPU
-    // reference on all 12 fixture/model pairs and ~2.7× faster on the encoder
-    // phase.  `--cpu-enc` forces the host path back (A/B and regression work);
-    // `--gpu-enc` is still accepted and is the default.  A device that cannot
-    // build the tower falls back to the CPU one on its own, with a reason.
     let backend = if flag(&args, "--cpu-enc") {
         EncoderBackend::Cpu
     } else {
         EncoderBackend::Gpu
     };
+    let selector = match adapter.as_deref() {
+        Some(a) => DeviceSelector::parse(a)?,
+        None => DeviceSelector::Auto,
+    };
 
     println!("model: {}", model.display());
     println!("wav:   {}", wav.display());
     let t_load = Instant::now();
-    let mut asr = WgpuAsr::load_with(&model, adapter.as_deref(), backend)?;
+    let asr = AsrInference::load_with(&model, selector, backend)?;
     println!(
         "loaded in {:.1}s (audio tower: {})",
         t_load.elapsed().as_secs_f64(),
         if asr.gpu_encoder_active() { "gpu" } else { "cpu" }
     );
 
-    // Upstream parity knobs: `--context` (hotword/bias text, goes into the chat
-    // template's system message) and `--lang` (force the output language).
-    // `--prompt` is the reference processor's name for the same thing, and the
-    // name `transformers` itself uses: `apply_transcription_request(prompt=…)`.
-    let opts = TranscribeOptions {
-        context: arg(&args, "--context")
-            .or_else(|| arg(&args, "--prompt"))
-            .unwrap_or_default(),
-        language: arg(&args, "--lang"),
-    };
+    let mut opts = TranscribeOptions::default().with_max_new_tokens(max_new);
+    opts.context = arg(&args, "--context")
+        .or_else(|| arg(&args, "--prompt"))
+        .unwrap_or_default();
+    opts.language = arg(&args, "--lang");
     let dump = arg(&args, "--dump").map(PathBuf::from);
     let compare_enc = flag(&args, "--compare-enc");
-    if flag(&args, "--languages") {
-        println!("{}", qwen3_asr_wgpu::inference::supported_languages().join(", "));
-        return Ok(());
-    }
     if flag(&args, "--diag-enc") {
         if let Some(mel_path) = arg(&args, "--mel") {
             let raw = std::fs::read(&mel_path)?;
@@ -103,9 +85,9 @@ fn main() -> Result<()> {
             let n_mels = 128usize;
             let n_frames = mel.len() / n_mels;
             println!("diag from mel: {n_mels}x{n_frames}");
-            asr.diagnose_encoder_mel(&mel, n_mels, n_frames)?;
+            diagnostics::diagnose_encoder_mel(&asr, &mel, n_mels, n_frames)?;
         } else {
-            asr.diagnose_encoder(&wav)?;
+            diagnostics::diagnose_encoder(&asr, &wav)?;
         }
         return Ok(());
     }
@@ -121,8 +103,8 @@ fn main() -> Result<()> {
         anyhow::ensure!(mel.len() % n_mels == 0, "mel length");
         let n_frames = mel.len() / n_mels;
         println!("mel: {n_mels}x{n_frames} from {mel_path}");
-        asr.transcribe_from_mel_cmp_opts(
-            &mel, n_mels, n_frames, max_new, dump.as_deref(), compare_enc, &opts,
+        diagnostics::transcribe_from_mel(
+            &asr, &mel, n_mels, n_frames, &opts, dump.as_deref(), compare_enc,
         )?
     } else if let Some(embeds_path) = arg(&args, "--embeds") {
         let raw = std::fs::read(&embeds_path)?;
@@ -132,13 +114,10 @@ fn main() -> Result<()> {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         println!("embeds: {} from {embeds_path}", embeds.len());
-        asr.transcribe_from_embeds(&embeds, max_new, dump.as_deref())?
+        diagnostics::transcribe_from_embeds(&asr, &embeds, &opts, dump.as_deref())?
     } else if flag(&args, "--session") {
-        // Feed the wav through the incremental session in 1 s chunks (what a
-        // live source would do), then flush — the text must equal the
-        // whole-clip run.
-        let samples = qwen3_asr_wgpu::mel::load_audio_wav(&wav, 16_000)?;
-        let mut sess = asr.create_streaming_session(opts.clone(), max_new)?;
+        let samples = qwen3_asr_wgpu::load_audio_wav(&wav, 16_000)?;
+        let mut sess = asr.create_streaming_session(opts.clone())?;
         let chunk = 16_000;
         for part in samples.chunks(chunk) {
             sess.push_samples(part)?;
@@ -146,18 +125,22 @@ fn main() -> Result<()> {
         println!("session encoded {} tokens", sess.encoded_tokens());
         sess.flush()?
     } else if flag(&args, "--stream") {
-        // Per-token callback (reference port's `transcribe_streaming`): the
-        // incremental text goes to stderr, so stdout still carries the final
-        // text for `--baseline`.
         let mut shown = 0usize;
-        asr.transcribe_file_streaming(&wav, max_new, dump.as_deref(), compare_enc, &opts, |t| {
-            if t.text_so_far.len() > shown {
-                eprint!("{}", &t.text_so_far[shown..]);
-                shown = t.text_so_far.len();
-            }
-        })?
+        diagnostics::transcribe_with_dump_streaming(
+            &asr,
+            &wav,
+            &opts,
+            dump.as_deref(),
+            compare_enc,
+            |t| {
+                if t.text_so_far.len() > shown {
+                    eprint!("{}", &t.text_so_far[shown..]);
+                    shown = t.text_so_far.len();
+                }
+            },
+        )?
     } else {
-        asr.transcribe_file_opts(&wav, max_new, dump.as_deref(), compare_enc, &opts)?
+        diagnostics::transcribe_with_dump(&asr, &wav, &opts, dump.as_deref(), compare_enc)?
     };
     let elapsed = t0.elapsed().as_secs_f64();
     let audio_s = if arg(&args, "--mel").is_none() && arg(&args, "--embeds").is_none() {

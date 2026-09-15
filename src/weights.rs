@@ -1,18 +1,3 @@
-//! Model weight loading for the wgpu engine.
-//!
-//! Deliberately independent of the main crate: `weights` / `raw_tensor` are
-//! private modules there, and the brief keeps all wgpu code inside this crate.
-//! The **bytes are produced by exactly the same conversion path** the CUDA
-//! backend uses (bf16 -> f32 via a 16-bit shift -> `half::f16::from_f32`), so the
-//! two engines consume bit-identical f16 weights.
-//!
-//! Tensors are uploaded in the layouts the kernels want:
-//!
-//! * fused QKV = `[q_proj | k_proj | v_proj]` rows concatenated (same as
-//!   `load_fused_qkv_weight`);
-//! * fused gate/up = `[gate_proj | up_proj]` rows concatenated;
-//! * everything stored f16, byte-packed.
-
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
@@ -180,7 +165,6 @@ fn normalize_hf_weight_names(weights: HashMap<String, RawTensor>) -> HashMap<Str
 
 fn load_shard(path: &Path) -> Result<HashMap<String, RawTensor>> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    // SAFETY: read-only checkpoint, never mutated while mapped.
     let mmap = unsafe { Mmap::map(&file) }
         .with_context(|| format!("mmap {}", path.display()))?;
     let buf: Bytes = Bytes::from_owner(mmap);

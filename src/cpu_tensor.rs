@@ -1,5 +1,3 @@
-//! Host f32 tensors + GEMM used by the CPU audio encoder.
-
 use gemm::{gemm, Parallelism};
 use rayon::prelude::*;
 

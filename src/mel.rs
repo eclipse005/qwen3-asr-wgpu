@@ -6,7 +6,6 @@ pub(crate) const N_FFT: usize = 400;
 pub(crate) const HOP_LENGTH: usize = 160;
 
 fn hann_window(n: usize) -> Vec<f32> {
-    // Match torch.hann_window(n, periodic=True) used by Qwen3ASRFeatureExtractor.
     (0..n)
         .map(|i| {
             let x = 2.0 * std::f32::consts::PI * i as f32 / n as f32;
@@ -15,7 +14,6 @@ fn hann_window(n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// numpy/torch `mode="reflect"` (edge not repeated). `n==0` is empty.
 fn reflect_index(i: isize, n: usize) -> usize {
     if n <= 1 {
         return 0;
@@ -185,7 +183,6 @@ impl MelExtractor {
 
     pub(crate) fn extract(&self, samples: &[f32]) -> Result<(Vec<f32>, usize, usize)> {
         anyhow::ensure!(!samples.is_empty(), "empty audio");
-        // torch.stft(center=True): reflect-pad n_fft/2, then drop the extra frame.
         let pad = self.n_fft / 2;
         let padded_signal = reflection_pad(samples, pad);
 
@@ -287,15 +284,12 @@ mod tests {
         assert!(y.iter().any(|v| *v != 0.0));
     }
 
-    /// The session's window slices must reproduce the whole-clip frames; the
-    /// only difference the extractor can introduce is its per-call log-mel max
-    /// normalization.  This locks that property down: every value moves by
-    /// `0 ..= -(M_whole - M_slice)/4` (large values are untouched, deep silence
-    /// clamps to the same floor on both sides).
     #[test]
     fn slice_extraction_matches_whole_clip_modulo_normalization() {
-        let wav = r"D:\qwen3-asr-rs\tests\fixtures\180s_zh.wav";
-        if !std::path::Path::new(wav).exists() {
+        let Ok(wav) = std::env::var("QASR_TEST_WAV") else {
+            return;
+        };
+        if !std::path::Path::new(&wav).exists() {
             return;
         }
         let samples = load_audio_wav(wav, MEL_SAMPLE_RATE).unwrap();
@@ -303,7 +297,6 @@ mod tests {
         let (mel_w, n_mels, frames_w) = ex.extract(&samples).unwrap();
         let m_whole = mel_w.iter().cloned().fold(f32::NEG_INFINITY, f32::max) * 4.0 - 4.0;
 
-        // Window 1 of the session's slicing: `2` hops of lead-in, `2` dropped frames.
         let (win, drop) = (800usize, 2usize);
         let f0 = win;
         let lo = f0 * HOP_LENGTH - drop * HOP_LENGTH;
@@ -327,106 +320,17 @@ mod tests {
         assert!(dmax.abs() < 1e-6, "slice values must never exceed the whole-clip ones: {dmax}");
         assert!((dmin + shift).abs() < 1e-5, "delta floor {dmin} != -shift {}", -shift);
     }
-
-    #[test]
-    fn resample_180s_en_vs_python_dump() {
-        let wav = r"D:\qwen3-asr-rs\tests\fixtures\180s_en.wav";
-        let py_path = r"D:\qwen3-asr-wgpu\align_dump\py_180s_en\wave16k.f32";
-        if !std::path::Path::new(wav).exists() || !std::path::Path::new(py_path).exists() {
-            return;
-        }
-        let rust = load_audio_wav(wav, 16000).unwrap();
-        let raw = std::fs::read(py_path).unwrap();
-        let py: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        let n = rust.len().min(py.len());
-        let mut dot = 0.0f64;
-        let mut nr = 0.0f64;
-        let mut np_ = 0.0f64;
-        let mut maxabs = 0.0f32;
-        for i in 0..n {
-            let a = rust[i] as f64;
-            let b = py[i] as f64;
-            dot += a * b;
-            nr += a * a;
-            np_ += b * b;
-            maxabs = maxabs.max((rust[i] - py[i]).abs());
-        }
-        let corr = dot / (nr.sqrt() * np_.sqrt());
-        println!(
-            "rust={} py={} dlen={} corr={corr:.8} maxabs={maxabs:.6e}",
-            rust.len(),
-            py.len(),
-            rust.len() as i64 - py.len() as i64
-        );
-        assert!(
-            corr > 0.9999,
-            "soxr vs python wave corr {corr} maxabs {maxabs}"
-        );
-    }
-
-    #[test]
-    fn load_and_mel_180s_zh_vs_python_dump() {
-        let wav = r"D:\qwen3-asr-rs\tests\fixtures\180s_zh.wav";
-        let py_wave = r"D:\qwen3-asr-wgpu\align_dump\py_180s_zh\wave16k.f32";
-        let py_mel = r"D:\qwen3-asr-wgpu\align_dump\py_180s_zh\mel.f32";
-        if !std::path::Path::new(wav).exists() || !std::path::Path::new(py_wave).exists() {
-            return;
-        }
-        let rust = load_audio_wav(wav, 16000).unwrap();
-        let py: Vec<f32> = std::fs::read(py_wave)
-            .unwrap()
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        println!("wave rust={} py={}", rust.len(), py.len());
-        let n = rust.len().min(py.len());
-        let mut maxabs = 0.0f32;
-        let mut ndiff = 0usize;
-        for i in 0..n {
-            let d = (rust[i] - py[i]).abs();
-            if d > 0.0 {
-                ndiff += 1;
-            }
-            maxabs = maxabs.max(d);
-        }
-        println!("wave maxabs={maxabs:.6e} ndiff={ndiff}");
-
-        let extractor = MelExtractor::new(N_FFT, HOP_LENGTH, 128, MEL_SAMPLE_RATE);
-        let (mel, n_mels, n_frames) = extractor.extract(&rust).unwrap();
-        let pmel: Vec<f32> = std::fs::read(py_mel)
-            .unwrap()
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        println!(
-            "mel rust={}x{} ({}) py={}",
-            n_mels,
-            n_frames,
-            mel.len(),
-            pmel.len()
-        );
-        let m = mel.len().min(pmel.len());
-        let mut mmax = 0.0f32;
-        let mut mrms = 0.0f64;
-        let mut mdiff = 0usize;
-        for i in 0..m {
-            let d = (mel[i] - pmel[i]).abs();
-            if d > 1e-5 {
-                mdiff += 1;
-            }
-            mmax = mmax.max(d);
-            mrms += (d as f64) * (d as f64);
-        }
-        mrms = (mrms / m as f64).sqrt();
-        println!("mel maxabs={mmax:.6e} rms={mrms:.6e} ndiff>1e-5={mdiff}");
-    }
 }
 
-pub fn load_audio_wav(path: impl AsRef<std::path::Path>, target_sr: u32) -> anyhow::Result<Vec<f32>> {
-    load_audio_wav_impl(path.as_ref(), target_sr)
+/// Read a wav at any sample rate and resample it to `target_sr`.
+///
+/// The caller's first failure point, so it reports [`crate::AsrError::AudioDecode`]
+/// rather than burying a decode problem in an inference error.
+pub fn load_audio_wav(
+    path: impl AsRef<std::path::Path>,
+    target_sr: u32,
+) -> crate::Result<Vec<f32>> {
+    load_audio_wav_impl(path.as_ref(), target_sr).map_err(crate::AsrError::AudioDecode)
 }
 
 fn load_audio_wav_impl(path: &std::path::Path, target_sr: u32) -> anyhow::Result<Vec<f32>> {
@@ -436,10 +340,6 @@ fn load_audio_wav_impl(path: &std::path::Path, target_sr: u32) -> anyhow::Result
     let channels = spec.channels as usize;
     let max_val = (1i64 << (spec.bits_per_sample - 1)) as f32;
 
-    // A data chunk shorter than the header promises is not fatal: libsndfile and
-    // ffmpeg play what is there, and one FLEURS test wav ships that way (its
-    // `data` chunk claims 151492 bytes, the file holds 147398).  Keep the
-    // samples that could be read rather than failing the whole clip.
     let mut truncated = false;
     let mut samples_f32: Vec<f32> = Vec::new();
     match spec.sample_format {
@@ -490,10 +390,6 @@ fn load_audio_wav_impl(path: &std::path::Path, target_sr: u32) -> anyhow::Result
     resample_soxr(&mono, sr, target_sr)
 }
 
-/// Match Transformers `load_audio` → librosa (`soxr_hq`).
-///
-/// librosa.resample runs soxr HQ then `fix_length` to `ceil(n * target / orig)`.
-/// `soxr_oneshot` defaults to LQ — quality must be passed explicitly.
 fn resample_soxr(mono: &[f32], sr: u32, target_sr: u32) -> anyhow::Result<Vec<f32>> {
     use std::ffi::CStr;
     use std::os::raw::{c_char, c_uint, c_ulong, c_void};
@@ -521,7 +417,7 @@ fn resample_soxr(mono: &[f32], sr: u32, target_sr: u32) -> anyhow::Result<Vec<f3
     type SoxrT = *mut c_void;
     type SoxrErrorT = *const c_char;
 
-    const SOXR_HQ: c_ulong = 4; // SOXR_20_BITQ
+    const SOXR_HQ: c_ulong = 4;
 
     unsafe extern "C" {
         fn soxr_quality_spec(recipe: c_ulong, flags: c_ulong) -> SoxrQualitySpec;
@@ -555,13 +451,8 @@ fn resample_soxr(mono: &[f32], sr: u32, target_sr: u32) -> anyhow::Result<Vec<f3
         anyhow::bail!("soxr: {msg}")
     }
 
-    // librosa.resample(..., fix=True) uses ceil, not trunc/round.
     let expected = (mono.len() as f64 * target_sr as f64 / sr as f64).ceil() as usize;
     let q = unsafe { soxr_quality_spec(SOXR_HQ, 0) };
-    // One thread on purpose: soxr's OpenMP path only splits work across
-    // *channels* (`num_channels > 1` in `soxr.c`), and this is mono, so a thread
-    // pool buys nothing.  Measured: 1 vs 8 threads, same 1.3 s and byte-identical
-    // output for a 3-minute 44.1 kHz clip.
     let rt = unsafe { soxr_runtime_spec(1) };
     let mut err: SoxrErrorT = std::ptr::null();
     let soxr = unsafe {

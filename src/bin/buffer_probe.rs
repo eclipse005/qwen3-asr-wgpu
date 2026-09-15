@@ -1,8 +1,3 @@
-//! Minimal repro for the 1.7B embed-table problem: big buffer alloc + upload +
-//! SSBO binding, isolating which stage fails on this driver.
-//!
-//! cargo run --release --manifest-path wgpu/Cargo.toml --bin buffer_probe -- --mb 593
-
 use anyhow::Result;
 use qwen3_asr_wgpu::gpu::Gpu;
 
@@ -15,7 +10,6 @@ fn copy(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ";
 
-/// Exact replica of the decoder's `embed_lookup_single` kernel.
 const EMBED_KERNEL: &str = "
 struct Cfg { slot: u32, d2: u32, _a: u32, _b: u32 };
 
@@ -55,20 +49,17 @@ sub_group: {}", gpu.features, gpu.features.contains(wgpu::Features::SUBGROUP));
     let buf = gpu.storage("big", bytes);
     let out = gpu.storage("out", 4096);
 
-    // 1. upload a recognizable pattern
     let pattern: Vec<u8> = (0..words as u32)
         .flat_map(|w| (w ^ 0xDEAD_BEEF).to_le_bytes())
         .collect();
     println!("uploading pattern (chunked)...");
     gpu.upload(&buf, &pattern);
 
-    // 2. readback through COPY (no binding involved)
     let back = gpu.readback(&buf, 16)?;
     let w0 = u32::from_le_bytes([back[0], back[1], back[2], back[3]]);
     println!("readback word[0] = {w0:#010x} (expect 0xdeadbeef) -> {}",
         if w0 == 0xdead_beef { "OK" } else { "FAIL" });
 
-    // 3. bind the WHOLE buffer as SSBO and copy the first words through a kernel
     let pipe = gpu.pipeline("copy", KERNEL, "copy", None)?;
     let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("copy"),
@@ -91,16 +82,14 @@ sub_group: {}", gpu.features, gpu.features.contains(wgpu::Features::SUBGROUP));
     println!("kernel read word[0] = {g0:#010x} -> {}",
         if g0 == 0xdead_beef { "OK" } else { "FAIL" });
 
-    // 4. exact embed-kernel replica against the big table
     let tok = 11528u32;
     let d2 = mb_size_words(&bytes, &args);
     let row_bytes = d2 * 4;
     let table = gpu.storage("table", bytes);
-    // fill the token's row so a correct kernel returns a known value
     let row_pattern: Vec<u8> = (0..d2 as u32)
         .flat_map(|w| (w ^ 0x1234_5678).to_le_bytes())
         .collect();
-    gpu.upload(&table, &pattern); // reuse big pattern
+    gpu.upload(&table, &pattern);
     gpu.queue.write_buffer(&table, tok as u64 * row_bytes as u64, &row_pattern);
     let ids = gpu.storage("ids", 4);
     gpu.queue.write_buffer(&ids, 0, &tok.to_le_bytes());
@@ -137,8 +126,6 @@ sub_group: {}", gpu.features, gpu.features.contains(wgpu::Features::SUBGROUP));
     Ok(())
 }
 
-/// Row size in u32 words: replicate the decoder — `hs/2` words per row, with the
-/// table holding `vocab * hs` f16.  Here: derive from `--d2` or default 1024.
 fn mb_size_words(_bytes: &u64, args: &[String]) -> u32 {
     args.iter()
         .position(|a| a == "--d2")

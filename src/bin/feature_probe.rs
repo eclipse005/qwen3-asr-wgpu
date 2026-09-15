@@ -1,24 +1,3 @@
-//! Probe: which of the wgpu 30 features this Pascal/Vulkan stack can actually
-//! request, and whether subgroup WGSL built-ins compile **without** the
-//! `enable subgroups;` directive.
-//!
-//! Motivation (see `docs/wgpu-best-practices-audit.md` §H/§V4): the roadmaps
-//! recorded "naga rejects `enable subgroups;`" and concluded warp-shuffle
-//! butterflies were unavailable.  naga leaves that *directive* unimplemented on
-//! purpose (tracking issue #5555), while `wgpu::Features::SUBGROUP` exists and
-//! lists Vulkan — so subgroup built-ins may be gated by the capability bit
-//! instead.  If they work here, the decode GQA butterfly can move from shared
-//! memory to warp shuffles.
-//!
-//! Also reports limits that gate the two other planned optimisations
-//! (`max_immediate_size` for the `GDims` ring, and the dynamic-offset
-//! alignment), plus whether `zero_initialize_workgroup_memory: false` pipelines
-//! build.
-//!
-//! ```text
-//! cargo run --release --bin feature_probe -- --adapter nvidia
-//! ```
-
 use anyhow::Result;
 use wgpu::util::DeviceExt;
 
@@ -26,9 +5,6 @@ fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
 }
 
-/// Subgroup built-ins with **no** `enable` directive: ballot + shuffle-xor +
-/// a mask popcount.  If this module compiles, subgroup built-ins are reachable
-/// on this stack and the old "unavailable" conclusion was wrong.
 const SUBGROUP_WGSL: &str = r#"
 @group(0) @binding(0) var<storage, read_write> out_buf: array<u32>;
 
@@ -40,8 +16,6 @@ fn probe(@builtin(local_invocation_index) lid: u32) {
 }
 "#;
 
-/// A kernel that actually *uses* `var<workgroup>` so the zero-init question is
-/// about a real allocation, not a trivially removable one.
 const WORKGROUP_WGSL: &str = r#"
 @group(0) @binding(0) var<storage, read>       src: array<f32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
@@ -101,7 +75,6 @@ async fn run(prefer: Option<&str>) -> Result<()> {
         lims.min_storage_buffer_offset_alignment,
         lims.max_immediate_size);
 
-    // ── which of the interesting features does the ADAPTER advertise? ──
     let interesting: &[(&str, wgpu::Features)] = &[
         ("SUBGROUP", wgpu::Features::SUBGROUP),
         ("SUBGROUP_BARRIER", wgpu::Features::SUBGROUP_BARRIER),
@@ -119,7 +92,6 @@ async fn run(prefer: Option<&str>) -> Result<()> {
         println!("  {name:<32} {}", if feats.contains(*f) { "YES" } else { "no" });
     }
 
-    // ── request only what we can, then test the WGSL front end ──
     let want = wgpu::Features::SUBGROUP
         | wgpu::Features::SUBGROUP_BARRIER
         | wgpu::Features::IMMEDIATES;
@@ -129,7 +101,6 @@ async fn run(prefer: Option<&str>) -> Result<()> {
         "SUBGROUP_BARRIER requires SUBGROUP"
     );
 
-    // `max_immediate_size` defaults to 0 and must be asked for explicitly.
     let mut req = lims.clone();
     if feats.contains(wgpu::Features::IMMEDIATES) {
         req.max_immediate_size = lims.max_immediate_size.min(128);
@@ -147,7 +118,6 @@ async fn run(prefer: Option<&str>) -> Result<()> {
 
     device.on_uncaptured_error(std::sync::Arc::new(|e| eprintln!("[wgpu error] {e}")));
 
-    // ── 1. subgroup WGSL built-ins, WITHOUT `enable subgroups;` ──
     println!("\n-- subgroup WGSL (no `enable` directive) --");
     match build(&device, "probe_subgroup", SUBGROUP_WGSL) {
         Ok(pipe) => {
@@ -170,8 +140,6 @@ async fn run(prefer: Option<&str>) -> Result<()> {
                 cp.dispatch_workgroups(1, 1, 1);
             }
             queue.submit([enc.finish()]);
-            // Read back: a non-zero, non-garbage pattern proves the subgroup
-            // ops really executed (not just that the module parsed).
             let staging = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("stage"),
                 size: 64 * 4,
@@ -199,7 +167,6 @@ async fn run(prefer: Option<&str>) -> Result<()> {
         Err(e) => println!("  FAILED: {e}"),
     }
 
-    // ── 2. `enable subgroups;` should still fail (naga #5555) ──
     let with_enable = format!("enable subgroups;\n{SUBGROUP_WGSL}");
     println!("\n-- `enable subgroups;` (expected to still be Unimplemented) --");
     match build(&device, "probe_enable", &with_enable) {
@@ -216,7 +183,6 @@ async fn run(prefer: Option<&str>) -> Result<()> {
         }
     }
 
-    // ── 3. zero-initialised workgroup memory: default vs disabled ──
     println!("\n-- zero_initialize_workgroup_memory --");
     for zero in [true, false] {
         let opts = wgpu::PipelineCompilationOptions {
@@ -229,7 +195,6 @@ async fn run(prefer: Option<&str>) -> Result<()> {
         }
     }
 
-    // ── 4. does disabling it actually change the result? (correctness check) ──
     println!("\n-- correctness with zero_initialize=false --");
     match correctness(&device, &queue).await {
         Ok(()) => {}
@@ -270,9 +235,6 @@ fn build_with(
     Ok(pipe)
 }
 
-/// Run the workgroup-reduction kernel twice with zero-init disabled and compare
-/// against a CPU reduction — a nonzero-initialised `tile` would show up as a
-/// wrong sum if any thread read before writing (it does not here).
 async fn correctness(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     const N: usize = 256;
     let src: Vec<f32> = (0..N).map(|i| (i as f32) * 0.5 - 8.0).collect();

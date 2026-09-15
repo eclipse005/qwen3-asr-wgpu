@@ -123,8 +123,6 @@ pub struct RopeScaling {
 
 fn default_mrope_section() -> Vec<usize> { vec![24, 20, 20] }
 
-/// On-disk `config.json`: either the original `thinker_config` layout or the
-/// Transformers-native `-hf` layout (`audio_config` + `text_config` at top level).
 #[derive(Debug, Deserialize)]
 struct AsrConfigFile {
     #[serde(default)]
@@ -308,20 +306,24 @@ mod tests {
             assert_eq!(cfg.thinker_config.audio_config.encoder_layers, 18);
             assert_eq!(cfg.thinker_config.text_config.num_hidden_layers, 28);
         }
-        let hf = std::path::Path::new(r"D:\Qwen3-ASR\models\Qwen3-ASR-0.6B-hf\config.json");
-        if hf.is_file() {
-            let cfg = AsrConfig::from_file(hf).unwrap();
-            assert_eq!(cfg.thinker_config.audio_config.encoder_layers, 18);
-            assert_eq!(cfg.thinker_config.text_config.hidden_size, 1024);
-            assert_eq!(cfg.thinker_config.text_config.rope_theta, 1_000_000.0);
-            assert_eq!(cfg.thinker_config.audio_token_id, 151676);
+        if let Ok(dir) = std::env::var("QASR_TEST_MODEL") {
+            let hf = std::path::Path::new(&dir).join("config.json");
+            if hf.is_file() {
+                let cfg = AsrConfig::from_file(&hf).unwrap();
+                assert_eq!(cfg.thinker_config.audio_config.encoder_layers, 18);
+                assert_eq!(cfg.thinker_config.text_config.hidden_size, 1024);
+                assert_eq!(cfg.thinker_config.text_config.rope_theta, 1_000_000.0);
+                assert_eq!(cfg.thinker_config.audio_token_id, 151676);
+            }
         }
-        let hf17 = std::path::Path::new(r"D:\Qwen3-ASR\models\Qwen3-ASR-1.7B-hf\config.json");
-        if hf17.is_file() {
-            let cfg = AsrConfig::from_file(hf17).unwrap();
-            assert_eq!(cfg.thinker_config.audio_config.encoder_layers, 24);
-            assert_eq!(cfg.thinker_config.text_config.hidden_size, 2048);
-            assert_eq!(cfg.thinker_config.audio_config.output_dim, 2048);
+        if let Ok(dir) = std::env::var("QASR_TEST_MODEL_17") {
+            let hf17 = std::path::Path::new(&dir).join("config.json");
+            if hf17.is_file() {
+                let cfg = AsrConfig::from_file(&hf17).unwrap();
+                assert_eq!(cfg.thinker_config.audio_config.encoder_layers, 24);
+                assert_eq!(cfg.thinker_config.text_config.hidden_size, 2048);
+                assert_eq!(cfg.thinker_config.audio_config.output_dim, 2048);
+            }
         }
     }
 

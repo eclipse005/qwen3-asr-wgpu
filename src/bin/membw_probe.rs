@@ -1,13 +1,3 @@
-//! Pure-CPU memory-bandwidth probe (streaming read/write).
-//!
-//! The CPU audio encoder is weight-bandwidth bound: ~380 MB of f32 weights per
-//! pass.  This measures what the machine can actually stream, so "how much of
-//! encode time is irreducible weight traffic" has a real number behind it.
-//!
-//! ```text
-//! cargo run --release --bin membw_probe
-//! ```
-
 use std::time::Instant;
 
 fn best_of<F: FnMut() -> f64>(reps: usize, mut f: F) -> f64 {
@@ -22,12 +12,11 @@ fn best_of<F: FnMut() -> f64>(reps: usize, mut f: F) -> f64 {
 }
 
 fn main() {
-    let n = 64usize << 20; // 256 MB of f32
+    let n = 64usize << 20;
     let a: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
     let b: Vec<f32> = (0..n).map(|i| (i % 5) as f32).collect();
     let mut c: Vec<f32> = vec![0.0; n];
 
-    // 1. triad: 3 streams (2 read + 1 write)
     let s = best_of(5, || {
         let t = Instant::now();
         for i in 0..n {
@@ -37,7 +26,6 @@ fn main() {
     });
     println!("add (2R+1W)      : {:>7.1} ms  {:>6.1} GB/s", s * 1e3, 3.0 * n as f64 * 4.0 / s / 1e9);
 
-    // 2. pure read (sum)
     let s = best_of(5, || {
         let t = Instant::now();
         let mut acc = 0.0f32;
@@ -49,7 +37,6 @@ fn main() {
     });
     println!("read-only (1R)   : {:>7.1} ms  {:>6.1} GB/s", s * 1e3, n as f64 * 4.0 / s / 1e9);
 
-    // 3. pure write (fill)
     let s = best_of(5, || {
         let t = Instant::now();
         for i in 0..n {
@@ -59,7 +46,6 @@ fn main() {
     });
     println!("write-only (1W)  : {:>7.1} ms  {:>6.1} GB/s", s * 1e3, n as f64 * 4.0 / s / 1e9);
 
-    // 4. rayon-parallel add (what the encoder's elementwise ops do)
     use rayon::prelude::*;
     let s = best_of(5, || {
         let t = Instant::now();
@@ -70,7 +56,6 @@ fn main() {
     });
     println!("rayon add (2R+1W): {:>7.1} ms  {:>6.1} GB/s", s * 1e3, 3.0 * n as f64 * 4.0 / s / 1e9);
 
-    // 5. f16 -> f32 convert of a 190 MB f16 weight image (the GPU upload path)
     let src: Vec<half::f16> = (0..n).map(|i| half::f16::from_f32((i % 13) as f32)).collect();
     let mut dst: Vec<f32> = vec![0.0; n];
     let s = best_of(5, || {

@@ -1,28 +1,3 @@
-//! Measure the instruction-issue cost of `prefill_gemm`'s inner-loop shape.
-//!
-//! `prefill_gemm` emits, per thread per k-step: 8 `As[]` reads + 8 `Bs[]` reads +
-//! 8 prefetch loads + 16 shared stores + **64 FMAs** = 104 instructions, of which
-//! FMAs are only 62%.  On NVIDIA the shared-memory LD/ST and the FMA share the
-//! same instruction-issue slot, so a 2 TFLOP/s result against an ~8 TFLOP/s fp32
-//! peak is what this mix predicts.
-//!
-//! This probe reproduces that mix (8 shared loads + 64 FMA per iteration) and
-//! reports the achieved TFLOP/s.  It is deliberately written so the compiler
-//! **cannot** strength-reduce it: the shared addresses depend on the loop counter
-//! *and* on an accumulator, and the tile is filled with varying values.  An
-//! earlier synthetic probe got this wrong and reported 0.70 TFLOP/s for every
-//! variant — three times *below* the real kernel — so it was discarded; see
-//! `smem_roof.rs`.
-//!
-//! The lever this points at is **vectorised shared-memory reads** (`vec4<f32>`
-//! instead of scalar), which cuts the non-FMA instructions from ~40 to ~24 per
-//! k-step and raises FMA density from 62% to ~73%.  That is a portable win: every
-//! backend benefits, not just NVIDIA.
-//!
-//! ```text
-//! cargo run --release --bin f16_arith_probe -- --adapter nvidia
-//! ```
-
 use std::time::Instant;
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -70,8 +45,6 @@ async fn run(prefer: Option<&str>) -> anyhow::Result<()> {
         .await?;
     device.on_uncaptured_error(std::sync::Arc::new(|e| eprintln!("[wgpu error] {e}")));
 
-    // ── the kernel: an FMA loop whose shared-memory addresses depend on the
-    //    loop counter and on the accumulator, so nothing can be folded ──
     let wgsl = r#"
 const PAD: u32 = 260u;
 const ITERS: u32 = 256u;
@@ -171,8 +144,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         ],
     });
 
-    let gx = 144u32; // same order as prefill_gemm's real grid
-    let mut run = |reps: usize| -> anyhow::Result<f64> {
+    let gx = 144u32;
+    let run = |reps: usize| -> anyhow::Result<f64> {
         let mut enc = device.create_command_encoder(&Default::default());
         {
             let mut cp = enc.begin_compute_pass(&Default::default());
@@ -189,7 +162,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     };
     run(3)?;
     let ms = run(20)?;
-    // 8 loads + 64 FMAs per iteration, ITERS=256
     let fmas = gx as f64 * 256.0 * 256.0 * 64.0;
     let loads = gx as f64 * 256.0 * 256.0 * 8.0;
     println!(
@@ -205,4 +177,3 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     println!("\n(compare: real prefill_gemm = 2.07 TFLOP/s)");
     Ok(())
 }
-

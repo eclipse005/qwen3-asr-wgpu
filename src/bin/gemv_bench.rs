@@ -1,16 +1,3 @@
-//! Isolated GEMV benchmark mirroring `cudarc_engine::gemv_vs_cublas_bandwidth`
-//! (same five decode projections, same deterministic weights, 50 timed iters)
-//! so the numbers are directly comparable to the CUDA baseline.
-//!
-//! Variants:
-//! * `prod`   — the production `shaders::gemv` (subgroup-shuffle butterfly)
-//! * `unroll4`— experimental: tile loop unrolled ×4 with prefetched loads
-//!              (accumulation order unchanged — bit-identical results)
-//!
-//! ```text
-//! cargo run --release --manifest-path wgpu/Cargo.toml --bin gemv_bench -- --adapter nvidia
-//! ```
-
 use std::time::Instant;
 
 use anyhow::Result;
@@ -117,10 +104,6 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
 }}
 ";
 
-/// Experimental: `X` (the activation row, shared by every warp of the block) is
-/// unpacked once into f32 shared memory instead of being unpacked per warp per
-/// row.  The values are the very same f16→f32 conversions, and the FMA chains
-/// consume them in the same order, so the result is bit-identical.
 const XSMEM_WGSL: &str = "\
 @group(0) @binding(0) var<storage, read>       Wt: array<vec4<u32>>;
 @group(0) @binding(1) var<storage, read>       X:  array<vec4<u32>>;
@@ -238,11 +221,6 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
 }}
 ";
 
-/// Experimental: two rows per warp.  The X loads are shared by both rows (one
-/// activation row per warp instead of one per row) and each lane keeps eight W
-/// loads in flight instead of four, which is the knob that matters when the
-/// shape is too small to fill the machine.  Per row the FMA chains and the
-/// reduction tree are untouched, so the result is bit-identical.
 const ROWS2_WGSL: &str = "\
 @group(0) @binding(0) var<storage, read>       Wt: array<vec4<u32>>;
 @group(0) @binding(1) var<storage, read>       X:  array<vec4<u32>>;
@@ -358,10 +336,6 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
 }}
 ";
 
-/// Split-K: `SPLITS` workgroups per row-block each own a slice of the K range and
-/// write f32 partials; a second kernel (`gemv_merge`, generated in
-/// `shaders::gemv_merge`) adds them.  Not bit-identical to `prod` (the per-lane
-/// accumulator covers a sub-range), so the transcript is the gate.
 const SPLIT_MERGE_WGSL: &str = "\
 struct Cfg { words: u32, splits: u32 };
 
@@ -387,7 +361,6 @@ fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
 }
 
-/// Deterministic f16 weights in [0.5, 1.0) — identical LCG to the CUDA bench.
 fn make_weight(rows: usize, cols: usize) -> Vec<u8> {
     let mut s: u32 = 12345;
     let mut out = Vec::with_capacity(rows * cols * 2);
@@ -468,10 +441,6 @@ fn main() -> Result<()> {
             Ok(t0.elapsed().as_secs_f64() * 1000.0 / iters as f64)
         };
 
-        // production kernel
-        // production kernel, in BOTH reduction flavours: the subgroup form must
-        // be bit-identical and is the one the decoder now uses when the adapter
-        // exposes `Features::SUBGROUP` (see `subgroup_bfly_bench`).
         let src = shaders::gemv(rows, cols, false, false);
         let pipe_p = gpu.pipeline("prod", &src, "gemv", None)?;
         let bg_p = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -485,7 +454,6 @@ fn main() -> Result<()> {
         });
         let ms_p = run(&pipe_p, &bg_p)?;
 
-        // unroll4 kernel
         let src4 = UNROLL4_WGSL
             .replace("{kg}u", &format!("{kg}u"))
             .replace("{tiles}u", &format!("{tiles}u"));
@@ -501,7 +469,6 @@ fn main() -> Result<()> {
         });
         let ms_u = run(&pipe_u, &bg_u)?;
 
-        // xsmem kernel: X pre-unpacked into f32 shared memory
         let srcs = XSMEM_WGSL
             .replace("{kg}u", &format!("{kg}u"))
             .replace("{tiles}u", &format!("{tiles}u"))
@@ -519,7 +486,6 @@ fn main() -> Result<()> {
         });
         let ms_s = run(&pipe_s, &bg_s)?;
 
-        // rows2 kernel: two rows per warp, X shared
         let src2 = ROWS2_WGSL
             .replace("{kg}u", &format!("{kg}u"))
             .replace("{tiles}u", &format!("{tiles}u"));
@@ -535,11 +501,10 @@ fn main() -> Result<()> {
         });
         let ms_2 = run(&pipe_2, &bg_2)?;
 
-        // split-K: SPLITS workgroups per row block + a merge kernel
         let splits = 2usize;
         let srcs = shaders::gemv_split(rows, cols, false, splits);
         let pipe_sp = gpu.pipeline("gemv_split", &srcs, "gemv", None)?;
-        let ngran = cols / 8 / 32 / splits; // granules per lane per split
+        let ngran = cols / 8 / 32 / splits;
         let _ = ngran;
         let p_buf = gpu.storage("p_partial", (rows * splits * 4) as u64);
         let merge_src = SPLIT_MERGE_WGSL.replace("{words}u", &format!("{}u", rows / 2));
@@ -633,4 +598,3 @@ fn main() -> Result<()> {
     );
     Ok(())
 }
-

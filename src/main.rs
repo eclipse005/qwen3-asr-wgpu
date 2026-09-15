@@ -1,19 +1,5 @@
-//! wgpu feasibility spike for qwen3-asr-rs.
-//!
-//! Answers, with measurements rather than guesses:
-//!   1. Which wgpu features does each adapter actually expose (notably f16)?
-//!   2. Can a hand-written WGSL f16 GEMV reach cuBLAS-class bandwidth on the
-//!      0.6B decode shapes?
-//!   3. What does one dispatch cost in wgpu — the launch tax on a ~255-dispatch step?
-//!   4. Does a u32-packed-f16 kernel (no f16 extension needed) hold up?
-
 use std::time::Instant;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Kernels
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Needs Features::SHADER_F16.  Weight is `array<vec4<f16>>` (8 bytes/element).
 const SHADER_F16: &str = r#"
 enable f16;
 
@@ -65,7 +51,6 @@ fn gemv(@builtin(workgroup_id) gid: vec3<u32>,
 }
 "#;
 
-/// Control: plain f32 weights.  Same kernel shape, but 2x the weight traffic.
 const SHADER_F32: &str = r#"
 struct Dims { n: u32, k: u32, _p0: u32, _p1: u32 };
 
@@ -112,10 +97,6 @@ fn gemv(@builtin(workgroup_id) gid: vec3<u32>,
 }
 "#;
 
-/// Portable path.  f16 weights packed as `u32` (2 halves each — the byte layout is
-/// identical to `array<f16>`), unpacked with the core builtin `unpack2x16float`.
-/// No f16 extension and no f16 arithmetic: works on every wgpu backend, including
-/// Pascal, where Vulkan exposes 16-bit storage but not shaderFloat16.
 const SHADER_P16: &str = r#"
 struct Dims { n: u32, k: u32, _p0: u32, _p1: u32 };
 
@@ -168,8 +149,6 @@ fn gemv(@builtin(workgroup_id) gid: vec3<u32>,
 }
 "#;
 
-/// Kept in its own module: WGSL resource variables must not share (group, binding)
-/// with an unrelated variable reachable from another entry point.
 const SHADER_PROBE: &str = r#"
 // Pure streaming read of the same bytes, for the bandwidth ceiling.
 @group(0) @binding(0) var<storage, read>       R: array<vec4<u32>>;
@@ -213,14 +192,6 @@ fn readprobe(@builtin(local_invocation_id) lid: vec3<u32>,
 fn noop() {}
 "#;
 
-/// Prefill GEMM: C[m,n] = A[m,k] * W[n,k]^T, f32 accumulate, packed-f16 weights.
-/// 64x64 output tile per workgroup, 256 threads, 4x4 micro-tile per thread.
-/// Deliberately straightforward — the point is to bound how far a hand-written WGSL
-/// GEMM falls behind cuBLAS on the prefill shapes, not to ship a tuned kernel.
-/// Generates a prefill GEMM with a configurable `tm x tn` micro-tile per thread.
-/// Workgroup is 16x16 = 256 threads; the output tile is `16*tm x 16*tn`.
-/// Scalar shared-memory loads, f32 accumulate, packed-f16 weights on the right operand.
-/// This exists so the micro-tile can be swept without hand-writing each variant.
 fn gemm_shader(tm: usize, tn: usize, unroll_q: bool) -> String {
     let bm = 16 * tm;
     let bn = 16 * tn;
@@ -398,16 +369,12 @@ fn gemm(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Qwen3-ASR-0.6B text decoder shapes
-// (mirrors examples/cublas_gemv_bench.rs so numbers are directly comparable)
-// ─────────────────────────────────────────────────────────────────────────────
 const HS: usize = 1024;
-const Q_DIM: usize = 16 * 128;                      // 2048
-const KV_DIM: usize = 8 * 128;                      // 1024
-const FUSED_QKV_COLS: usize = Q_DIM + 2 * KV_DIM;   // 4096
+const Q_DIM: usize = 16 * 128;
+const KV_DIM: usize = 8 * 128;
+const FUSED_QKV_COLS: usize = Q_DIM + 2 * KV_DIM;
 const INTER: usize = 3072;
-const FUSED_GU_COLS: usize = 2 * INTER;             // 6144
+const FUSED_GU_COLS: usize = 2 * INTER;
 const VOCAB: usize = 151936;
 const LAYERS: usize = 28;
 
@@ -436,7 +403,6 @@ fn dims_buf(device: &wgpu::Device, queue: &wgpu::Queue, n: u32, k: u32) -> wgpu:
     b
 }
 
-/// f16 bit patterns inside [0.5, 1.0): no denormals, no inf/nan.
 fn f16_bytes(seed: u32, len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(len * 2);
     let mut s = seed | 1;
@@ -514,7 +480,6 @@ async fn run() {
         device.limits().max_compute_workgroups_per_dimension,
     );
 
-    // ── Kernels ───────────────────────────────────────────────────────────────
     let build = |src: &str| device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
         source: wgpu::ShaderSource::Wgsl(src.into()),
@@ -539,7 +504,6 @@ async fn run() {
     let f32p = mk(&m_f32, "gemv");
     let f16p = m_f16.as_ref().map(|m| mk(m, "gemv"));
 
-    // ── Weight buffers (shared; identical bytes for every packing) ────────────
     let mut w_bufs: Vec<wgpu::Buffer> = Vec::new();
     let mut total_f16_bytes = 0usize;
     for sh in &SHAPES {
@@ -643,7 +607,6 @@ async fn run() {
     correctness_probe(&device, &queue, &p16);
     verify_full_k(&device, &queue, &p16, &w_bufs[0], SHAPES[0].rows, SHAPES[0].cols);
 
-    // ── Pure streaming-read ceiling ───────────────────────────────────────────
     {
         let slots = (total_f16_bytes / 16).next_power_of_two();
         let slots = slots - (slots % 8192);
@@ -688,7 +651,6 @@ async fn run() {
             (slots * 16) as f64 / 1048576.0, ms, (slots * 16) as f64 / 1e9 / (ms / 1000.0));
     }
 
-    // ── Dispatch overhead ─────────────────────────────────────────────────────
     println!("\n=== dispatch overhead ===");
     let bg_noop = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None, layout: &noop.get_bind_group_layout(0), entries: &[],
@@ -739,7 +701,6 @@ async fn run() {
     println!("  encode + submit each          : {:>7.2} us / dispatch",
         t0.elapsed().as_secs_f64() * 1e6 / m as f64);
 
-    // ── Simulated decode step ─────────────────────────────────────────────────
     println!("\n=== simulated decode step: 28 layers x 4 GEMVs + lm_head ===");
     let idx = [0usize, 1, 2, 3];
     let gx: Vec<u32> = idx.iter().map(|&i| (SHAPES[i].rows as u32).div_ceil(8)).collect();
@@ -814,7 +775,6 @@ async fn run() {
     println!("  +142 no-ops (255 dispatches)    : {:>7.3} ms/step -> {:.0} tok/s (tax {:+.3} ms)",
         b, 1000.0 / b, b - a);
 
-    // ── Prefill GEMM ─────────────────────────────────────────────────────────
     let layer_specs = [("qkv", 0usize), ("o_proj", 1), ("gate_up", 2), ("down", 3)];
     for &(tm, tn, un) in &[(4usize, 4usize, false), (4, 4, true), (8, 4, true)] {
         let src = gemm_shader(tm, tn, un);
@@ -841,8 +801,7 @@ async fn run() {
                     (n * k * 2) as f64 / 1e9 / (ms / 1000.0));
                 layer_total += ms;
             }
-            println!("  -> 28 layers at m={}: {:.1} ms   (cuBLAS: {:.1} ms)",
-                m, layer_total * LAYERS as f64, if m == 384 { 75.3 } else { 191.1 });
+            println!("  -> 28 layers at m={}: {:.1} ms", m, layer_total * LAYERS as f64);
         }
     }
 
@@ -853,8 +812,6 @@ async fn run() {
     }
 }
 
-/// GEMV over the shared weight buffers.  `as_f16` picks the vec4<f16> activation buffer
-/// (f16-extension pipeline) over the vec4<f32> one (packed-u32 pipeline).
 fn bench_p16_style(
     device: &wgpu::Device, queue: &wgpu::Queue, pipe: &wgpu::ComputePipeline,
     w: &[wgpu::Buffer], shapes: &[Shaped], as_f16: bool,
@@ -915,9 +872,6 @@ fn submit_n(
     queue.submit([enc.finish()]);
 }
 
-/// One small packed-u32 GEMV vs a CPU f32 reference: proves `unpack2x16float` and the
-/// f16 storage bytes round-trip correctly on this backend — the exact area where the
-/// earlier Intel-Vulkan attempt hit device-lost.
 fn correctness_probe(device: &wgpu::Device, queue: &wgpu::Queue, pipe: &wgpu::ComputePipeline) {
     const N: usize = 64;
     const K: usize = 128;
@@ -992,7 +946,6 @@ fn correctness_probe(device: &wgpu::Device, queue: &wgpu::Queue, pipe: &wgpu::Co
             max_err = max_err.max((acc - got[i]).abs());
         }
     }
-    drop(slice);
     staging.unmap();
 
     println!("=== numerical sanity: 64x128 packed-f16 GEMV vs CPU f32 reference ===");
@@ -1000,9 +953,6 @@ fn correctness_probe(device: &wgpu::Device, queue: &wgpu::Queue, pipe: &wgpu::Co
     println!("  max abs error      : {:.5}  (dot products are O(40): rounding-level)", max_err);
 }
 
-/// Full-K verification on a real decode shape: runs the packed kernel over the 4096x1024
-/// qkv weight and diffs the first and last output rows against a CPU f32 reference.
-/// This is the check that catches a kernel which silently reads less than K.
 fn verify_full_k(
     device: &wgpu::Device, queue: &wgpu::Queue, pipe: &wgpu::ComputePipeline,
     w: &wgpu::Buffer, rows: usize, cols: usize,
@@ -1069,7 +1019,6 @@ fn verify_full_k(
         for j in 0..cols { acc += wf[r * cols + j] * xf[j]; }
         report.push((r, acc, got, (acc - got).abs()));
     }
-    drop(slice);
     staging.unmap();
 
     println!("=== full-K check on qkv {rows}x{cols} (packed kernel) ===");
@@ -1080,7 +1029,6 @@ fn verify_full_k(
     println!("  -> {}", if worst < 0.05 { "kernel reads all K correctly" } else { "MISMATCH: kernel is not doing the full reduction" });
 }
 
-/// Time one prefill-shaped GEMM.  `w` must hold at least n*(k/2) u32 (packed f16 rows).
 fn run_gemm(
     device: &wgpu::Device, queue: &wgpu::Queue, pipe: &wgpu::ComputePipeline,
     w: &wgpu::Buffer, m: usize, n: usize, k: usize, warm: u32, iters: u32,
@@ -1133,8 +1081,6 @@ fn run_gemm(
     t0.elapsed().as_secs_f64() * 1000.0 / iters as f64
 }
 
-/// Small-GEMM correctness: GPU vs CPU f32 reference on a 64x64x64 case, reusing the
-/// packed weight buffer reinterpreted with a k=64 row stride.
 fn verify_gemm(
     device: &wgpu::Device, queue: &wgpu::Queue, pipe: &wgpu::ComputePipeline,
     w: &wgpu::Buffer, m: usize, n: usize, k: usize,
@@ -1189,7 +1135,6 @@ fn verify_gemm(
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
     rx.recv().unwrap().unwrap();
 
-    // CPU reference over the same raw bytes.
     let wraw = f16_bytes(1, 4096 * 1024);
     let words: Vec<u32> = wraw.chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
@@ -1213,7 +1158,6 @@ fn verify_gemm(
             worst = worst.max((acc - got).abs());
         }
     }
-    drop(slice);
     staging.unmap();
 
     println!("\n=== GEMM numerical check 64x64x64: max abs err {:.5} ===", worst);

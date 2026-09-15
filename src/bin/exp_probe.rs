@@ -1,28 +1,4 @@
-//! WGSL-side transcendental probe.  Mirrors `examples/exp_probe.rs`: reads the
-//! same deterministic inputs, evaluates several exp/fma variants on the GPU,
-//! and dumps f32 bit patterns for bit-level comparison against the CUDA probe.
-//!
-//! Usage (repo root):  cargo run --release --manifest-path wgpu/Cargo.toml --bin exp_probe
-//! Writes: wgpu/exp_probe/wgpu_out.bin (u32 LE, 24 words per input).
-//!
-//! Per-input outputs:
-//!   0: x*y+z            — driver FFMA-contraction test (compare vs CUDA `fmaf`)
-//!   1: exp(x)            — WGSL builtin (the current decode-softmax drift source)
-//!   2: exp2(x)           — WGSL builtin (raw ex2.approx behaviour)
-//!   3: expf_cuda(x)      — expf port via float fma_soft (comparison path)
-//!   4: exp2(x*LOG2E)     — the silu path (compare vs CUDA `__expf`)
-//!   5: fma_soft(x,y,z)   — float-domain software fma (breaks under driver CSE)
-//!   6: f8 / 7: f12 / 8: f14 / 9: f5 — expf internals (soft path)
-//!  10: alo / 11: e      — Dekker fold detectors
-//!  12: raw x*c1+0.5     — contraction probes (documented: NOT contracted)
-//!  13: raw x*LOG2E+f10
-//!  14: raw x*c2+f12     — (contracted: SSA-c shape)
-//!  15: raw x*LOG2E+75
-//!  16: fma_int(x,y,z)   — PURE-INTEGER correctly-rounded fma (the ship path)
-//!  17: expf_int(x)      — expf port via fma_int (bit-exactness target)
-//!  18: f5_int / 19: f12_int / 20: f14_int — expf_int internals
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 use qwen3_asr_wgpu::gpu::Gpu;
 
 const SHADER: &str = r#"
@@ -288,8 +264,8 @@ fn fma_soft(a: f32, b: f32, c: f32) -> f32 {
 // rn(A * 2^(q-126)) for normal A > 0, q in [0,252]: f15 is a power of two, so
 // the exact product only re-biases the exponent; assemble bits directly and
 // do integer GRS rounding when the result lands in the subnormal grid.
-// Replaces OpFMul, which the driver compiles with FTZ (CUDA's mul.rn does not
-// flush), making the final multiply bit-exact against CUDA expf as well.
+// Replaces OpFMul, which the driver compiles with FTZ (a correctly-rounded
+// multiply does not flush), making the final multiply bit-exact as well.
 fn scale_pow2(Abits: u32, q: u32) -> u32 {
     let sgn = Abits & 0x80000000u;
     if ((Abits & 0x7FFFFFFFu) == 0u) { return sgn; }   // A == 0 (exp2 flushed)
@@ -317,7 +293,7 @@ fn scale_pow2(Abits: u32, q: u32) -> u32 {
     return sgn | kR;
 }
 
-// CUDA expf (sm_61, CUDA 12.8) port — fma source selectable
+// expf — fma source selectable
 fn expf_body(x: f32, useInt: bool) -> f32 {
     let f5 = clamp(select(fma_soft(x, p.c1, 0.5), fma_int(x, p.c1, 0.5), useInt), 0.0, 1.0);
     let b5 = bitcast<u32>(f5);
@@ -340,7 +316,7 @@ fn expf_body(x: f32, useInt: bool) -> f32 {
     return exp2(f14) * f15;
 }
 
-fn expf_cuda(x: f32) -> f32 { return expf_body(x, false); }
+fn expf_soft(x: f32) -> f32 { return expf_body(x, false); }
 fn expf_int2(x: f32) -> f32 {
     let f5 = clamp(fma_int(x, p.c1, 0.5), 0.0, 1.0);
     let b5 = bitcast<u32>(f5);
@@ -372,7 +348,7 @@ fn probe(@builtin(global_invocation_id) gid: vec3<u32>) {
     Out[i*24u+0u] = bitcast<u32>(x * y + z);
     Out[i*24u+1u] = bitcast<u32>(exp(x));
     Out[i*24u+2u] = bitcast<u32>(exp2(x));
-    Out[i*24u+3u] = bitcast<u32>(expf_cuda(x));
+    Out[i*24u+3u] = bitcast<u32>(expf_soft(x));
     Out[i*24u+4u] = bitcast<u32>(exp2(x * p.log2e));
     Out[i*24u+5u] = bitcast<u32>(fma_soft(x, y, z));
     // expf internals (soft path) + fold detectors
@@ -543,7 +519,6 @@ async fn run() -> Result<()> {
     device.poll(wgpu::PollType::wait_indefinitely())?;
     rx.recv()??;
     let raw = slice.get_mapped_range()?.to_vec();
-    drop(slice);
     staging.unmap();
     std::fs::write(format!("{dir}/wgpu_out.bin"), &raw)?;
     println!("wgpu_out.bin written ({} u32)", n * 24);

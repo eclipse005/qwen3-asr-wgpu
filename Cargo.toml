@@ -4,13 +4,15 @@
 name = "qwen3-asr-wgpu"
 version = "0.1.0"
 edition = "2021"
-description = "wgpu inference backend for qwen3-asr-rs — cross-vendor GPU text decoder"
+description = "Qwen3-ASR speech recognition on wgpu — cross-vendor GPU inference in Rust"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/eclipse005/qwen3-asr-wgpu"
 
 [lib]
 name = "qwen3_asr_wgpu"
 path = "src/lib.rs"
 
-# The original feasibility spike lives at src/main.rs and stays runnable.
 [[bin]]
 name = "spike"
 path = "src/main.rs"
@@ -36,6 +38,14 @@ rustfft = "6"
 gemm = "0.18"
 rayon = "1.10"
 libm = "0.2"
+thiserror = "2"
+# `hub` feature only: download a model from HuggingFace (src/hub.rs).
+reqwest = { version = "0.12", features = ["blocking"], optional = true }
+
+[features]
+# Off by default: it pulls in reqwest and TLS, and a local checkpoint needs
+# neither.
+hub = ["dep:reqwest"]
 
 [build-dependencies]
 cmake = "0.1"

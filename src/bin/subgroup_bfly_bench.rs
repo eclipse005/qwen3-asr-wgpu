@@ -1,23 +1,3 @@
-//! A/B: shared-memory butterfly vs `subgroupShuffleXor` for the decode GEMV's
-//! 32-lane reduction.
-//!
-//! `shaders::gemv` reduces each output row with a 5-round xor butterfly
-//! (`lane ^ 16, ^8, ^4, ^2, ^1`) done through `var<workgroup>` plus **5
-//! workgroupBarrier()s** — the comment says it is shared-memory because "WGSL
-//! has no portable warp shuffle on this wgpu version".  `feature_probe` just
-//! showed this stack *does* support `Features::SUBGROUP` (P104-100 / Vulkan /
-//! 572.75), so the shuffle form is available.
-//!
-//! Both kernels below compute the same thing and must agree **exactly**: the
-//! xor order is preserved, and f32 addition is performed in the same sequence,
-//! so the reduction tree — and therefore every bit — is unchanged.  That is the
-//! property that matters, because the decode chain's alignment gate depends on
-//! the current tree.
-//!
-//! ```text
-//! cargo run --release --bin subgroup_bfly_bench -- --adapter nvidia
-//! ```
-
 use anyhow::Result;
 use wgpu::util::DeviceExt;
 
@@ -25,7 +5,6 @@ fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
 }
 
-/// Shared-memory butterfly — a copy of `shaders::gemv`'s `bfly`.
 const WGSL_SMEM: &str = r#"
 struct P { n: u32, _a: u32, _b: u32, _c: u32 };
 @group(0) @binding(0) var<storage, read>       src: array<f32>;
@@ -76,7 +55,6 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>,
 }
 "#;
 
-/// Subgroup form: same xor order, no barrier, no shared memory.
 const WGSL_SUB: &str = r#"
 struct P { n: u32, _a: u32, _b: u32, _c: u32 };
 @group(0) @binding(0) var<storage, read>       src: array<f32>;
@@ -144,10 +122,8 @@ async fn run(prefer: Option<&str>) -> Result<()> {
         .await?;
     device.on_uncaptured_error(std::sync::Arc::new(|e| eprintln!("[wgpu error] {e}")));
 
-    // rows = 28 * 6 GEMVs per decode step would be thousands; use the shape the
-    // decoder actually dispatches: one warp per output row.
     for &(rows, iters) in &[(512usize, 200usize), (18992usize, 50usize)] {
-        let n = rows * 8; // 8 warps per workgroup
+        let n = rows * 8;
         let gx = (rows as u32).div_ceil(8);
 
         let src: Vec<f32> = (0..16 * 512)
@@ -203,7 +179,6 @@ async fn run(prefer: Option<&str>) -> Result<()> {
                 ],
             });
 
-            // warm up
             let mut enc = device.create_command_encoder(&Default::default());
             {
                 let mut cp = enc.begin_compute_pass(&Default::default());
@@ -214,8 +189,6 @@ async fn run(prefer: Option<&str>) -> Result<()> {
             queue.submit([enc.finish()]);
             device.poll(wgpu::PollType::wait_indefinitely())?;
 
-            // all iterations in ONE encoder + ONE submit, so the measurement is
-            // the dispatch loop's GPU cost and not per-submit overhead
             let t = std::time::Instant::now();
             let mut enc = device.create_command_encoder(&Default::default());
             {
@@ -230,7 +203,6 @@ async fn run(prefer: Option<&str>) -> Result<()> {
             device.poll(wgpu::PollType::wait_indefinitely())?;
             let ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-            // read back for the bit-exactness check
             let staging = device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
                 size: (n * 4) as u64,

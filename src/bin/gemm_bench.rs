@@ -1,26 +1,3 @@
-//! Prefill GEMM micro-benchmark — the stage-2 go/no-go gate.
-//!
-//! Sweeps a tiled WGSL GEMM generator:  C[m,n] f16 = A[m,k] f16 × W[n,k]ᵀ f16,
-//! f32 accumulate, one f16 rounding (cuBLAS-Hgemm output semantics).
-//!
-//! Workgroup 16×16 threads; output tile 16·TM × 16·TN; blocked micro-tile per
-//! thread (thread owns TM rows × TN consecutive columns); A/W staged through
-//! padded f32 shared memory (unpacked once); BK = 16.
-//!
-//! `double = true` adds software pipelining: the next k-tile's global loads are
-//! issued into registers *before* computing the current tile, then stored to
-//! shared memory after a barrier — hiding most of the DRAM latency that a
-//! plain load/compute/barrier loop exposes every step.
-//!
-//! Timing is honest-by-construction: all iterations dispatch into ONE command
-//! encoder / ONE submit, so per-submit driver cost cannot leak in.
-//!
-//! Go/no-go: ≥ 2.5 TFLOP/s at m=384, k=1024, n=4096.
-//!
-//! ```text
-//! cargo run --release --manifest-path wgpu/Cargo.toml --bin gemm_bench -- --adapter nvidia
-//! ```
-
 use std::time::Instant;
 
 use anyhow::{bail, Result};
@@ -72,8 +49,6 @@ fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool) -> String {
         }
     }
 
-    // Per-thread element mapping inside a tile (idx = ty*16 + tx + e*256,
-    // BK = 16): row = ty + e*16, column = tx.  Unrolled loads below rely on it.
     let load_as = |kx: &str, dst: &str| -> String {
         let mut t = String::new();
         for e in 0..n_as {
@@ -178,7 +153,6 @@ fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool) -> String {
     };
 
     if !double {
-        // plain pipeline: load the k0 tile at the top of every step
         s.push_str(" var k0: u32 = 0u;\n loop {\n  if (k0 >= gd.k) { break; }\n");
         s.push_str(&load_as("k0", "As"));
         s.push_str(&load_bs("k0", "Bs"));
@@ -187,8 +161,6 @@ fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool) -> String {
         s.push_str("  workgroupBarrier();\n");
         s.push_str("  k0 = k0 + BK;\n }\n");
     } else {
-        // software pipeline: smem holds tile k0 during compute while the next
-        // tile's global loads are already in flight in registers
         s.push_str(" var k0: u32 = 0u;\n");
         s.push_str(&load_as("k0", "As"));
         s.push_str(&load_bs("k0", "Bs"));
@@ -209,8 +181,6 @@ fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool) -> String {
         s.push_str("  k0 = kn;\n }\n");
     }
 
-    // epilogue: pack column pairs (even, odd) into f16 words — a thread owns
-    // TN consecutive columns so pairs never cross threads
     for i in 0..tm {
         s.push_str(&format!("let row{i} = m0 + ty * {tm}u + {i}u;\n"));
     }
@@ -251,8 +221,6 @@ struct Bench<'a> {
     pipe: wgpu::ComputePipeline,
     bg: wgpu::BindGroup,
     c_buf: wgpu::Buffer,
-    a_buf: wgpu::Buffer,
-    w_buf: wgpu::Buffer,
     grid: (u32, u32),
     m: usize,
     n: usize,
@@ -261,7 +229,6 @@ struct Bench<'a> {
     w_words: Vec<u8>,
 }
 
-/// `m`/`n` padded up to whole tiles internally; k must be a multiple of BK.
 fn setup<'a>(
     gpu: &'a Gpu,
     tm: usize,
@@ -313,8 +280,6 @@ fn setup<'a>(
         pipe,
         bg,
         c_buf,
-        a_buf,
-        w_buf,
         grid: ((np / bn) as u32, (mp / bm) as u32),
         m: mp,
         n: np,
@@ -338,7 +303,6 @@ impl Bench<'_> {
         }
     }
 
-    /// All iterations in ONE encoder + ONE submit — no per-submit pollution.
     fn time(&self, iters: u32) -> Result<f64> {
         {
             let mut enc = self.gpu.device.create_command_encoder(&Default::default());
@@ -354,7 +318,6 @@ impl Bench<'_> {
         Ok(t0.elapsed().as_secs_f64() * 1000.0 / iters as f64)
     }
 
-    /// Read back C and compare against a CPU f32 reference (f16-noise tolerance).
     fn verify(&self) -> Result<(f32, f32)> {
         let (rows, cols) = (self.m.min(256), self.n.min(256));
         let bytes = self.gpu.readback(&self.c_buf, (rows * cols / 2 * 4) as u64)?;
@@ -412,7 +375,6 @@ fn main() -> Result<()> {
         (4, 4, true, true),
     ];
 
-    // ── correctness first (values within f16 rounding of a CPU f32 reference) ──
     println!("-- correctness (m=256, n=256, k=256) --");
     let mut seed = 42u32;
     for (tm, tn, dbl, uq) in variants {
@@ -432,7 +394,6 @@ fn main() -> Result<()> {
         }
     }
 
-    // ── sweep ────────────────────────────────────────────────────────────────
     let shapes: [(&str, usize, usize, usize); 5] = [
         ("gate m384 k1024 n4096", 384, 1024, 4096),
         ("gate m2304 k1024 n4096", 2304, 1024, 4096),

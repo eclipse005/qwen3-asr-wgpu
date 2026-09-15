@@ -1,8 +1,4 @@
-//! Prompt construction and result parsing for Qwen3-ASR.
-//!
-//! Force-language prompt and output post-processing mirror upstream Python
-//! `qwen_asr.inference.utils.parse_asr_output` / `_build_text_prompt`.
-
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct TranscribeResult {
     pub text: String,
@@ -10,11 +6,8 @@ pub struct TranscribeResult {
     pub raw_output: String,
 }
 
-// ─── Token constants ──────────────────────────────────────────────
-
 pub(crate) const IM_END_TOKEN_ID: i64 = 151645;
 pub(crate) const ENDOFTEXT_TOKEN_ID: i64 = 151643;
-/// `<asr_text>` special separator (same id as HF tokenizer).
 pub(crate) const ASR_TEXT_SEP_TOKEN_ID: u32 = 151704;
 
 pub(crate) const TOK_IM_START: i64 = 151644;
@@ -24,8 +17,6 @@ pub(crate) const TOK_IM_END: i64 = IM_END_TOKEN_ID;
 pub(crate) const TOK_USER: i64 = 872;
 pub(crate) const TOK_ASSISTANT: i64 = 77091;
 const LANG_PREFIX: &str = "language ";
-
-// ─── Prompt building ──────────────────────────────────────────────
 
 pub(crate) fn build_prompt(
     tokenizer: &tokenizers::Tokenizer,
@@ -37,9 +28,6 @@ pub(crate) fn build_prompt(
     context: &str,
     prefix_text: Option<&str>,
 ) -> anyhow::Result<(Vec<i64>, usize)> {
-    // Chat template parity: `system` carries the context (hotword biasing),
-    // `user` carries the audio.  Upstream: `_build_messages(context, audio)` then
-    // `apply_chat_template(..., add_generation_prompt=True)`.
     let mut tokens: Vec<i64> = vec![TOK_IM_START, TOK_SYSTEM, TOK_NEWLINE];
     if !context.is_empty() {
         let enc = tokenizer
@@ -53,8 +41,6 @@ pub(crate) fn build_prompt(
     tokens.extend(std::iter::repeat_n(audio_token_id, nat));
     tokens.extend_from_slice(&[audio_end_token_id, TOK_IM_END, TOK_NEWLINE, TOK_IM_START]);
     if let Some(lang) = language {
-        // Python: base + f"language {force_language}<asr_text>"
-        // Prefilling through <asr_text> forces text-only generation (no meta loop).
         tokens.push(TOK_ASSISTANT);
         tokens.push(TOK_NEWLINE);
         let lang_str = format!("language {}", capitalize_first(lang));
@@ -78,8 +64,6 @@ pub(crate) fn build_prompt(
     Ok((tokens, asp))
 }
 
-// ─── Result parsing (Python parity) ───────────────────────────────
-
 pub(crate) fn decode_result(
     tokenizer: &tokenizers::Tokenizer,
     generated_ids: &[u32],
@@ -95,18 +79,12 @@ pub(crate) fn decode_result(
     })
 }
 
-/// Port of the reference processor's `_parse_single_output`
-/// (transformers' `Qwen3ASRProcessor`), which is what produced the gold texts —
-/// note it takes **no** forced-language argument: when a language is forced the
-/// metadata is part of the *prompt*, so the generated text carries none and the
-/// reported language is empty, exactly like the reference.
 pub(crate) fn parse_asr_output(raw: &str) -> (String, String) {
     if raw.trim().is_empty() {
         return (String::new(), String::new());
     }
     let mut s = raw.trim().to_string();
 
-    // The decoded string can still carry the prompt's assistant tail.
     if let Some(idx) = s.find("assistant\n") {
         s = s[idx + "assistant\n".len()..].to_string();
     }
@@ -115,18 +93,15 @@ pub(crate) fn parse_asr_output(raw: &str) -> (String, String) {
 
     const TAG: &str = "<asr_text>";
     let Some(pos) = s.find(TAG) else {
-        // No tag — treat the whole string as plain transcription.
         return (String::new(), s.trim().to_string());
     };
     let prefix = s[..pos].trim().to_string();
     let transcription = s[pos + TAG.len()..].trim().to_string();
 
-    // Empty-audio heuristic: "language None<asr_text>"
     if prefix.to_lowercase() == "language none" {
         return (String::new(), transcription);
     }
 
-    // Only the first non-empty line is inspected, and its value is used raw.
     let mut language = String::new();
     for line in prefix.lines() {
         let line = line.trim();
@@ -147,9 +122,6 @@ pub(crate) fn parse_asr_output(raw: &str) -> (String, String) {
     (language, transcription)
 }
 
-/// Port of transformers' `resolve_language` (`audio_utils.py`): accepts a
-/// language code (`"en"`, `"zh"`) or a full name (`"English"`), either case, and
-/// returns the canonical full name the forced-language suffix must use.
 pub(crate) fn resolve_language(language: &str) -> anyhow::Result<String> {
     let l = language.to_lowercase();
     for (code, name) in LANGUAGE_CODE_TO_NAME {
@@ -162,7 +134,6 @@ pub(crate) fn resolve_language(language: &str) -> anyhow::Result<String> {
     )
 }
 
-/// `LANGUAGE_CODE_TO_NAME` from the reference processor.
 pub(crate) const LANGUAGE_CODE_TO_NAME: [(&str, &str); 30] = [
     ("ar", "Arabic"),
     ("yue", "Cantonese"),
@@ -196,9 +167,6 @@ pub(crate) const LANGUAGE_CODE_TO_NAME: [(&str, &str); 30] = [
     ("vi", "Vietnamese"),
 ];
 
-/// `qwen_asr.inference.utils.SUPPORTED_LANGUAGES` — the canonical names the
-/// forced-language suffix may carry, in upstream's order.  (The processor's
-/// code map above holds the same 30 names, ordered by language code.)
 pub(crate) const SUPPORTED_LANGUAGES: [&str; 30] = [
     "Chinese", "English", "Cantonese", "Arabic", "German", "French", "Spanish", "Portuguese",
     "Indonesian", "Italian", "Korean", "Russian", "Thai", "Vietnamese", "Japanese", "Turkish",
@@ -206,17 +174,12 @@ pub(crate) const SUPPORTED_LANGUAGES: [&str; 30] = [
     "Persian", "Greek", "Romanian", "Hungarian", "Macedonian",
 ];
 
-/// Port of Python `detect_and_fix_repetitions` (threshold default 20).
-///
-/// `max_pattern_len` is upstream's 20: a longer window collapses repeats the
-/// reference leaves alone, which is a behaviour difference, not an improvement.
 pub(crate) fn detect_and_fix_repetitions(text: &str, threshold: usize) -> String {
     let text = fix_char_repeats(text, threshold);
     fix_pattern_repeats(&text, threshold, 20)
 }
 
 fn fix_char_repeats(s: &str, thresh: usize) -> String {
-    // Operate on Unicode scalars like Python `str`.
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len();
     let mut res = String::new();
@@ -307,8 +270,6 @@ mod tests {
 
     #[test]
     fn force_language_prompt_ends_with_asr_text_sep() {
-        // Token sequence must include ASR_TEXT_SEP after language (Python parity).
-        // Use a minimal fake: just assert constant wiring via a synthetic check.
         assert_eq!(ASR_TEXT_SEP_TOKEN_ID, 151704);
     }
 
@@ -324,7 +285,6 @@ mod tests {
         let unit = "你好世界";
         let s = unit.repeat(25);
         let out = fix_pattern_repeats(&s, 20, 20);
-        // Collapses to a single unit (or short prefix of units depending on k search).
         assert!(out.len() < s.len());
         assert!(out.contains("你好") || out == unit);
     }

@@ -21,42 +21,21 @@ against the frozen python-hf text) on every runtime this machine has:
 | `vulkan:1` | Intel iGPU | 9176 | 14816 | 25062 | 49 s | 3.6× | MATCH |
 | `gl:0` | Intel iGPU (OpenGL) | 7083 | 12131 | 29992 | 51 s | 3.46× | MATCH |
 
-A caveat that costs more than any of the above: on **D3D12 the pipeline build takes
-~5.5 minutes** (measured: 344 s on Intel, 328 s on NVIDIA, against 4.6 / 6.6 s on
-Vulkan for their own Vulkan adapters) — wgpu goes through naga → HLSL → FXC, and
-these kernels are heavily unrolled with the bit-exact integer `expf_bt` on the
-critical path, which is what FXC is slowest at (~40 pipelines x ~8 s).  The
-timings in this table are *after* that load.
+On **D3D12 the pipeline build takes ~5.5 minutes** (344 s on Intel, 328 s on
+NVIDIA, against 4.6 / 6.6 s on Vulkan for their own Vulkan adapters), and wgpu
+30's D3D12 backend does not expose `Features::PIPELINE_CACHE`, so it cannot be
+cached away there.  The timings above are *after* that load; D3D12 stays a
+fallback for when Vulkan is unavailable, and `vulkan:N` is the practical choice.
 
-The engine now *does* persist compiled pipelines (`VkPipelineCache` /
-`ID3D12PipelineLibrary`) when the runtime offers the capability — `--list-devices`
-prints `pso-cache yes|no` per target — but on this stack that is **Vulkan-only**:
-wgpu 30's D3D12 backend does not expose `Features::PIPELINE_CACHE`, so the 5.5
-minutes cannot be cached away there.  The near-identical cost on two different
-vendors also points at naga's HLSL translation (CPU, vendor-independent) rather
-than the driver's compiler.  D3D12 therefore stays a *fallback for when Vulkan is
-unavailable*, and the practical advice is: prefer `vulkan:N`.
-
-`cpu` is the host decoder (`--cpu-dec`): no adapter, f16 weights widened to f32
+`cpu` is the host backend (`--cpu-dec`): no adapter, f16 weights widened to f32
 once at load, rayon over output rows and over `(row, head)` in the attention.
-`src/cpu_decoder.rs` records the five measured pathologies that shaped it, each
-with its number: 355 ms/token when the GEMV was sliced by batch (decode is
-batch 1); 5.5 s of prefill when it was sliced by `(row, output)` and re-read the
-weights per row instead of streaming them once; 5.4 s of prefill when the
-`f16 → f32` conversion sat inside the inner loop; 18 s of a 34 s prefill when
-the attention converted the f16 caches per key per query row; and 136 ms/token
-when the attention was parallelised per row (a decode step *is* one row) instead
-of per `(row, head)`.  The prefill's GEMMs go through the `gemm` crate (`gemm_row_major`,
-`Parallelism::Rayon(0)`), the decode's single-row GEMVs stay hand-rolled.  Its
-six-fixture RTFx: 4.25 / 3.77 / 3.95 / 4.17 / 3.61 / 3.47 (15 s … 180 s).
+Its six-fixture RTFx: 4.25 / 3.77 / 3.95 / 4.17 / 3.61 / 3.47 (15 s … 180 s).
 
-One portability bug had to be fixed to get there, and it is the best argument for
-this table existing: `Features::SUBGROUP` is a *capability*, not a width.  Intel's
-Vulkan driver grants it with `subgroup_min_size..max_size = 8..32`, the 32-lane
-xor butterfly then reduced across the wrong lanes, and the model produced fluent
-garbage with no error anywhere — the transcript was the only symptom.  Shuffle
-paths are now gated on the adapter promising exactly 32 lanes (the shared-memory
-fallback is bit-identical); see `docs/PORTING.md` trap 10.
+`Features::SUBGROUP` is a capability, not a width: some drivers grant it with
+`subgroup_min_size..max_size = 8..32`, where a 32-lane xor butterfly reduces
+across the wrong lanes and the model produces fluent garbage with no error
+anywhere.  Shuffle paths are gated on the adapter promising exactly 32 lanes;
+the shared-memory fallback is bit-identical.
 
 ```
 wav ──► mel (STFT, 128 bins) ──► audio tower (conv stem + 18 transformer layers)
@@ -78,11 +57,9 @@ wav ──► mel (STFT, 128 bins) ──► audio tower (conv stem + 18 transfo
 | **Long audio** | a **15-minute** clip transcribes end to end — 12 065-token prompt, 3 343-token transcript, 98 s, ~5.5 GiB peak, RTFx 9.4 |
 | **Not ported** | time stamps (`Qwen3-ForcedAligner` is a second model), batching, the vLLM backend |
 
-Long audio is the interesting case: the reference materialises the `s²`
-attention matrix, which at 15 minutes is 2 × 4.7 GB and does not fit an 8 GB
-card (the Python SDPA path OOMs there on Pascal). This port tiles the prefill
-attention into key slabs (`docs/design-tiled-prefill.md`), which is what turns
-"refused" into "runs".
+Long audio is the interesting case: materialising the `s²` attention matrix at 15
+minutes is 2 × 4.7 GB and does not fit an 8 GB card. This port tiles the prefill
+attention into key slabs, which is what turns "refused" into "runs".
 
 ## Quick start
 
@@ -105,6 +82,56 @@ Useful flags: `--lang en` (force a language; ISO code or full name), `--context`
 `--cpu-enc` (CPU audio tower, for A/B), `--baseline file.txt` (compare against a
 frozen reference text), `--dump dir/` (mel/embeddings/ids).
 
+### Library use
+
+```rust
+use qwen3_asr_wgpu::{AsrInference, Backend, TranscribeOptions};
+
+let asr = AsrInference::load("Qwen3-ASR-0.6B-hf".as_ref(), Backend::best())?;
+let out = asr.transcribe("clip.wav", TranscribeOptions::default())?;
+println!("[{}] {}", out.language, out.text);
+```
+
+`AsrInference` owns the model and every method takes `&self`, so one instance can
+be *shared* rather than duplicated — 0.6B's weights are ~1.2 GiB and each copy
+would carry its own KV cache too:
+
+```rust
+let asr = std::sync::Arc::new(AsrInference::load(dir, Backend::best())?);
+let worker = std::sync::Arc::clone(&asr);
+std::thread::spawn(move || worker.transcribe("clip.wav", TranscribeOptions::default()));
+```
+
+Concurrent calls serialize on the internal mutex; a transcription is not split
+across threads. Everything else is per-call state — each generation prefills its
+own prompt from KV position zero, so nothing leaks between calls.
+
+Errors are one enum, `AsrError` (`ModelLoad`, `AudioDecode`, `Inference`,
+`InvalidOptions`), with `Result<T>` as the alias every entry point returns.
+
+`TranscribeOptions` carries the whole request — `language` (ISO code or full
+name, validated against the 30 supported ones), `context` (the hotwords that
+become the chat template's `system` message) and `max_new_tokens` (default
+2048). There is no second, positional copy of the ceiling to fall out of sync
+with. The struct is `#[non_exhaustive]` and has `with_*` setters:
+
+```rust
+let opts = TranscribeOptions::default()
+    .with_language("zh")
+    .with_context("Swing trading course. Terms: order block, time frame, …")
+    .with_max_new_tokens(700);
+```
+
+When a language is forced the result reports it back in
+`TranscribeResult::language`; with auto-detection the field is whatever the model
+named. Streaming is the same picture — `transcribe_streaming` takes a per-token
+callback, and `create_streaming_session` takes audio incrementally
+(`push_samples` → `flush`).
+
+With `features = ["hub"]`, `AsrInference::from_pretrained(model_id, cache_dir, backend)`
+downloads `Qwen/Qwen3-ASR-0.6B` (or `1.7B`) and loads it; the `hub` feature is
+off by default because it pulls in reqwest and TLS.
+
 ### Choosing the runtime and device
 
 The selectable axis is the **runtime**, with an optional index for machines that
@@ -122,34 +149,43 @@ cargo run --release --bin transcribe -- --list-devices
 #   dx12:1     Intel(R) Graphics (Intel, iGPU, ...) binding 2047 MiB, no subgroup
 #   gl:0       Intel(R) Graphics (Intel, iGPU, ...) binding 1024 MiB, no subgroup
 #   dx12:3     Microsoft Basic Render Driver (Microsoft, CPU, ...)
-#   cpu        (not implemented yet — see the CPU section of HANDOFF.md)
+#   cpu        the host backend (CPU audio tower + CPU text decoder)
 
 cargo run --release --bin transcribe -- --device vulkan:1 …   # iGPU through Vulkan
 cargo run --release --bin transcribe -- --device dx12:0 …     # dGPU through D3D12
 ```
 
 The runtimes are `vulkan`, `metal`, `dx12`, `gl` (the four wgpu drives) and
-`cpu` (our own implementation, still to come).  There is deliberately **no
-`cuda` and no `dml`**: this crate has no CUDA backend, and wgpu drives Windows
-through D3D12 *compute* — DirectML is a different API that would be a separate
-integration.  `gl` is wgpu's compatibility runtime (OpenGL/GLES, weakest feature
-set); it is kept in the list because old machines only have it, and it is
-verified here.
+`cpu` (our own host implementation).  There is deliberately **no `cuda` and no
+`dml`**: this crate has no CUDA backend, and wgpu drives Windows through D3D12
+*compute* — DirectML is a different API that would be a separate integration.
+`gl` is wgpu's compatibility runtime (OpenGL/GLES, weakest feature set); it is
+kept in the list because old machines only have it.
+
+**What is verified where.** Everything above was measured on Windows + NVIDIA.
+The Vulkan, D3D12, GL and host paths are all gated on this machine; the Metal
+path has not been run anywhere.  Nothing in the engine is Windows- or
+NVIDIA-specific — the shaders are WGSL, the device is whatever
+`DeviceSelector` picks, and `build.rs` builds the vendored resampler with CMake
+on any platform — but "not verified" is not "works", and the first run on a new
+runtime is where a driver-specific surprise would show up.  The likely one is
+subgroup handling: shuffle paths are gated on the adapter promising exactly 32
+lanes, and the shared-memory fallback is bit-identical, so an adapter that
+reports something else takes the slow-but-correct path.
 
 ```rust
-use qwen3_asr_wgpu::{DeviceSelector, WgpuAsr};
+use qwen3_asr_wgpu::{AsrInference, DeviceSelector};
 
-for t in WgpuAsr::device_targets() { println!("{}", t.describe()); }  // no device created
-let asr = WgpuAsr::load_on("model-dir".as_ref(),
-                           DeviceSelector::Runtime { api: wgpu::Backend::Vulkan, index: 1 })?;
+for t in AsrInference::device_targets() { println!("{}", t.describe()); }  // no device created
+let asr = AsrInference::load_on("model-dir".as_ref(),
+                                DeviceSelector::Runtime { api: wgpu::Backend::Vulkan, index: 1 })?;
 println!("running on {}", asr.device_description());
 ```
 
 `--adapter <name>` (the older spelling) still works and is the last-resort
 substring form.  Whatever a target grants — binding limit, workgroup storage,
 subgroup width — the engine reads from the *negotiated* limits, so a target that
-cannot run a given clip is refused explicitly rather than producing garbage
-(that refusal is what the tiling in `docs/design-tiled-prefill.md` is about).
+cannot run a given clip is refused explicitly rather than producing garbage.
 
 ### The reference pipeline's API
 
@@ -158,46 +194,46 @@ The Python side is three steps — `processor.apply_transcription_request(...)`,
 and so is this crate ([`src/processor.rs`](src/processor.rs)):
 
 ```rust
-use qwen3_asr_wgpu::{ReturnFormat, TranscribeOptions, WgpuAsr};
+use qwen3_asr_wgpu::{AsrInference, Backend, ReturnFormat, TranscribeOptions};
 
-let mut asr = WgpuAsr::load("Qwen3-ASR-0.6B-hf".as_ref(), Some("nvidia"))?;
-let opts = TranscribeOptions::default();                 // language, context/prompt
+let asr = AsrInference::load("Qwen3-ASR-0.6B-hf".as_ref(), Backend::best())?;
+let opts = TranscribeOptions::default().with_max_new_tokens(512);  // + language, context
 
 let req  = asr.apply_transcription_request_file("clip.wav".as_ref(), &opts)?;
-let ids  = asr.generate(&req, 512)?;                     // greedy, stops at EOS
+let ids  = asr.generate(&req)?;                          // greedy, stops at EOS
 let out  = asr.decode(&ids, ReturnFormat::Parsed)?;      // {"language", "transcription"}
 println!("{}: {}", out.language().unwrap_or("?"), out.transcription_text());
 ```
 
+`max_new_tokens` rides in the request's options rather than being passed again to
+`generate`, so the ceiling is fixed where the request is built — the same rule
+`transcribe` follows.
+
 `decode` implements all three upstream formats (`Raw`, `Parsed`,
 `TranscriptionOnly`) with the reference's exact semantics — including
-`Raw` keeping the special tokens and `Parsed` dropping them. The convenience
-wrappers (`transcribe_file_opts`, streaming, sessions) are thin layers over the
-same internals; `#[ignore]`d test `upstream_api_matches_the_one_call_wrapper`
-pins them together.
+`Raw` keeping the special tokens and `Parsed` dropping them. Note that `decode`
+reports the language the *model* named, which is the reference's
+`_parse_single_output`: when the language was forced the metadata lives in the
+prompt and the field is empty. `transcribe` fills it in from the request instead
+— the one place the two disagree. The `#[ignore]`d test
+`processor_api_matches_the_one_call_wrapper` pins them together.
 
-## Parity gates
+## Verification
 
-Everything is verified against the *reference*, not against itself:
-
-```powershell
-powershell -File tools/verify_all.ps1          # 12 runs: 2 models × 6 clips, text vs frozen python-hf
-QASR_SLAB=on powershell -File tools/verify_all.ps1 -SkipTiming   # same, forced through the slab attention
-```
-
-* `tools/verify_all.ps1` — the gate above; also prints per-phase timings and the
-  SM clock (this machine's P104 boosts/drops between 1151/1607/1911 MHz, so
-  numbers are only comparable at the same clock).
-* `cargo run --release --bin prefill_check -- --tag q06_90s_en` — the layer-by-layer
-  check against a CUDA golden: KV cache, prefill logits, first token, and a
-  51-step decode continuation that must be *identical*.
+* `cargo test --release` — the pure-CPU half (tokenizer / prompt / mel geometry,
+  config parsing).
+* `cargo test --release --test public_api -- --ignored` — the public API against
+  a real model: the frozen-text check, `Backend::Cpu`, the incremental session,
+  and one instance serving two threads.  Needs
+  `QASR_TEST_MODEL` / `QASR_TEST_WAV`, and `QASR_TEST_BASELINE` for the
+  verbatim comparison.
+* `cargo run --release --bin transcribe -- --model <dir> --wav clip.wav
+  --adapter nvidia --max-new 512 --baseline frozen.txt` — the whole pipeline,
+  with a verbatim comparison against a frozen reference transcript
+  (`MATCH` / `MISMATCH`).
 * `cargo run --release --bin transcribe -- --diag-enc` — the audio tower's own
-  oracle (stage-by-stage vs the CPU reference, including a host recomputation of
-  attention operands).
-* `cargo test` — the pure-CPU half (tokenizer/prompt/mel geometry, 24 tests).
-
-`docs/PORTING.md` explains why these gates look the way they do and what a port
-to another runtime has to preserve.
+  oracle: stage by stage against the host reference, including a host
+  recomputation of the attention operands.
 
 ## Measured envelope
 
@@ -217,8 +253,7 @@ attention needs 398 MB at 15 minutes instead of 2 × 4.7 GB.
 Where the time goes at 15 minutes: decode 78 % (the KV scan is instruction-bound,
 not bandwidth-bound: ~86 GB/s effective against ~250 GB/s available), prefill
 17 % (60 % of it the two attention GEMMs, already at this card's ~2.1 TFLOP/s
-ceiling), audio tower 5 % (at its weight-bandwidth roofline). `HANDOFF.md` and
-`docs/design-tiled-prefill.md` carry the ablation tables behind those numbers.
+ceiling), audio tower 5 % (at its weight-bandwidth roofline).
 
 ## Source map
 
@@ -229,24 +264,15 @@ ceiling), audio tower 5 % (at its weight-bandwidth roofline). `HANDOFF.md` and
 | `src/audio_encoder_gpu.rs` | GPU audio tower: conv stem, window packing, 18 transformer layers |
 | `src/decoder.rs` | text decoder: GEMV decode path, prefill (GEMM chain + attention), KV cache |
 | `src/shaders.rs` | every WGSL kernel, generated as Rust string functions with the invariants spelled out |
-| `src/inference.rs` | orchestration: model load, mel → tower → prompt → prefill → decode, streaming sessions, diagnostics |
+| `src/inference.rs` | the engine (`Inner`) and its public handle `AsrInference`: model load, mel → tower → prompt → prefill → decode |
+| `src/backend.rs` | `Backend` — the one-word backend choice |
+| `src/error.rs` | `AsrError` / `Result`, the public error type |
+| `src/streaming.rs` | incremental sessions (`create_streaming_session` → `push_samples` → `flush`) |
+| `src/diagnostics.rs` | probe and dump hooks — engine internals, deliberately not on `AsrInference` |
+| `src/hub.rs` | HuggingFace download (`hub` feature) |
 | `src/processor.rs` | the reference processor API (`apply_transcription_request` / `generate` / `decode`) |
 | `src/prompt.rs` | chat template + the reference's output parsing (`language X<asr_text>…`) |
-| `src/bin/` | `transcribe` (CLI) and ~15 probes/benches — see `docs/PORTING.md` |
-| `cuda_ref/` | the little CUDA program that produced the golden dumps `prefill_check` diffs against |
-
-## Documentation
-
-| doc | for |
-|---|---|
-| `docs/PORTING.md` | **start here if you are porting this to another runtime**: the invariants, the traps, the dead ends |
-| `docs/design-tiled-prefill.md` | the long-context attention: design, as-built, measurements, eight traps |
-| `FEASIBILITY.md` | the original go/no-go: what wgpu can and cannot express, with numbers |
-| `ROADMAP-wgpu.md` | the port's phase history |
-| `docs/wgpu-best-practices-audit.md` | wgpu-specific findings (batching, descriptors, subgroup experiments) |
-| `docs/decode-splitk-analysis.md` | why the decode GEMVs cannot be K-split bit-exactly, and what to tune instead |
-| `docs/eval-fleurs*.md` | WER/CER + RTFx against the Python reference on 29 languages |
-| `HANDOFF.md` | the live lab notebook (Chinese): current state, bug archaeology, dead ends, next steps |
+| `src/bin/` | `transcribe` (CLI) and 11 probes / benches |
 
 ## License
 

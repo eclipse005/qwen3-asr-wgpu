@@ -1,6 +1,3 @@
-//! End-to-end transcribe: CPU audio encoder + wgpu text decoder.
-//! Alignment target is the Python Transformers-native `-hf` greedy baseline.
-
 use std::path::Path;
 use std::time::Instant;
 
@@ -10,6 +7,7 @@ use tokenizers::Tokenizer;
 
 use crate::audio_encoder::CpuAudioEncoder;
 use crate::audio_encoder_gpu::GpuAudioEncoder;
+use crate::backend::Backend;
 use crate::config::AsrConfig;
 use crate::decoder::{TextConfig, WgpuTextDecoder};
 use crate::gpu::{DeviceSelector, Gpu};
@@ -18,202 +16,18 @@ use crate::mrope::{compute_mrope_cos_sin, text_positions};
 use crate::prompt::{self, TranscribeResult, ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID};
 use crate::weights;
 
-/// KV + MRoPE size: 16 key slabs (`decoder::SLAB_T`) — a 15-minute clip plus its
-/// transcript, i.e. ~16 min of audio end to end.
-///
-/// Until the prefill attention was tiled, the real cap was the per-binding limit
-/// on the O(s²) `scores`/`attn` scratch (~8 200 tokens here), and this constant
-/// only had to stay above that guard.  The slabbed path is O(s · T) per head, so
-/// the binding limit is no longer what bounds the sequence — the KV cache is
-/// (nkvh · s · hd · 2 bytes per layer per K and V, ~1.9 GiB across 28 layers at
-/// this cap).  Both limits are checked where they bite: `prefill` before it
-/// allocates, and the caller below before it prompts.
 const DECODER_MAX_SEQ: usize = 16384;
 
 /// Which audio-tower implementation a [`WgpuAsr`] runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncoderBackend {
-    /// Host f32 reference (`gemm` crate + rayon).  Kept for A/B and regression
-    /// work — every fixture is bit-matched against it.
     Cpu,
-    /// wgpu audio tower — the **default** (see [`WgpuAsr::load`]); falls back to
-    /// [`EncoderBackend::Cpu`] if the GPU tower cannot be built (with a printed
-    /// reason).  No GPU device at all is not a case this has to handle: the text
-    /// decoder needs one before the encoder is even built.
     Gpu,
 }
 
-/// Incremental audio in, text at [`StreamingSession::flush`] — the same shape
-/// as the reference port's `AsrStreamingSession`.
-///
-/// Audio is encoded as it arrives, in whole attention windows (104 tokens =
-/// 8 conv chunks = 800 mel frames), which is exactly the granularity the
-/// encoder is independent at: the conv stem runs per chunk, the attention is
-/// windowed, and a window is a whole multiple of `tpc`, so the positional
-/// embedding's `tok % tpc` phase matches the whole-clip pass.  `flush` reuses
-/// the ordinary decode path.
-///
-/// The mel *frames* are bit-identical to the whole-clip pass (a slice that
-/// starts `n_fft/2` of samples early reproduces them exactly — see
-/// [`Self::encode_window`]).  What a stream cannot reproduce is the
-/// extractor's log-mel max normalization, which is a property of the whole
-/// call: each window is normalized against its own max, so its values sit up
-/// to `(M_whole − M_window) / 4` below the whole-clip ones.  Measured on
-/// 0.6B: text identical to the whole-clip run on 5 of the 6 fixtures,
-/// `180s_zh` differs by two `，`→`。` and a dropped `嗯，`.  The reference port
-/// has the same class of deviation, and no live stream can know the final max
-/// in advance.
-pub struct StreamingSession<'a> {
-    asr: &'a mut WgpuAsr,
-    opts: TranscribeOptions,
-    max_new_tokens: usize,
-    /// Un-consumed 16 kHz samples; `samples[0]` is global sample `base`.
-    samples: Vec<f32>,
-    base: usize,
-    /// Next global mel frame to encode.
-    frame: usize,
-    embeds: Vec<f32>,
-    n_mels: usize,
-    out_dim: usize,
-    /// Mel frames in one attention window (`cs · n_window_infer/cs`).
-    win_frames: usize,
-}
-
-impl WgpuAsr {
-    /// Start an incremental session (audio in via [`StreamingSession::push_samples`]).
-    pub fn create_streaming_session(
-        &mut self,
-        opts: TranscribeOptions,
-        max_new_tokens: usize,
-    ) -> Result<StreamingSession<'_>> {
-        let (cs, n_window_infer, n_mels, out_dim) = {
-            let ac = &self.config.thinker_config.audio_config;
-            (ac.n_window * 2, ac.n_window_infer, ac.num_mel_bins, ac.output_dim)
-        };
-        let win_frames = cs * (n_window_infer / cs).max(1);
-        Ok(StreamingSession {
-            asr: self,
-            opts,
-            max_new_tokens,
-            samples: Vec::new(),
-            base: 0,
-            frame: 0,
-            embeds: Vec::new(),
-            n_mels,
-            out_dim,
-            win_frames,
-        })
-    }
-}
-
-impl StreamingSession<'_> {
-    /// Feed more 16 kHz mono audio; every complete window is encoded on the way in.
-    pub fn push_samples(&mut self, samples: &[f32]) -> Result<()> {
-        self.samples.extend_from_slice(samples);
-        loop {
-            // The window covers global frames `[frame, frame + win_frames)`; its
-            // last frame needs samples up to `(f_last)·hop + n_fft/2`.
-            let f_last = self.frame + self.win_frames - 1;
-            let need_end = f_last * HOP_LENGTH + N_FFT / 2;
-            if self.base + self.samples.len() < need_end {
-                break;
-            }
-            self.encode_window(Some(self.win_frames))?;
-        }
-        Ok(())
-    }
-
-    /// Encode the remaining audio and decode the text.
-    pub fn flush(&mut self) -> Result<TranscribeResult> {
-        self.flush_streaming(|_| {})
-    }
-
-    /// [`Self::flush`] with a per-token callback.
-    pub fn flush_streaming<F>(&mut self, mut on_token: F) -> Result<TranscribeResult>
-    where
-        F: FnMut(StreamToken),
-    {
-        // Encode whatever is left (a partial window is fine — that is what the
-        // whole-clip path does for its tail chunk too).  The extractor makes
-        // `len / hop` frames for `len` samples, over the whole stream pushed so
-        // far: `base + samples.len()`.
-        let total_frames = (self.base + self.samples.len()) / HOP_LENGTH;
-        if total_frames > self.frame {
-            self.encode_window(None)?;
-        }
-        let embeds = std::mem::take(&mut self.embeds);
-        self.asr.decode_from_audio_embeds(
-            &embeds,
-            self.max_new_tokens,
-            None,
-            0.0,
-            0.0,
-            &self.opts.clone(),
-            Some(&mut on_token),
-        )
-    }
-
-    /// Encode `n_frames` frames starting at `self.frame` (or all that the buffer
-    /// holds, when `None`) and append the result.
-    ///
-    /// The mel is recomputed for just this slice: `MelExtractor` frames depend
-    /// on `±n_fft/2` samples, so a slice that starts an integral number of hops
-    /// before the first frame we keep reproduces the whole-clip frames exactly
-    /// (frames whose 400-sample window would touch the slice's own reflection
-    /// are dropped — two of them, or none at the very start of the stream).
-    /// The extractor's per-call max normalization is the one thing that differs;
-    /// see the [`StreamingSession`] docs.
-    fn encode_window(&mut self, n_frames: Option<usize>) -> Result<()> {
-        let f0 = self.frame;
-        let want_from = f0 * HOP_LENGTH;
-        let slice_start = want_from.saturating_sub(2 * HOP_LENGTH);
-        let drop = (want_from - slice_start) / HOP_LENGTH;
-        let hi = match n_frames {
-            Some(n) => {
-                let end = (f0 + n - 1) * HOP_LENGTH + N_FFT / 2;
-                anyhow::ensure!(end <= self.base + self.samples.len(), "stream slice past the buffer");
-                end - self.base
-            }
-            None => self.samples.len(),
-        };
-        let lo = slice_start - self.base;
-        let (mel, n_mels, frames) = self.asr.mel.extract(&self.samples[lo..hi])?;
-        anyhow::ensure!(n_mels == self.n_mels, "mel bins {n_mels} != {}", self.n_mels);
-        let n = match n_frames {
-            Some(n) => n,
-            None => frames.saturating_sub(drop),
-        };
-        anyhow::ensure!(n > 0 && frames >= drop + n, "mel slice too short ({frames} frames, need {})", drop + n);
-
-        let mut win = vec![0.0f32; self.n_mels * n];
-        for m in 0..self.n_mels {
-            let src = m * frames + drop;
-            win[m * n..(m + 1) * n].copy_from_slice(&mel[src..src + n]);
-        }
-        let embeds = self.asr.run_encoder(&win, self.n_mels, n, false)?;
-        let tokens = embeds.len() / self.out_dim;
-        anyhow::ensure!(embeds.len() == tokens * self.out_dim, "encoder output not a whole number of tokens");
-        self.embeds.extend_from_slice(&embeds);
-        self.frame += n;
-
-        // Drop what can no longer be needed: the next slice starts two hops
-        // before the next window's first frame.
-        let keep_from = (self.frame * HOP_LENGTH).saturating_sub(2 * HOP_LENGTH);
-        if keep_from > self.base {
-            self.samples.drain(..(keep_from - self.base));
-            self.base = keep_from;
-        }
-        Ok(())
-    }
-
-    /// Tokens encoded so far (one per audio token; the prompt adds the rest).
-    pub fn encoded_tokens(&self) -> usize {
-        self.embeds.len() / self.out_dim
-    }
-}
-
-/// One incremental decode event, mirroring the reference port's `StreamToken`
-/// (`qwen3-asr-rs`'s `transcribe_streaming` callback).
+/// One incremental decode event: the token id the decoder just produced and the
+/// raw text so far.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct StreamToken {
     /// The token id the decoder just produced.
@@ -224,11 +38,36 @@ pub struct StreamToken {
     pub text_so_far: String,
 }
 
-/// The languages the forced-language suffix accepts, in upstream's order
+/// The languages the forced-language suffix accepts, in the reference's order
 /// (`qwen_asr.inference.utils.SUPPORTED_LANGUAGES` / the processor's
 /// `LANGUAGE_CODE_TO_NAME` values — the two lists are the same 30 names).
 pub fn supported_languages() -> &'static [&'static str] {
     &prompt::SUPPORTED_LANGUAGES
+}
+
+/// Pick a local checkpoint directory for `"0.6B"` / `"1.7B"`.
+///
+/// Order: the `QWEN3_ASR_MODEL_06_DIR` / `QWEN3_ASR_MODEL_17_DIR` environment
+/// override, then `root/models/Qwen3-ASR-{size}-hf`, then
+/// `root/models/Qwen3-ASR-{size}`.  The `-hf` suffix marks the
+/// transformers-native checkpoint the frozen baselines were made with.
+#[must_use]
+pub fn resolve_model_dir(root: &Path, size: &str) -> std::path::PathBuf {
+    let env_key = match size {
+        "0.6B" => "QWEN3_ASR_MODEL_06_DIR",
+        "1.7B" => "QWEN3_ASR_MODEL_17_DIR",
+        _ => "",
+    };
+    if !env_key.is_empty() {
+        if let Ok(p) = std::env::var(env_key) {
+            return std::path::PathBuf::from(p);
+        }
+    }
+    let hf = root.join(format!("models/Qwen3-ASR-{size}-hf"));
+    if hf.join("config.json").is_file() {
+        return hf;
+    }
+    root.join(format!("models/Qwen3-ASR-{size}"))
 }
 
 fn emit_token(
@@ -243,29 +82,74 @@ fn emit_token(
     Ok(())
 }
 
-/// Round-to-even pad of a width — mirrors `audio_encoder_gpu`'s mel stride.
 fn mel_pad_even(v: usize) -> usize {
     if v % 2 == 1 { v + 1 } else { v }
 }
 
-/// Per-request knobs, mirroring upstream `Qwen3ASRModel.transcribe(audio,
+/// Per-request knobs, mirroring `Qwen3ASRModel.transcribe(audio,
 /// context=…, language=…)`.  `context` is the hotword/bias text and goes into
 /// the chat template's **system** message; `language` forces text-only output by
 /// prefilling `language {Language}<asr_text>` after the assistant header.
-#[derive(Debug, Clone, Default)]
+///
+/// Every entry point that takes these reads `max_new_tokens` from here — there
+/// is no second, positional copy of it to fall out of sync with.
+///
+/// `#[non_exhaustive]` on purpose: fields get added (this one did), and a
+/// harmless struct-literal at a call site would then be a breaking change.
+/// Build one with [`TranscribeOptions::default`] plus the `with_*` setters.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
 pub struct TranscribeOptions {
+    /// Hotword / bias text — the content of the chat template's `system` turn.
+    /// Empty means "no context", which is what the frozen baselines were made
+    /// with.
     pub context: String,
     /// `None` = let the model detect it.  Normalised and validated against
-    /// [`prompt::SUPPORTED_LANGUAGES`] on use, like upstream.
+    /// [`prompt::SUPPORTED_LANGUAGES`] on use: a code (`"en"`) or
+    /// a full name (`"English"`), either case.
     pub language: Option<String>,
+    /// Upper bound on generated tokens (the stop is EOS, as in HF `generate`).
+    /// The default matches common product / transformers use (2048).
+    pub max_new_tokens: usize,
+}
+
+impl Default for TranscribeOptions {
+    fn default() -> Self {
+        Self {
+            context: String::new(),
+            language: None,
+            max_new_tokens: 2048,
+        }
+    }
 }
 
 impl TranscribeOptions {
-    /// The canonical language name to prompt with, or `None` when the caller did
-    /// not force one.  Mirrors the reference processor: a code (`"en"`) or a full
-    /// name (`"English"`), either case, resolved to the canonical name; anything
-    /// else is rejected.
-    fn forced_language(&self) -> Result<Option<String>> {
+    /// Bias the transcription towards a domain — the chat template's `system`
+    /// message.  See the hotword notes in `README.md` for what this does and
+    /// does not buy.
+    #[must_use]
+    pub fn with_context(mut self, context: impl Into<String>) -> Self {
+        self.context = context.into();
+        self
+    }
+
+    /// Force the output language, text-only (no language metadata turn).
+    /// Accepts a code or a full name; an unsupported one fails at the call, not
+    /// here, so the setter stays infallible like the other two.
+    #[must_use]
+    pub fn with_language(mut self, language: impl Into<String>) -> Self {
+        self.language = Some(language.into());
+        self
+    }
+
+    /// Replace the generated-token ceiling.
+    #[must_use]
+    pub fn with_max_new_tokens(mut self, n: usize) -> Self {
+        self.max_new_tokens = n;
+        self
+    }
+
+    pub(crate) fn forced_language(&self) -> anyhow::Result<Option<String>> {
         let Some(raw) = self.language.as_deref() else {
             return Ok(None);
         };
@@ -276,14 +160,11 @@ impl TranscribeOptions {
     }
 }
 
-/// The global chunk index a captured round starts at.
 fn ch0_of(cap: &crate::audio_encoder_gpu::Capture, r: &crate::audio_encoder_gpu::ConvRound) -> usize {
     let _ = cap;
     r.chunk0
 }
 
-/// Per-stage difference accumulator: max, rms, and how many elements exceed the
-/// tolerance, with the first offender for a legible failure.
 #[derive(Default)]
 struct Diff {
     max: f32,
@@ -322,12 +203,7 @@ impl Diff {
     }
 }
 
-/// Which text decoder this instance runs: the wgpu one, or the host one.
-///
-/// Both expose the same three things the caller needs — `prefill`, `step` and
-/// `max_seq` — so the rest of the engine is backend-agnostic; only the
-/// diagnostics and the per-op timings differ (the CPU path has neither).
-enum TextBackend {
+pub(crate) enum TextBackend {
     Gpu(WgpuTextDecoder),
     Cpu(crate::cpu_decoder::CpuTextDecoder),
 }
@@ -361,8 +237,6 @@ impl TextBackend {
         }
     }
 
-    /// `(host submit, host read)` milliseconds — the GPU decoder's split of the
-    /// per-step host time.  The CPU path has no submits to account for.
     fn host_ms(&self) -> (f64, f64) {
         match self {
             Self::Gpu(d) => (d.host_submit_ms, d.host_read_ms),
@@ -370,15 +244,6 @@ impl TextBackend {
         }
     }
 
-    fn describe(&self) -> String {
-        match self {
-            Self::Gpu(d) => format!("gpu ({})", d.gpu.info.name),
-            Self::Cpu(d) => d.describe(),
-        }
-    }
-
-    /// Both decoders take the same f16-rounded tables, so the rotation the model
-    /// sees does not depend on the backend.
     fn set_rope_tables(&mut self, cos: &[f16], sin: &[f16]) {
         match self {
             Self::Gpu(d) => d.set_rope_tables(cos, sin),
@@ -387,42 +252,272 @@ impl TextBackend {
     }
 }
 
-pub struct WgpuAsr {
-    config: AsrConfig,
-    tokenizer: Tokenizer,
-    encoder: CpuAudioEncoder,
-    /// `None` when the tower is unavailable (or `--cpu-enc` was given).
-    gpu_encoder: Option<GpuAudioEncoder>,
-    mel: MelExtractor,
-    tensors: std::collections::HashMap<String, weights::RawTensor>,
-    decoder: TextBackend,
+pub(crate) struct Inner {
+    pub(crate) config: AsrConfig,
+    pub(crate) tokenizer: Tokenizer,
+    pub(crate) encoder: CpuAudioEncoder,
+    pub(crate) gpu_encoder: Option<GpuAudioEncoder>,
+    pub(crate) mel: MelExtractor,
+    pub(crate) tensors: std::collections::HashMap<String, weights::RawTensor>,
+    pub(crate) decoder: TextBackend,
 }
 
-impl WgpuAsr {
-    /// Loads on the GPU audio tower (the default; it falls back to the CPU tower
-    /// by itself if the device cannot build it).
-    pub fn load(model_dir: &Path, adapter: Option<&str>) -> Result<Self> {
-        Self::load_with(model_dir, adapter, EncoderBackend::Gpu)
+/// A loaded Qwen3-ASR model — the crate's entry point.
+///
+/// One `AsrInference` owns every device object, weight mapping and scratch
+/// buffer the model needs, and serializes access behind a mutex.  That is what
+/// lets one instance be shared rather than duplicated (the weights are ~1.2 GiB
+/// at 0.6B, and the KV cache scales with the sequence cap):
+///
+/// ```no_run
+/// use qwen3_asr_wgpu::{AsrInference, Backend, TranscribeOptions};
+/// # fn main() -> qwen3_asr_wgpu::Result<()> {
+/// let asr = std::sync::Arc::new(AsrInference::load(
+///     std::path::Path::new("model-dir"),
+///     Backend::best(),
+/// )?);
+///
+/// let worker = std::sync::Arc::clone(&asr);
+/// std::thread::spawn(move || worker.transcribe("clip.wav", TranscribeOptions::default()));
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Every method takes `&self`, so `AsrInference` is `Send + Sync`.  Concurrent
+/// calls queue on the mutex — a transcription is not split across threads, it is
+/// serialized.  Nothing leaks between calls: each generation prefills its own
+/// prompt and resets the KV position to zero.
+pub struct AsrInference {
+    pub(crate) inner: std::sync::Mutex<Inner>,
+}
+
+impl AsrInference {
+    pub(crate) fn lock(&self) -> crate::Result<std::sync::MutexGuard<'_, Inner>> {
+        self.inner
+            .lock()
+            .map_err(|_| crate::AsrError::Inference(anyhow::anyhow!("mutex poisoned")))
     }
 
-    /// [`Self::load`] with an explicit [`DeviceSelector`] — by name, index,
-    /// backend or device type.  See [`crate::gpu::list_devices`] to enumerate.
-    pub fn load_on(model_dir: &Path, selector: DeviceSelector) -> Result<Self> {
-        Self::load_with_selector(model_dir, selector, EncoderBackend::Gpu)
+    /// Load a checkpoint directory with a one-word backend choice — the common
+    /// path.  See [`Backend`] for what each variant does and
+    /// [`Self::load_on`] / [`Self::load_with`] for the finer knobs.
+    ///
+    /// `model_dir` must hold `config.json`, `tokenizer.json` and the
+    /// safetensors weights — i.e. one of the HuggingFace `Qwen/Qwen3-ASR-*`
+    /// repositories, as downloaded or via [`Self::from_pretrained`].
+    pub fn load(model_dir: &Path, backend: Backend) -> crate::Result<Self> {
+        let (selector, encoder) = backend.resolve()?;
+        Self::load_with(model_dir, selector, encoder)
     }
 
+    /// [`Self::load`] with [`Backend::Auto`].
+    pub fn new(model_dir: &Path) -> crate::Result<Self> {
+        Self::load(model_dir, Backend::Auto)
+    }
+
+    /// Load on a specific device, named by runtime and index (`vulkan:0`,
+    /// `dx12`, `metal`), by raw enumeration index, or by a substring of the
+    /// adapter name.  See [`crate::AsrInference::device_targets`] —
+    /// or `transcribe --list-devices` — for the names this machine accepts.
+    ///
+    /// The GPU audio tower is used; a device that cannot build it falls back to
+    /// the host tower with a printed reason.
+    pub fn load_on(model_dir: &Path, selector: DeviceSelector) -> crate::Result<Self> {
+        Self::load_with(model_dir, selector, EncoderBackend::Gpu)
+    }
+
+    /// The full form: pick the device *and* which audio tower to build.
+    ///
+    /// [`EncoderBackend::Cpu`] is the host f32 reference the GPU tower is
+    /// verified against — ~2.7× slower on the encoder phase, and the reason the
+    /// two can be diffed at all.
     pub fn load_with(
         model_dir: &Path,
-        adapter: Option<&str>,
-        backend: EncoderBackend,
-    ) -> Result<Self> {
-        let selector = match adapter {
-            Some(a) => DeviceSelector::parse(a)?,
-            None => DeviceSelector::Auto,
-        };
-        Self::load_with_selector(model_dir, selector, backend)
+        selector: DeviceSelector,
+        encoder: EncoderBackend,
+    ) -> crate::Result<Self> {
+        let inner = Inner::load_with_selector(model_dir, selector, encoder)
+            .map_err(crate::AsrError::ModelLoad)?;
+        Ok(Self {
+            inner: std::sync::Mutex::new(inner),
+        })
     }
 
+    /// Download `model_id` from HuggingFace into `cache_dir` (if it is not
+    /// already there) and load it.
+    ///
+    /// Requires the `hub` feature.  The download is resumed by presence, not by
+    /// range: an interrupted one leaves a directory without the `.complete`
+    /// marker and is fetched again from scratch.
+    #[cfg(feature = "hub")]
+    pub fn from_pretrained(
+        model_id: &str,
+        cache_dir: &Path,
+        backend: Backend,
+    ) -> crate::Result<Self> {
+        let model_dir =
+            crate::hub::ensure_model_cached(model_id, cache_dir).map_err(crate::AsrError::ModelLoad)?;
+        Self::load(&model_dir, backend)
+    }
+
+    /// Every adapter wgpu can see on this machine, in the order
+    /// [`DeviceSelector::Index`] indexes into.  Cheap: no device is created.
+    pub fn devices() -> Vec<crate::gpu::DeviceInfo> {
+        Inner::devices()
+    }
+
+    /// The user-facing device list: each target named `<runtime>:<index>`, the
+    /// form [`Self::load_on`] accepts, with the default marked.
+    pub fn device_targets() -> Vec<crate::gpu::DeviceTarget> {
+        Inner::device_targets()
+    }
+
+    /// The device this instance actually runs on, or `None` on the CPU backend.
+    pub fn device(&self) -> Option<wgpu::AdapterInfo> {
+        self.lock().ok().and_then(|g| g.device().cloned())
+    }
+
+    /// One-line description of the running backend (device name, runtime,
+    /// driver and limits — or that this is the CPU path).
+    pub fn device_description(&self) -> String {
+        match self.lock() {
+            Ok(g) => g.device_description(),
+            Err(e) => format!("unavailable: {e}"),
+        }
+    }
+
+    /// True when the GPU audio tower is loaded rather than the host one.
+    pub fn gpu_encoder_active(&self) -> bool {
+        self.lock().map(|g| g.gpu_encoder_active()).unwrap_or(false)
+    }
+
+    /// Transcribe a wav file (any sample rate; it is resampled to 16 kHz).
+    ///
+    /// Returns the parsed transcript plus the language — either the one the
+    /// model named in its output, or, when the caller forced one, the caller's
+    /// (see [`TranscribeOptions::language`]).
+    pub fn transcribe(
+        &self,
+        audio_path: &str,
+        opts: TranscribeOptions,
+    ) -> crate::Result<TranscribeResult> {
+        let forced = check_options(&opts)?;
+        let samples = load_audio_wav(audio_path, MEL_SAMPLE_RATE)?;
+        let mut guard = self.lock()?;
+        let r = guard
+            .transcribe_samples(&samples, opts.max_new_tokens)
+            .map_err(crate::AsrError::Inference)?;
+        Ok(with_forced_language(r, forced))
+    }
+
+    /// [`Self::transcribe`] from 16 kHz mono samples already in memory.
+    pub fn transcribe_samples(
+        &self,
+        samples: &[f32],
+        opts: TranscribeOptions,
+    ) -> crate::Result<TranscribeResult> {
+        let forced = check_options(&opts)?;
+        let mut guard = self.lock()?;
+        let r = guard
+            .transcribe_samples(samples, opts.max_new_tokens)
+            .map_err(crate::AsrError::Inference)?;
+        Ok(with_forced_language(r, forced))
+    }
+
+    /// [`Self::transcribe`] with `on_token` called once per generated token.
+    ///
+    /// The callback is host-side only: the token stream, and therefore the final
+    /// text, is identical to the non-streaming call.  `text_so_far` is the raw
+    /// decode — no metadata split, no repetition fix.
+    pub fn transcribe_streaming<F>(
+        &self,
+        audio_path: &str,
+        opts: TranscribeOptions,
+        on_token: F,
+    ) -> crate::Result<TranscribeResult>
+    where
+        F: FnMut(StreamToken),
+    {
+        let forced = check_options(&opts)?;
+        let samples = load_audio_wav(audio_path, MEL_SAMPLE_RATE)?;
+        let mut guard = self.lock()?;
+        let r = guard
+            .transcribe_samples_streaming(
+                &samples,
+                opts.max_new_tokens,
+                None,
+                false,
+                &opts,
+                on_token,
+            )
+            .map_err(crate::AsrError::Inference)?;
+        Ok(with_forced_language(r, forced))
+    }
+
+    /// [`Self::transcribe_samples`] with `on_token` called once per token.
+    pub fn transcribe_samples_streaming<F>(
+        &self,
+        samples: &[f32],
+        opts: TranscribeOptions,
+        on_token: F,
+    ) -> crate::Result<TranscribeResult>
+    where
+        F: FnMut(StreamToken),
+    {
+        let forced = check_options(&opts)?;
+        let mut guard = self.lock()?;
+        let r = guard
+            .transcribe_samples_streaming(
+                samples,
+                opts.max_new_tokens,
+                None,
+                false,
+                &opts,
+                on_token,
+            )
+            .map_err(crate::AsrError::Inference)?;
+        Ok(with_forced_language(r, forced))
+    }
+
+    /// Start a session that takes audio incrementally and returns text at
+    /// [`crate::AsrStreamingSession::flush`].
+    ///
+    /// The session holds this instance's lock until it is dropped, so the two
+    /// cannot be used at once.
+    pub fn create_streaming_session(
+        &self,
+        opts: TranscribeOptions,
+    ) -> crate::Result<crate::AsrStreamingSession<'_>> {
+        check_options(&opts)?;
+        let forced = opts.forced_language().ok().flatten();
+        let guard = self.lock()?;
+        Ok(crate::AsrStreamingSession::new(guard, opts, forced))
+    }
+}
+
+fn check_options(opts: &TranscribeOptions) -> crate::Result<Option<String>> {
+    if opts.max_new_tokens == 0 {
+        return Err(crate::AsrError::InvalidOptions(
+            "max_new_tokens is 0 — nothing would be generated".to_string(),
+        ));
+    }
+    opts.forced_language()
+        .map_err(|e| crate::AsrError::InvalidOptions(e.to_string()))
+}
+
+pub(crate) fn with_forced_language(
+    mut r: TranscribeResult,
+    forced: Option<String>,
+) -> TranscribeResult {
+    if r.language.is_empty() {
+        if let Some(name) = forced {
+            r.language = name;
+        }
+    }
+    r
+}
+
+impl Inner {
     pub fn load_with_selector(
         model_dir: &Path,
         selector: DeviceSelector,
@@ -439,10 +534,6 @@ impl WgpuAsr {
             &config.thinker_config.audio_config,
         )?;
         let n_mels = config.thinker_config.audio_config.num_mel_bins;
-        // `cpu` means the CPU text decoder, which needs no adapter at all; a
-        // GPU selector that cannot be satisfied is an error, except for `auto`,
-        // which falls back to the CPU (that is what "auto" has to mean on a
-        // machine with no usable GPU).
         let want_cpu = selector == DeviceSelector::Cpu;
         let gpu = if want_cpu {
             None
@@ -460,8 +551,6 @@ impl WgpuAsr {
             (None, _) | (_, EncoderBackend::Cpu) => None,
             (Some(gpu), EncoderBackend::Gpu) => {
                 let ac = &config.thinker_config.audio_config;
-                // `n_window_infer` is the attention window in *mel frames*
-                // (800 shipped = 8 chunks of 100).
                 let window_infer = ac.n_window_infer.max(ac.n_window * 2);
                 match GpuAudioEncoder::load(gpu, &tensors, "thinker.audio_tower", ac, window_infer) {
                     Ok(e) => Some(e),
@@ -505,8 +594,6 @@ impl WgpuAsr {
         let cos_f16: Vec<f16> = cos.iter().copied().map(f16::from_f32).collect();
         let sin_f16: Vec<f16> = sin.iter().copied().map(f16::from_f32).collect();
         decoder.set_rope_tables(&cos_f16, &sin_f16);
-        // Everything that will ever be compiled has been compiled by now; persist
-        // it so the next process skips the compile (minutes on D3D12).
         if let Some(gpu) = decoder.gpu() {
             if let Err(e) = gpu.save_pipeline_cache() {
                 eprintln!("[pipeline cache] not saved: {e:#}");
@@ -557,23 +644,7 @@ impl WgpuAsr {
         self.gpu_encoder.is_some()
     }
 
-
-    pub fn transcribe(&mut self, wav: &Path, max_new_tokens: usize) -> Result<TranscribeResult> {
-        self.transcribe_with_dump(wav, max_new_tokens, None)
-    }
-
-    /// File entry point with an optional CPU-vs-GPU encoder comparison.
-    pub fn transcribe_file(
-        &mut self,
-        wav: &Path,
-        max_new_tokens: usize,
-        dump_dir: Option<&Path>,
-        compare_enc: bool,
-    ) -> Result<TranscribeResult> {
-        self.transcribe_file_opts(wav, max_new_tokens, dump_dir, compare_enc, &TranscribeOptions::default())
-    }
-
-    /// [`Self::transcribe_file`] with upstream's `context` / `language` knobs.
+    /// [`Inner::transcribe_file_opts`] with `context` / `language` knobs.
     pub fn transcribe_file_opts(
         &mut self,
         wav: &Path,
@@ -597,8 +668,7 @@ impl WgpuAsr {
     /// [`Self::transcribe_file_opts`] with a per-token callback.
     ///
     /// `on_token` fires once per generated token with the token id and the raw
-    /// text so far — the same shape as the reference port's
-    /// `transcribe_streaming`.  The callback is host-side only: the token stream
+    /// text so far.  The callback is host-side only: the token stream
     /// (and therefore the final text) is identical to the non-streaming call.
     pub fn transcribe_file_streaming<F>(
         &mut self,
@@ -647,22 +717,8 @@ impl WgpuAsr {
         )
     }
 
-    /// Mel-in entry point with an optional CPU-vs-GPU encoder comparison.
-    pub fn transcribe_from_mel_cmp(
-        &mut self,
-        mel: &[f32],
-        n_mels: usize,
-        n_frames: usize,
-        max_new_tokens: usize,
-        dump_dir: Option<&Path>,
-        compare_enc: bool,
-    ) -> Result<TranscribeResult> {
-        self.transcribe_from_mel_cmp_opts(
-            mel, n_mels, n_frames, max_new_tokens, dump_dir, compare_enc, &TranscribeOptions::default(),
-        )
-    }
-
-    /// [`Self::transcribe_from_mel_cmp`] with upstream's options.
+    /// Mel-in entry point with an optional CPU-vs-GPU encoder comparison,
+    /// with `context` / `language` knobs.
     #[allow(clippy::too_many_arguments)]
     pub fn transcribe_from_mel_cmp_opts(
         &mut self,
@@ -706,9 +762,6 @@ impl WgpuAsr {
         self.mel.extract(samples)
     }
 
-    /// The tokenizer's decode — the reference's `processor.decode` primitive.
-    /// `skip_special_tokens` is upstream's knob: left at its default (`false`)
-    /// for `return_format="raw"`, forced `true` for the other two formats.
     pub(crate) fn decode_ids(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
         self.tokenizer
             .decode(ids, skip_special_tokens)
@@ -751,11 +804,6 @@ impl WgpuAsr {
         self.encoder.conv_reference_c1(mel, n_mels, n_frames)
     }
 
-    /// The GPU audio tower, when one was built.
-    pub fn gpu_encoder(&self) -> Option<&GpuAudioEncoder> {
-        self.gpu_encoder.as_ref()
-    }
-
     /// Stage-by-stage GPU-vs-CPU comparison of the audio tower (diagnostic).
     pub fn diagnose_encoder(&mut self, wav: &Path) -> Result<()> {
         let samples = load_audio_wav(wav, MEL_SAMPLE_RATE)?;
@@ -790,10 +838,6 @@ impl WgpuAsr {
             n_frames
         );
 
-        // The GPU's inputs are f16, so the CPU is fed *exactly* what the GPU
-        // read: the f16-rounded mel for level 1, and the GPU's own activation
-        // for the deeper levels.  Anything the comparison then shows is a bug in
-        // the gather/GEMM/GELU, not the operand rounding.
         let w0 = {
             let v = enc.level(0);
             let _ = v;
@@ -849,12 +893,6 @@ impl WgpuAsr {
                             );
                         }
                         for c in 0..v.c_out {
-                            // The two CPU tensors have *different* layouts: `raw`
-                            // is the GEMM's own `[c_out][all positions]` (what the
-                            // GPU's buffer holds), `act` is `[chunk][c_out][plane]`
-                            // (the shape `conv_block` returns).  Using the raw
-                            // stride for both is correct exactly when there is one
-                            // chunk — which is how it went unnoticed.
                             let cri = c * (n_chunks * v.plane) + lcol + p;
                             let cai = (chunk * v.c_out + c) * v.plane + p;
                             draw.add(chunk, c, r.raw[level][c * v.n_all + gcol].to_f32(), cpu.raw[cri], 2e-3);
@@ -867,13 +905,7 @@ impl WgpuAsr {
             draw.report(&format!("conv{} GEMM", level + 1), "raw (pre-GELU)");
             dact.report(&format!("conv{} +bias/GELU", level + 1), "act");
 
-            // Next level's input: the GPU's activation, de-padded into the
-            // CPU's `[chunk][c][h][w]` layout.
             let (c_out, plane, plane_pad, n_all) = (v.c_out, v.plane, v.plane_pad, v.n_all);
-            // `conv_block_stages`/`im2col_3x3_s2p1` take `[chunk][c_in][h][w]`,
-            // i.e. one channel plane per chunk — *not* the GEMM's channel-major
-            // `[c][all positions]`.  The two agree only at one chunk, which is
-            // exactly where this was first tested.
             let mut next = vec![0.0f32; n_chunks * c_out * plane];
             for r in &cap.rounds {
                 for cc in 0..r.n_chunks {
@@ -892,17 +924,9 @@ impl WgpuAsr {
             w = v.w_out;
         }
 
-        // The whole-chain (CPU f32) comparison: coarser, but it covers the
-        // permute and the projection, where a layout slip is O(1).
         let tower = self.encoder.conv_tower(mel, n_mels, n_frames)?;
         let cf = tower.packed.len().checked_div(tower.n_total).unwrap_or(0);
         let dm = self.encoder.config().d_model;
-        // Self-contained attention oracle: rebuild a (head, window) block's
-        // scores, softmax and AV from the GPU's own Q/K/V.  Every block is the
-        // *same* arithmetic — the head slice and the window bound are the parts
-        // that can differ — so it runs head 0 *and* head 1, first and last
-        // window, and prints the Q/K/V magnitudes (an all-zero actor block makes
-        // every one of these comparisons agree for free).
         if let Some(a) = cap.attn.as_ref() {
             let (hd, wlen, wpad) = (a.hd, a.wlen, a.wpad);
             let hd_pad = a.attn_out.len() / (a.nh * a.n_win * a.wpad);
@@ -913,16 +937,12 @@ impl WgpuAsr {
             };
             let inv_scale = (hd as f32).sqrt();
             let (mut dsc, mut dpr, mut dav) = (Diff::default(), Diff::default(), Diff::default());
-            // `z = head·n_win + win`; the last window is the short one.
             for (head, win) in [(0usize, 0usize), (1, 0), (0, a.n_win - 1), (1, a.n_win - 1)] {
                 let z = head * a.n_win + win;
                 let valid = wlen.min(a.s - win * wlen);
                 let rows = valid.min(8);
                 let sc0 = dsc.bad;
                 let (mut pbad, mut abad, mut first_bad) = (0usize, 0usize, usize::MAX);
-                // The packed operands against the host's Q/K/V: a wrong `qp` is a
-                // prep bug (the re-pack), a right `qp` with wrong scores is the
-                // GEMM's.
                 let (mut dq, mut dk, mut dv) = (0.0f32, 0.0f32, 0.0f32);
                 let mut qat = (0usize, 0usize);
                 for r in 0..valid {
@@ -956,9 +976,6 @@ impl WgpuAsr {
                             let ki = a.k[(win * wlen + j) * a.acols + head * hd + d].to_f32();
                             dot += qi * ki;
                         }
-                        // `scores` holds the raw dots: the softmax kernel applies
-                        // `scale` itself, and comparing against a pre-scaled host
-                        // value is off by 1/scale (8 at hd 64).
                         sc[j] = dot * scale;
                         mx = mx.max(dot * scale);
                     }
@@ -971,8 +988,6 @@ impl WgpuAsr {
                     for j in 0..valid {
                         let row_g = z * wpad + row;
                         let gs = a.scores[z * wpad * wpad + row * wpad + j].to_f32();
-                        // f16 storage: the ulp at |s| 300 is 0.25, so the score
-                        // tolerance has to follow the magnitude.
                         let raw = sc[j] * inv_scale;
                         dsc.add(row_g, j, gs, raw, 2e-2 + 2e-3 * raw.abs());
                         let gp = a.probs[z * wpad * wpad + row * wpad + j].to_f32();
@@ -1012,7 +1027,6 @@ impl WgpuAsr {
                 norm(&a.k),
                 norm(&a.v)
             );
-            // The CPU's LN1 / QKV / attention block on the same tokens.
             if !a.normed.is_empty() && !a.qkv.is_empty() && !a.attn_flat.is_empty() {
                 let h0: Vec<f32> = cap.h[..tower.n_total * dm].iter().map(|v| v.to_f32()).collect();
                 let n3 = tower.n_total * 3 * dm;
@@ -1034,18 +1048,12 @@ impl WgpuAsr {
                         }
                     }
                 }
-                // `attn_flat` is the flattened attention *before* `out_proj`, so
-                // the CPU side has to stop at the same stage (comparing it with
-                // `dbg_attn` compared a pre-projection tensor with a projected
-                // one — a guaranteed mismatch that says nothing about the GPU).
                 let want_attn = self.encoder.dbg_attn_flat(0, &want_normed, tower.n_total)?;
                 for t in 0..tower.n_total {
                     for j in 0..dm {
                         da.add(t, j, a.attn_flat[t * a.acols + j].to_f32(), want_attn[t * dm + j], 3e-2);
                     }
                 }
-                // Split layer 0: the attention residual (before the FFN) and
-                // the FFN residual (after it).
                 if !a.mid.is_empty() {
                     let attn_out = self.encoder.dbg_attn(0, &want_normed, tower.n_total)?;
                     let mut dmid = Diff::default();
@@ -1068,8 +1076,6 @@ impl WgpuAsr {
             dav.report("av out", "host prob*v");
         }
 
-        // Per-layer: the CPU runs layer `li` on exactly the tokens the GPU fed
-        // it, so any mismatch is that layer's — attention, residual or FFN.
         if !cap.layers.is_empty() {
             let mut prev: Vec<f32> = cap.h.iter().take(tower.n_total * dm).map(|v| v.to_f32()).collect();
             for (li, got) in cap.layers.iter().enumerate() {
@@ -1093,8 +1099,6 @@ impl WgpuAsr {
                 }
             }
         }
-        // Loose per-level check: the GPU's activations against the CPU's *own*
-        // chain, so the f16 rounding each level feeds the next one shows up.
         for level in 0..3 {
             let v = enc.level(level);
             let mut d = Diff::default();
@@ -1127,8 +1131,6 @@ impl WgpuAsr {
             }
         }
         dh.report("h [tok][d_model]", "vs CPU conv_out+PE");
-        // Same projection, but from the GPU's own operand: separates a
-        // conv_out/PE bug from the f16 drift upstream of it.
         if cf > 0 {
             let gpu_packed: Vec<f32> = cap.packed[..tower.n_total * cf]
                 .iter()
@@ -1168,9 +1170,7 @@ impl WgpuAsr {
         Ok(())
     }
 
-    /// Run a mel through the configured tower, returning f32 rows.
-    /// `compare` additionally runs the CPU reference and prints the envelope.
-       fn run_encoder(
+    pub(crate) fn run_encoder(
         &mut self,
         mel: &[f32],
         n_mels: usize,
@@ -1178,7 +1178,6 @@ impl WgpuAsr {
         compare: bool,
     ) -> Result<Vec<f32>> {
         let TextBackend::Gpu(dec) = &self.decoder else {
-            // CPU text decoder ⇒ no GPU to encode on either.
             return self.encoder.forward(mel, n_mels, n_frames);
         };
         let Some(enc) = self.gpu_encoder.as_mut() else {
@@ -1201,48 +1200,8 @@ impl WgpuAsr {
         Ok(embeds)
     }
 
-    pub fn transcribe_with_dump(
-        &mut self,
-        wav: &Path,
-        max_new_tokens: usize,
-        dump_dir: Option<&Path>,
-    ) -> Result<TranscribeResult> {
-        let samples = load_audio_wav(wav, MEL_SAMPLE_RATE)?;
-        if let Some(dir) = dump_dir {
-            std::fs::create_dir_all(dir)?;
-            let mut bytes = Vec::with_capacity(samples.len() * 4);
-            for v in &samples {
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-            std::fs::write(dir.join("wave16k.f32"), bytes)?;
-        }
-        self.transcribe_samples_with_dump(&samples, max_new_tokens, dump_dir)
-    }
-
     pub fn transcribe_samples(&mut self, samples: &[f32], max_new_tokens: usize) -> Result<TranscribeResult> {
         self.transcribe_samples_with_dump(samples, max_new_tokens, None)
-    }
-
-    pub fn transcribe_from_mel(
-        &mut self,
-        mel: &[f32],
-        n_mels: usize,
-        n_frames: usize,
-        max_new_tokens: usize,
-        dump_dir: Option<&Path>,
-    ) -> Result<TranscribeResult> {
-        let t1 = Instant::now();
-        let audio_embeds = self.run_encoder(mel, n_mels, n_frames, false)?;
-        let t_enc = t1.elapsed();
-        self.decode_from_audio_embeds(
-            &audio_embeds,
-            max_new_tokens,
-            dump_dir,
-            0.0,
-            t_enc.as_secs_f64() * 1000.0,
-            &TranscribeOptions::default(),
-            None,
-        )
     }
 
     pub fn transcribe_from_embeds(
@@ -1324,7 +1283,7 @@ impl WgpuAsr {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn decode_from_audio_embeds(
+    pub(crate) fn decode_from_audio_embeds(
         &mut self,
         audio_embeds: &[f32],
         max_new_tokens: usize,
@@ -1362,13 +1321,6 @@ impl WgpuAsr {
         prompt::decode_result(&self.tokenizer, &gen.ids)
     }
 
-    /// Prompt → prefill → greedy decode over pre-encoded audio embeddings.
-    ///
-    /// This is the reference pipeline's `model.generate(**inputs)`: everything
-    /// after the processor has produced the audio features.  The returned ids are
-    /// only the *generated* ones — the reference slices `output_ids[:,
-    /// input_ids.shape[1]:]` before `decode`, and every caller here starts from
-    /// the same point.
     pub(crate) fn generate_from_embeds(
         &mut self,
         audio_embeds: &[f32],
@@ -1378,8 +1330,6 @@ impl WgpuAsr {
     ) -> Result<Generation> {
         let hs = self.config.thinker_config.text_config.hidden_size;
         let nat = audio_embeds.len() / hs;
-        // Upstream normalises and validates a forced language before prompting,
-        // and only then appends `language X<asr_text>` to the assistant turn.
         let language = opts.forced_language()?;
         let (input_ids, asp) = prompt::build_prompt(
             &self.tokenizer,
@@ -1404,10 +1354,6 @@ impl WgpuAsr {
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("missing {name}"))?;
         anyhow::ensure!(et.shape.len() == 2 && et.shape[1] == hs, "embed shape {:?}", et.shape);
-        // Rows come straight out of the mapped file.  Going through
-        // `weights::get_f16` re-materialised the whole table (155 M elements at
-        // 0.6 B) as a fresh `Vec<f16>` on every call — ~0.3 s of the 12 s run
-        // (twice that at 1.7 B).
         let mut hidden_bytes: Vec<u8> = Vec::with_capacity(seq_len * hs * 2);
         for &id in &input_ids[..asp] {
             et.append_f16_row_le(id as usize, hs, &mut hidden_bytes)?;
@@ -1453,8 +1399,6 @@ impl WgpuAsr {
     }
 }
 
-/// One greedy generation (the reference's `model.generate`): the generated ids
-/// **without** the prompt, plus what the phase timings need.
 pub(crate) struct Generation {
     pub ids: Vec<u32>,
     pub seq_len: usize,
@@ -1462,41 +1406,8 @@ pub(crate) struct Generation {
     pub decode_ms: f64,
 }
 
-/// Diagnostic envelope of one stage against the CPU reference.
-fn stage_diff(name: &str, reference: &[f32], got: &[f32], shape: &[usize]) {
-    let n = reference.len().min(got.len());
-    if reference.len() != got.len() {
-        eprintln!(
-            "  {name:<24} SIZE MISMATCH ref {} vs gpu {} (shape {shape:?})",
-            reference.len(),
-            got.len()
-        );
-    }
-    let mut max_abs = 0.0f32;
-    let mut rms = 0.0f64;
-    let mut ref_rms = 0.0f64;
-    let mut worst = 0usize;
-    for i in 0..n {
-        let d = (reference[i] - got[i]).abs();
-        if d > max_abs {
-            max_abs = d;
-            worst = i;
-        }
-        rms += (d as f64) * (d as f64);
-        ref_rms += (reference[i] as f64) * (reference[i] as f64);
-    }
-    let rms = (rms / n.max(1) as f64).sqrt();
-    let ref_rms = (ref_rms / n.max(1) as f64).sqrt();
-    eprintln!(
-        "  {name:<24} n={n} max|d| {max_abs:.6} (idx {worst}: ref {:.5} gpu {:.5}) \
-         rms {rms:.6} vs ref-rms {ref_rms:.6}",
-        reference[worst],
-        got[worst]
-    );
-}
-
-/// Write a flat f32 tensor as little-endian bytes.
-fn write_f32_dump(dir: &Path, name: &str, data: &[f32]) -> Result<()> {    let mut bytes = Vec::with_capacity(data.len() * 4);
+fn write_f32_dump(dir: &Path, name: &str, data: &[f32]) -> Result<()> {
+    let mut bytes = Vec::with_capacity(data.len() * 4);
     for v in data {
         bytes.extend_from_slice(&v.to_le_bytes());
     }
@@ -1504,8 +1415,6 @@ fn write_f32_dump(dir: &Path, name: &str, data: &[f32]) -> Result<()> {    let m
     Ok(())
 }
 
-/// Diagnostic envelope of the GPU tower's f16 embeddings against the CPU
-/// reference's f32 ones — the alignment gate for the audio path.
 fn print_embed_diff(cpu: &[f32], gpu: &[f32], mel_frames: usize) {
     if cpu.len() != gpu.len() {
         eprintln!(
@@ -1536,6 +1445,3 @@ fn print_embed_diff(cpu: &[f32], gpu: &[f32], mel_frames: usize) {
          outside 0.0625+|x|*2^-9: {over}"
     );
 }
-
-
-

@@ -1,13 +1,3 @@
-//! CPU audio encoder for Qwen3-ASR — f32 GEMM (`gemm` crate + rayon).
-//! Safetensors weights are f16; converted once at load.
-//!
-//! Architecture:
-//!   mel [T_mel, 128]  →  conv2d stem (3 × {im2col + gemm + bias + GELU})
-//!   → conv_out (Linear + bias)  →  + sinusoidal PE
-//!   → 18 × { LN + windowed attn + LN + FFN(GELU-erf) }
-//!   → ln_post + proj1 + GELU + proj2
-//!   → [n_total, output_dim]
-//!
 use anyhow::Result;
 use gemm::{gemm, Parallelism};
 use rayon::prelude::*;
@@ -17,12 +7,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::config::AudioEncoderConfig;
 use crate::cpu_tensor::{linear, CpuTensor, CpuWeightF16};
 use crate::weights::RawTensor;
-
-// ─── Phase profiling (QWEN3_ENC_PROFILE=1) ─────────────────────────
-//
-// The encoder's wall time is dominated by a handful of ops whose split the
-// end-to-end timer cannot show.  Buckets are filled only when the env var is
-// set (`profiling()`), so the hot path pays one relaxed bool load per bucket.
 
 static PROF_NS: [AtomicU64; 16] = [
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
@@ -101,8 +85,6 @@ pub(crate) fn prof_report() {
     eprintln!("  {:<22} {:>9.1} ms", "SUM(buckets)", total as f64 / 1e6);
 }
 
-// ─── Linear + LayerNorm primitives ─────────────────────────────────
-
 pub(crate) struct CpuAudioLinear {
     pub w_f32: crate::cpu_tensor::CpuWeight,
     pub bias: Option<Vec<f32>>,
@@ -132,7 +114,6 @@ impl CpuAudioLinear {
         Ok(Self { w_f32: w_f16.to_f32(), bias })
     }
 
-    /// x: [..., in_features] → [..., out_features]  (bias added if present)
     pub(crate) fn forward(&self, x: &CpuTensor) -> Result<CpuTensor> {
         let mut y = linear(x, &self.w_f32);
         if let Some(b) = &self.bias {
@@ -168,7 +149,6 @@ impl CpuAudioLayerNorm {
         Ok(Self { w, bias, eps })
     }
 
-    /// x: [outer, d] → [outer, d]  (LayerNorm over last dim)
     pub(crate) fn forward(&self, x: &CpuTensor) -> CpuTensor {
         let d = *x.shape.last().unwrap();
         let w = &self.w;
@@ -193,7 +173,6 @@ impl CpuAudioLayerNorm {
     }
 }
 
-/// Match `torch.nn.functional.gelu` / `ACT2FN["gelu"]` (erf, not tanh).
 #[inline]
 fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + libm::erff(x * std::f32::consts::FRAC_1_SQRT_2))
@@ -203,10 +182,6 @@ pub(crate) fn gelu_inplace(x: &mut CpuTensor) {
     x.data.par_iter_mut().for_each(|v| *v = gelu(*v));
 }
 
-/// Standard im2col for conv2d(kernel=3, stride=2, pad=1).
-/// Input x: [b, c_in, h, w].
-/// Output: [col_count, c_in*9] row-major, where col_count = b * h_out * w_out.
-/// Column layout: col[ic*9 + kh*3 + kw] matches weight [c_out, c_in, 3, 3] flattened.
 pub(crate) fn im2col_3x3_s2p1(x: &[f32], b: usize, c_in: usize, h: usize, w: usize) -> (Vec<f32>, usize, usize) {
     let h_out = (h + 2 - 3) / 2 + 1;
     let w_out = (w + 2 - 3) / 2 + 1;
@@ -244,7 +219,7 @@ pub(crate) struct CpuConvStem {
     c2_w: crate::cpu_tensor::CpuWeight, c2_b: Vec<f32>,
     c3_w: crate::cpu_tensor::CpuWeight, c3_b: Vec<f32>,
     co: CpuAudioLinear,
-    pe: Vec<f32>,        // [max_pos, d_model] f32
+    pe: Vec<f32>,
     d_model: usize,
     max_pos: usize,
 }
@@ -263,7 +238,6 @@ impl CpuConvStem {
         let c3_b = load_bias(weights, &format!("{}.conv2d3.bias", prefix))?;
         let co = CpuAudioLinear::load(weights, &format!("{}.conv_out", prefix))?;
 
-        // Sinusoidal PE — formula identical to `gpu_audio_encoder.rs:220-228`.
         let dm = config.d_model;
         let max_pos = config.max_source_positions;
         let half = dm / 2;
@@ -279,10 +253,6 @@ impl CpuConvStem {
         Ok(Self { c1_w, c1_b, c2_w, c2_b, c3_w, c3_b, co, pe, d_model: dm, max_pos })
     }
 
-    /// Run conv stem on chunked mel input.
-    /// mel_chunks: [b_chunks * n_mels * cs] in (chunk, mel_bin, frame) order.
-    /// Layout matches GPU: [b_chunks, c=1, h=n_mels, w=cs] in NCHW.
-    /// Returns ([b_chunks * t2 * d_model], t2).
     pub(crate) fn forward(
         &self,
         mel_chunks: &[f32],
@@ -294,9 +264,6 @@ impl CpuConvStem {
         Ok((out, t2))
     }
 
-    /// As [`Self::forward`], also returning the `conv_out` *operand* — the
-    /// permuted `[chunk·t2][c·f]` rows — so the GPU's `packed` can be compared
-    /// without going through the projection.
     pub(crate) fn forward_stages(
         &self,
         mel_chunks: &[f32],
@@ -316,11 +283,9 @@ impl CpuConvStem {
         let _t = std::time::Instant::now();
         let (x3, h3, w3) = self.conv_block(&x2, b_chunks, c2_out, h2, w2, &self.c3_w, &self.c3_b)?;
         prof_add(P_CONV3, _t);
-        // x3: [b_chunks, c3_out, h3, w3]
         let t2 = w3;
         let _t = std::time::Instant::now();
 
-        // Permute [b, c, f, t] → [b, t, c, f] then reshape [b, t, c*f].
         let c_dim = self.c3_w.rows;
         let f_dim = h3;
         let row_len = c_dim * f_dim;
@@ -339,12 +304,10 @@ impl CpuConvStem {
                 }
             });
 
-        // ConvOut (Linear): [b, t2, c*f] → [b, t2, d_model]
         let perm_flat = perm.clone();
         let perm_t = CpuTensor::new(perm, vec![b_chunks, t2, c_dim * f_dim]);
         let co_out = self.co.forward(&perm_t)?;
 
-        // Add PE (broadcast over batch).
         let mut out = co_out.data.clone();
         let dm = self.d_model;
         let pe = &self.pe;
@@ -361,8 +324,6 @@ impl CpuConvStem {
         Ok((perm_flat, out, t2))
     }
 
-    /// Single conv2d (3×3, stride 2, pad 1) + bias + GELU.
-    /// Input x: [b, c_in, h, w]. Returns (flat [b, c_out, h_out, w_out], h_out, w_out).
     pub(crate) fn conv_block(
         &self,
         x: &[f32],
@@ -373,17 +334,6 @@ impl CpuConvStem {
         Ok((act, ho, wo))
     }
 
-    /// As [`Self::conv_block`], but returning the two tensors the GPU tower
-    /// keeps on separate buffers, **in the GPU's own layouts** so a comparison
-    /// cannot mix the axes up:
-    ///
-    /// * `raw` — the GEMM output `[c_out][n_chunks·plane]` *before* bias+GELU
-    ///   (`enc.cN_raw`): channel-major, every chunk's positions flattened;
-    /// * `act` — the same, *after* bias+GELU (`enc.cN_act`);
-    /// * `cols` — the im2col operand `[n_chunks·plane][k]`, `k = ic·9 + kh·3 + kw`
-    ///   (`enc.cN_col`, which stores its transpose).
-    ///
-    /// The tile loop is kept: `conv2`'s full-batch im2col is ~GB.
     #[allow(clippy::type_complexity)]
     pub(crate) fn conv_block_stages(
         &self,
@@ -400,12 +350,8 @@ impl CpuConvStem {
         assert_eq!(w_w.cols, k, "conv_block weight cols={} != c_in*9={}", w_w.cols, k);
         let plane = h_out * w_out;
         let in_plane = c_in * h * w;
-        // `raw` is only materialised for the diagnostic: at 180 s it is 1 GiB
-        // (c_out · chunks · plane · 4 B), and the production path does not read
-        // it at all — it would be allocated and written for nothing.
         let mut raw = if want_raw { vec![0.0f32; c_out * b * plane] } else { Vec::new() };
         let mut act = vec![0.0f32; b * c_out * plane];
-        // Tile batch so conv2/conv3 im2col stays cache-sized (full-b c2 is ~GB).
         let tile = CONV_TILE.load(Ordering::Relaxed).max(1) as usize;
         for b0 in (0..b).step_by(tile) {
             let nb = tile.min(b - b0);
@@ -417,10 +363,6 @@ impl CpuConvStem {
             prof_add(P_IM2COL, _t);
             debug_assert_eq!((ho, wo), (h_out, w_out));
             let col_count = nb * plane;
-            // When `want_raw`, the GEMM writes straight into `raw`, which is
-            // laid out `[c_out][b·plane]` — the GEMM's own layout and exactly
-            // the GPU's channel-major form.  Otherwise it uses a tile-sized
-            // scratch, as the production path always did.
             let mut scratch = vec![0.0f32; if want_raw { 0 } else { c_out * col_count }];
             let (out_ptr, cstride) = if want_raw {
                 (unsafe { raw.as_mut_ptr().add(b0 * plane) }, (b * plane) as isize)
@@ -448,10 +390,6 @@ impl CpuConvStem {
                 let ib = plane_idx / c_out;
                 let oc = plane_idx % c_out;
                 let bias = w_b[oc];
-                // The `want_raw` source is the *whole* `[c_out][b·plane]` tensor, so
-                // this tile's chunk is `b0 + ib`; reading `ib` fed the epilogue the
-                // first tile's rows for every later tile.  Invisible at one tile,
-                // which is why the single-chunk diagnostics agreed and this did not.
                 let src_chunk = if want_raw { b0 + ib } else { ib };
                 let src_row = oc * src_row_stride + src_chunk * plane;
                 for i in 0..plane {
@@ -508,11 +446,6 @@ impl CpuAudioAttention {
         })
     }
 
-    /// Windowed attention, flattened to `[b, s, nh·hd]` — everything `forward`
-    /// does *before* `out_proj`, which is the layout the GPU's `enc.attn_flat`
-    /// holds.  Comparing the GPU's flattened block against `forward` (i.e.
-    /// against the *projected* output) is an off-by-one-stage comparison that
-    /// can never pass.
     pub(crate) fn flat(
         &self,
         x: &CpuTensor,
@@ -524,7 +457,6 @@ impl CpuAudioAttention {
         let nh = self.num_heads;
         let hd = self.head_dim;
 
-        // Project Q, K, V.
         let _t = std::time::Instant::now();
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
@@ -536,12 +468,10 @@ impl CpuAudioAttention {
 
         let _t = std::time::Instant::now();
         let attn_out = if let Some(w) = window {
-            // Windowed: process chunks of `w` tokens, each chunk attends only to itself.
             let mut out = vec![0.0f32; b * nh * s * hd];
             for st in (0..s).step_by(w) {
                 let len = w.min(s - st);
                 let o = attention_window(&q.data, &k.data, &v.data, b, nh, s, dm, hd, len, st, scale);
-                // Scatter: out[(ib, ih, st:st+len, hd)] = o[(ib, ih, 0:len, hd)]
                 out.par_chunks_mut(s * hd)
                     .zip(o.par_chunks(len * hd))
                     .for_each(|(dst, src)| {
@@ -551,11 +481,9 @@ impl CpuAudioAttention {
             }
             out
         } else {
-            // Full attention.
             attention_window(&q.data, &k.data, &v.data, b, nh, s, dm, hd, s, 0, scale)
         };
 
-        // Reshape [b, nh, s, hd] → [b, s, nh*hd] (swap dims 1 and 2).
         let flat = {
             let mut out = vec![0.0f32; b * s * nh * hd];
             out.par_chunks_mut(nh * hd)
@@ -575,7 +503,6 @@ impl CpuAudioAttention {
         Ok(CpuTensor::new(flat, vec![b, s, nh * hd]))
     }
 
-    /// x [b, s, d_model] → [b, s, d_model]. ws: window size for attention.
     pub(crate) fn forward(
         &self,
         x: &CpuTensor,
@@ -589,9 +516,6 @@ impl CpuAudioAttention {
     }
 }
 
-/// Scalar attention with rayon parallelism across (batch, head) pairs.
-/// q/k/v: [b, s, dm] flat. Processes positions [st, st+len).
-/// Returns [b*nh, len*hd] where each chunk is one (batch, head) pair's output for the window.
 fn attention_window(
     q: &[f32], k: &[f32], v: &[f32],
     b: usize, nh: usize, s: usize, dm: usize, hd: usize, len: usize, st: usize, scale: f32,
@@ -623,14 +547,12 @@ fn attention_window(
                     scores[ki] = s_;
                     if s_ > max_s { max_s = s_; }
                 }
-                // Softmax.
                 let mut sum = 0.0f32;
                 for sc in scores.iter_mut() {
                     *sc = (*sc - max_s).exp();
                     sum += *sc;
                 }
                 let inv = 1.0 / sum;
-                // Weighted sum of V.
                 let out_base = qi * hd;
                 for ki in 0..len {
                     let w = scores[ki] * inv;
@@ -689,14 +611,12 @@ impl CpuAudioLayer {
         })
     }
 
-    /// x: [b, s, d_model] consumed; returns post-residual h of same shape.
     pub(crate) fn forward(&self, x: CpuTensor, ws: Option<usize>) -> Result<CpuTensor> {
         let shape = x.shape.clone();
         let _t = std::time::Instant::now();
         let normed = self.sln.forward(&x);
         prof_add(P_LN1, _t);
         let attn_out = self.attn.forward(&normed, ws)?;
-        // Residual add in-place on x.data (no clone needed — x is consumed).
         let mut x_data = x.data;
         x_data.par_iter_mut().zip(&attn_out.data).for_each(|(a, b)| *a += *b);
         let x1 = CpuTensor::new(x_data, shape);
@@ -781,7 +701,6 @@ impl CpuAudioEncoder {
         let tail = mel_len % cs;
         let n_chunks = nfull + if tail > 0 { 1 } else { 0 };
 
-        // Build chunked mel buffer [n_chunks * n_mels * cs], zero-padded.
         let _t = std::time::Instant::now();
         let mut chunked = vec![0.0f32; n_chunks * n_mels * cs];
         let mut chunk_tokens: Vec<usize> = Vec::with_capacity(n_chunks);
@@ -804,18 +723,15 @@ impl CpuAudioEncoder {
                 for j in 0..tail {
                     chunked[dst_base + j] = mel[src_base + j];
                 }
-                // Rest is already zero-padded.
             }
             chunk_tokens.push(feo(tail));
         }
 
-        // Conv stem on batched chunks.
         prof_add(P_CONV_CHUNK, _t);
         let (conv_data, t2) = self.conv_stem.forward(&chunked, n_chunks, n_mels, cs)?;
         let dm = self.config.d_model;
         let n_total: usize = chunk_tokens.iter().sum();
 
-        // Pack valid tokens from each chunk into [1, n_total, d_model].
         let _t = std::time::Instant::now();
         let mut packed = Vec::with_capacity(n_total * dm);
         for (idx, &v) in chunk_tokens.iter().enumerate() {
@@ -824,7 +740,6 @@ impl CpuAudioEncoder {
         }
         prof_add(P_PACK, _t);
 
-        // Transformer layers.
         let cs2 = self.config.n_window * 2;
         let tpc2 = feo(cs2);
         let cpw = self.config.n_window_infer / cs2;
@@ -852,61 +767,6 @@ impl CpuAudioEncoder {
         Ok(h.data)
     }
 
-    /// Run conv-stem on a single mel chunk of exactly `cs` frames.
-    /// mel_chunk: [n_mels * cs] flat (mel-bin-major). cs must equal n_window * 2.
-    /// Returns [tpc, d_model] tokens where tpc = feo(cs).
-    pub(crate) fn run_conv_stem(
-        &self, mel_chunk: &[f32], n_mels: usize, cs: usize,
-    ) -> Result<Vec<f32>> {
-        let (conv_data, _t2) = self.conv_stem.forward(mel_chunk, 1, n_mels, cs)?;
-        // conv_data is [t2, d_model] — all tokens are valid for a full chunk.
-        Ok(conv_data)
-    }
-
-    /// Run conv-stem on a partial (tail) mel chunk, zero-padded to `cs` frames.
-    /// mel_chunk: [n_mels * actual_frames] flat. actual_frames < cs.
-    /// Returns [feo(actual_frames), d_model] tokens.
-    pub(crate) fn run_conv_stem_tail(
-        &self, mel_chunk: &[f32], n_mels: usize, actual_frames: usize, cs: usize,
-    ) -> Result<Vec<f32>> {
-        let tpc = feo(actual_frames);
-        // Zero-pad to cs frames.
-        let mut padded = vec![0.0f32; n_mels * cs];
-        for m in 0..n_mels {
-            let dst_base = m * cs;
-            let src_base = m * actual_frames;
-            for j in 0..actual_frames {
-                padded[dst_base + j] = mel_chunk[src_base + j];
-            }
-        }
-        let (conv_data, _t2) = self.conv_stem.forward(&padded, 1, n_mels, cs)?;
-        // Keep only tpc tokens (discard zero-padded extras).
-        let dm = self.config.d_model;
-        Ok(conv_data[..tpc * dm].to_vec())
-    }
-
-    /// Run transformer layers + final projection on packed tokens.
-    /// tokens: [n_tokens, d_model] flat. Returns [n_tokens, output_dim] flat.
-    pub(crate) fn run_transformer(&self, tokens: &[f32], n_tokens: usize) -> Result<Vec<f32>> {
-        let dm = self.config.d_model;
-        let cs2 = self.config.n_window * 2;
-        let tpc2 = feo(cs2);
-        let cpw = self.config.n_window_infer / cs2;
-        let ws = tpc2 * cpw;
-
-        let mut h = CpuTensor::new(tokens.to_vec(), vec![1, n_tokens, dm]);
-        for layer in &self.layers {
-            h = layer.forward(h, Some(ws))?;
-        }
-        // Final projections.
-        let h = self.ln_post.forward(&h);
-        let mut h = self.proj1.forward(&h)?;
-        gelu_inplace(&mut h);
-        let h = self.proj2.forward(&h)?;
-        Ok(h.data)
-    }
-
-    /// Access config for streaming chunking parameters.
     pub(crate) fn config(&self) -> &AudioEncoderConfig {
         &self.config
     }
@@ -965,7 +825,6 @@ impl CpuAudioEncoder {
         Ok((x1, vec![n_chunks * 400 * c1_out], packed, vec![n_total, dm]))
     }
 
-    /// Chunk a mel exactly the way the encoder does.
     #[allow(clippy::type_complexity)]
     fn chunk_mel(
         &self,

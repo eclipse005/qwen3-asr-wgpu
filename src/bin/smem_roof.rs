@@ -1,44 +1,13 @@
-//! **STATUS: INCONCLUSIVE — do not trust the numbers this prints.**
-//!
-//! The probe as written does not measure what it claims.  Both variants land at
-//! ~0.70 TFLOP/s regardless of register blocking, which is *lower* than the real
-//! `prefill_gemm`'s measured 2.07 TFLOP/s — i.e. the synthetic inner loop is
-//! being strength-reduced (the shared tile is filled with a constant, so the
-//! repeated `fma(a, b_i, c)` collapses) and what is timed is not the FMA/LDS mix
-//! of the real kernel.  Kept only as a record of a negative result.
-//!
-//! What the measurements *do* establish about `prefill_gemm`'s ~2.07 TFLOP/s
-//! ceiling (see `ROADMAP-wgpu.md`):
-//!
-//! * Not DRAM: each layer streams ~12 MB of f16 weights in ~9.3 ms = ~1.3 GB/s
-//!   against a ~250 GB/s peak.
-//! * Not shared-memory bandwidth: at `bk=16` the A+W traffic per k-tile is 8 KB.
-//! * Most likely **instruction issue**: with TM=TN=8 each k-step emits 64 FMAs
-//!   against ~40 non-FMA instructions (16 scalar `As[]`/`Bs[]` reads + loop
-//!   overhead), so the FMA pipe is only ~46% occupied.  That also explains why
-//!   `gemm_bench`'s whole tile sweep (8x8 best; 4x4, 8x4, every double-buffer
-//!   and unroll combination) is pinned at 2.07 TFLOP/s.
-//!
-//! The lever that would move it is **vectorised shared-memory reads**
-//! (`vec4<f32>` instead of scalar), which raises the FMA density to ~73%.
-//!
-//! ```text
-//! cargo run --release --bin smem_roof -- --adapter nvidia
-//! ```
-
 use anyhow::Result;
 
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
 }
 
-/// `R` register accumulators, `L` shared-memory loads per iteration.
-/// Both kernels issue the SAME loads; they differ only in FMAs per load.
 fn kernel(l: usize, r: usize) -> String {
     let loads = (0..l)
         .map(|i| format!("    let b{i} = bs[((q + {i}u) & 255u) * PAD + tx];\n"))
         .collect::<String>();
-    // fold the loads into R accumulators
     let mut fmas = String::new();
     for i in 0..l {
         fmas.push_str(&format!("    c{} = fma(a, b{i}, c{});\n", i % r, i % r));
@@ -125,8 +94,6 @@ async fn run(prefer: Option<&str>) -> Result<()> {
         mapped_at_creation: false,
     });
 
-    // (loads per k-step, register accumulators) — matches prefill_gemm's shape
-    // first, then the "wider register tile" shape we are considering.
     let cases = [
         (16usize, 16usize, "prefill_gemm shape: 16 loads / 64 FMA"),
         (16, 64, "4x registers: 16 loads / 256 FMA"),
@@ -137,7 +104,6 @@ async fn run(prefer: Option<&str>) -> Result<()> {
     println!("\n{:<42} {:>10} {:>12} {:>10}", "variant", "us", "GFLOP/s", "vs first");
     let mut baseline = 0.0f64;
     for (l, r, label) in cases {
-        // skip variants that would exceed the 16 KB workgroup storage budget
         let guard = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(label),
@@ -163,8 +129,8 @@ async fn run(prefer: Option<&str>) -> Result<()> {
                 wgpu::BindGroupEntry { binding: 1, resource: out.as_entire_binding() },
             ],
         });
-        let gx = 80u32; // 80 workgroups = the real prefill grid's order of magnitude
-        let mut run = |reps: usize| -> Result<f64> {
+        let gx = 80u32;
+        let run = |reps: usize| -> Result<f64> {
             let mut enc = device.create_command_encoder(&Default::default());
             {
                 let mut cp = enc.begin_compute_pass(&Default::default());
@@ -179,12 +145,10 @@ async fn run(prefer: Option<&str>) -> Result<()> {
             device.poll(wgpu::PollType::wait_indefinitely())?;
             Ok(t.elapsed().as_secs_f64() * 1e3 / reps as f64)
         };
-        run(3)?; // warm
+        run(3)?;
         let ms = run(20)?;
 
-        // FLOPs: workgroups * threads * reps(512) * (loads*1 fma each, but each
-        // "fma" here is one FMA = 2 FLOP) -- we count the FMA count we emitted.
-        let fmas_per_iter = l as f64; // one fma per loaded operand
+        let fmas_per_iter = l as f64;
         let flop = gx as f64 * 256.0 * 512.0 * fmas_per_iter * 2.0;
         let gflops = flop / (ms / 1e3) / 1e9;
         if baseline == 0.0 {
