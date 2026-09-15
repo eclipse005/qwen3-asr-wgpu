@@ -299,17 +299,22 @@ CPU 参考抓出来的），也是查 Intel D3D12 那种「能跑但慢/错」�
    （`widen_f16()` 的代码在本轮试验里写过又删了；要再试的话，正确形态是「按 k 分块、
    块内转、块内用完」，不是整行转。）
 
-3. **prefill 换 `gemm` crate**：**值得做，但 wrapper 还没写对**。实测（180s_en，0.6B）：
-   接上 `gemm::gemm`（row-major、`Parallelism::Rayon(0)`）后 **prefill 20.2 → 7.2 s**
-   （proj 6005→924、mlp 9836→2069，约 6×），但**输出是垃圾** —— 所以先回退了。两个坑：
-   * **参数顺序是 `(beta, alpha)`**（不是常见的 alpha,beta；crate 自带的单测用同一个
-     wrapper 双方对比，所以它自己发现不了这个）。给 `gemm_row_major` 写了个
-     `gemm_row_major_matches_naive` 单测（3×5×4 vs 朴素三重循环）钉住这一点；
-   * 即便 `(beta, alpha)` 对了，**真实形状（210×1280×1024）仍然出垃圾**，而 3×5×4 过 ——
-     说明它的大形状路径（打包/packing 分支）还有别的约定没对上。**下一步**：把单测的
-     形状换成真实形状（例如 64×1280×1024）再调 stride，通了再接进 `batch_dot`。
-   * 兄弟仓库的调用在 `D:\qwen3-asr-rs\src\cpu_engine.rs:198`（gemm 0.17 时代），
-     stride 写法与 0.18 一致，但 alpha/beta 同样容易搞反 —— 别照抄，照单测。
+3. ~~prefill 换 `gemm` crate~~ → **已落地**（这条现在算「已采纳」，见下）。踩过的两个坑记在这里：
+   * **参数顺序是 `(beta, alpha)`**（不是常见的 alpha,beta）—— 写反的后果是 `alpha=0`，
+     输出全是垃圾。crate 自带的单测拿同一个 wrapper 的 `gemm` vs `gemm_fallback` 对比，
+     所以**顺序写反它也能过**；`gemm_row_major_matches_naive`（六个形状：3×5×4、8×8×8、
+     4×64×32、210×1280×1024、64×3072×1024、64×1024×3072，对朴素三重循环）才是真门禁。
+   * rhs 的 stride 是 `(cs=k, rs=1)`（B 是 Wᵀ），不是 `(1, k)` —— 后者在玩具形状上会挂、
+     前者全过；两次猜错都白费了时间，**照单测，别猜**。
+
+**本轮又落地的**（6/6 MATCH，180s_en **2.71 → 3.61×**、180s_zh 2.60 → 3.47×）：
+
+| 改动 | 效果 |
+|---|---|
+| prefill 的 GEMM 交 `gemm` crate（`Parallelism::Rayon(0)`） | prefill 20.2 → **7.2 s**（proj 6005→924、mlp 9836→2069） |
+| decode 的 GEMV 仍手写 | 保持（crate 的 m=1 慢 ~7×） |
+
+六档 RTFx：15s **4.25** / 30s 3.77 / 90s_en 3.95 / 90s_ja 4.17 / 180s_en 3.61 / 180s_zh 3.47。
 
 **还差的 vs 兄弟仓库 CPU（5.50×）**：差的**只有 int8 weight-only**（他们自己量到
 归一化 CER ~1%、180s_zh 3.6% ⇒ 换掉了逐字对齐，本仓库按用户要求不采纳）**和 `gemm` crate

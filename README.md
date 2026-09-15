@@ -17,7 +17,7 @@ against the frozen python-hf text) on every runtime this machine has:
 |---|---|---|---|---|---|---|---|
 | `vulkan:0` | NVIDIA P104-100 | 1012 | 1534 | 5788 | 10.5 s | **17.8×** | MATCH |
 | `dx12:0` | NVIDIA GTX 1070 | 1007 | 1644 | 8934 | 13.7 s | 12.9× | MATCH |
-| `cpu` | host (20 threads, f32 KV) | — | — | — | 65.1 s | 2.71× | MATCH |
+| `cpu` | host (20 threads; `gemm` prefill) | — | — | — | 48.8 s | 3.61× | MATCH |
 | `vulkan:1` | Intel iGPU | 9176 | 14816 | 25062 | 49 s | 3.6× | MATCH |
 | `gl:0` | Intel iGPU (OpenGL) | 7083 | 12131 | 29992 | 51 s | 3.46× | MATCH |
 
@@ -30,8 +30,9 @@ weights per row instead of streaming them once; 5.4 s of prefill when the
 `f16 → f32` conversion sat inside the inner loop; 18 s of a 34 s prefill when
 the attention converted the f16 caches per key per query row; and 136 ms/token
 when the attention was parallelised per row (a decode step *is* one row) instead
-of per `(row, head)`.  Its six-fixture RTFx:
-3.46 / 3.07 / 3.16 / 3.31 / 2.71 / 2.60 (15 s … 180 s).
+of per `(row, head)`.  The prefill's GEMMs go through the `gemm` crate (`gemm_row_major`,
+`Parallelism::Rayon(0)`), the decode's single-row GEMVs stay hand-rolled.  Its
+six-fixture RTFx: 4.25 / 3.77 / 3.95 / 4.17 / 3.61 / 3.47 (15 s … 180 s).
 
 One portability bug had to be fixed to get there, and it is the best argument for
 this table existing: `Features::SUBGROUP` is a *capability*, not a width.  Intel's

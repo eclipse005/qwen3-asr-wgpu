@@ -76,6 +76,15 @@ impl Mat {
     fn batch_dot(&self, x: &[f16], rows: usize, out: &mut [f16]) {
         debug_assert_eq!(x.len(), rows * self.cols);
         debug_assert_eq!(out.len(), rows * self.rows);
+        if rows >= 2 {
+            // Prefill: a real GEMM through the `gemm` crate (see
+            // `gemm_row_major`).  Row-major in and out, so no transpose.
+            let xs = widen_batch(x, rows, self.cols);
+            let mut acc = vec![0.0f32; rows * self.rows];
+            gemm_row_major(&mut acc, &xs, &self.data, rows, self.rows, self.cols, 0.0);
+            out.par_iter_mut().enumerate().for_each(|(i, y)| *y = f16::from_f32(acc[i]));
+            return;
+        }
         let acc = self.dot_transposed(x, rows);
         let n_out = self.rows;
         out.par_iter_mut()
@@ -88,6 +97,15 @@ impl Mat {
     fn batch_dot_acc(&self, x: &[f16], rows: usize, h: &mut [f16]) {
         debug_assert_eq!(x.len(), rows * self.cols);
         debug_assert_eq!(h.len(), rows * self.rows);
+        if rows >= 2 {
+            let xs = widen_batch(x, rows, self.cols);
+            let mut acc = vec![0.0f32; rows * self.rows];
+            gemm_row_major(&mut acc, &xs, &self.data, rows, self.rows, self.cols, 0.0);
+            h.par_iter_mut()
+                .enumerate()
+                .for_each(|(i, y)| *y = f16::from_f32(y.to_f32() + acc[i]));
+            return;
+        }
         let acc = self.dot_transposed(x, rows);
         let n_out = self.rows;
         h.par_iter_mut().enumerate().for_each(|(i, y)| {
@@ -595,6 +613,94 @@ impl CpuTextDecoder {
             self.cfg.num_key_value_heads,
             self.max_seq,
         )
+    }
+}
+
+/// f16 activations → f32, once per op (see [`Mat::dot_transposed`] for why the
+/// conversion must not sit in an inner loop).
+fn widen_batch(x: &[f16], rows: usize, cols: usize) -> Vec<f32> {
+    let mut xs = vec![0.0f32; rows * cols];
+    xs.par_chunks_mut(cols)
+        .zip(x.par_chunks(cols))
+        .for_each(|(dst, src)| {
+            for (d, s) in dst.iter_mut().zip(src) {
+                *d = s.to_f32();
+            }
+        });
+    xs
+}
+
+/// `out[r][o] = Σ_k x[r][k]·w[o][k]` (row-major throughout, `w` = `[n, k]`), via
+/// the `gemm` crate's microkernels with every core forced on.
+///
+/// Two traps, both measured: the two scalars before the strides are
+/// **`(beta, alpha)`** (the crate's own test compares `gemm` against
+/// `gemm_fallback` through the same wrapper, so a swapped pair passes there),
+/// and the strides have to be verified at *production* shapes — small shapes
+/// take a non-packing path, so the unit test below runs both.
+fn gemm_row_major(out: &mut [f32], x: &[f32], w: &[f32], m: usize, n: usize, k: usize, beta: f32) {
+    debug_assert_eq!(out.len(), m * n);
+    debug_assert_eq!(x.len(), m * k);
+    debug_assert_eq!(w.len(), n * k);
+    unsafe {
+        gemm::gemm(
+            m,
+            n,
+            k,
+            out.as_mut_ptr(),
+            1,          // dst: column stride (row-major C)
+            n as isize, // dst: row stride
+            beta != 0.0,
+            x.as_ptr(),
+            1,          // lhs: column stride
+            k as isize, // lhs: row stride
+            w.as_ptr(),
+            k as isize, // rhs: column stride (B is Wᵀ; j+1 advances by k in W)
+            1,          // rhs: row stride (the k axis of W[n][k])
+            beta,
+            1.0,
+            false,
+            false,
+            false,
+            gemm::Parallelism::Rayon(0),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin the `gemm` wrapper against a hand-written triple loop — at a toy
+    /// shape *and* the production ones, because the crate branches (packing,
+    /// threading thresholds) differently there and a stride that is right for
+    /// 3x5x4 was measured to produce garbage at 210x1280x1024.
+    #[test]
+    fn gemm_row_major_matches_naive() {
+        for &(m, n, k) in &[
+            (3usize, 5usize, 4usize),
+            (8, 8, 8),
+            (4, 64, 32),
+            (210, 1280, 1024),
+            (64, 3072, 1024),
+            (64, 1024, 3072),
+        ] {
+            let x: Vec<f32> = (0..m * k).map(|i| ((i * 13 % 61) as f32) * 0.03 - 0.9).collect();
+            let w: Vec<f32> = (0..n * k).map(|i| ((i * 7 % 53) as f32) * 0.02 - 0.5).collect();
+            let mut got = vec![0.0f32; m * n];
+            gemm_row_major(&mut got, &x, &w, m, n, k, 0.0);
+            let mut worst = 0.0f32;
+            for r in 0..m {
+                for o in 0..n {
+                    let mut s = 0.0f32;
+                    for p in 0..k {
+                        s += x[r * k + p] * w[o * k + p];
+                    }
+                    worst = worst.max((got[r * n + o] - s).abs());
+                }
+            }
+            assert!(worst < 1e-3, "shape {m}x{n}x{k}: worst |Δ| = {worst}");
+        }
     }
 }
 
