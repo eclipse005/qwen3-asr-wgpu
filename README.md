@@ -10,15 +10,23 @@ reference's arithmetic (down to accumulation order, the bit-exact `exp`, and
 where f16 rounding happens), and every claim below is measured on the machine
 described under [Measured envelope](#measured-envelope).
 
-**Verified targets** (same verbatim-parity gate on each; 180 s English clip
-unless noted):
+**Verified targets** — the same verbatim-parity gate (0.6B, 180 s English clip,
+against the frozen python-hf text) on every runtime this machine has:
 
-| target | device | subgroup | result |
-|---|---|---|---|
-| `vulkan:0` | NVIDIA P104-100 (dGPU) | 32 | MATCH |
-| `dx12:0` | NVIDIA GTX 1070 (dGPU) | none | MATCH |
-| `vulkan:1` | Intel iGPU | 8..32 | MATCH |
-| `gl:0` | Intel iGPU (OpenGL) | none | MATCH (15 s) |
+| target | device | enc | prefill | decode | elapsed | RTFx | verdict |
+|---|---|---|---|---|---|---|---|
+| `vulkan:0` | NVIDIA P104-100 | 1012 | 1534 | 5788 | 10.5 s | **17.8×** | MATCH |
+| `dx12:0` | NVIDIA GTX 1070 | 1007 | 1644 | 8934 | 13.7 s | 12.9× | MATCH |
+| `cpu` | host (20 threads, f32 widening) | — | — | — | 83.6 s | 2.11× | MATCH |
+| `vulkan:1` | Intel iGPU | 9176 | 14816 | 25062 | 49 s | 3.6× | MATCH |
+| `gl:0` | Intel iGPU (OpenGL) | 7083 | 12131 | 29992 | 51 s | 3.46× | MATCH |
+
+`cpu` is the host decoder (`--cpu-dec`): no adapter, f16 weights widened to f32
+once at load, rayon over output rows (see `src/cpu_decoder.rs` for the three
+measured pathologies that shaped it — 355 ms/token when the GEMV was sliced by
+batch, 5.5 s of prefill when it was sliced by `(row, output)` and re-read the
+weights per row, and conversion-bound inner loops).  Its six-fixture RTFx:
+3.59 / 3.06 / 2.70 / 2.84 / 2.11 / 2.03 (15 s … 180 s).
 
 One portability bug had to be fixed to get there, and it is the best argument for
 this table existing: `Features::SUBGROUP` is a *capability*, not a width.  Intel's

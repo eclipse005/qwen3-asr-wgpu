@@ -43,9 +43,9 @@ pub enum DeviceSelector {
     /// Vulkan, D3D12 or DML, and those are different code paths with different
     /// numerics and different speeds.
     Runtime { api: wgpu::Backend, index: usize },
-    /// Our own CPU implementation.  **Not implemented yet** (only the audio tower
-    /// has a CPU path so far); selecting it says so instead of silently falling
-    /// back to a GPU.
+    /// The host implementation: the CPU audio tower plus
+    /// [`crate::cpu_decoder::CpuTextDecoder`].  Needs no adapter at all, and is
+    /// also what [`Self::Auto`] falls back to when no GPU can be created.
     Cpu,
     /// Debug/addressing view: index into [`list_devices`] (one entry per
     /// *(device, runtime)* pair) — for disambiguating what the listing printed.
@@ -371,11 +371,11 @@ impl Gpu {
     /// Shorthand: `Gpu::new(Some("vulkan:1"))`.
     pub async fn new_with(selector: DeviceSelector) -> Result<Self> {
         if selector == DeviceSelector::Cpu {
+            // `WgpuAsr::load_with_selector` handles `Cpu` before it gets here (it
+            // never creates an adapter); this is the guard for direct callers.
             bail!(
-                "the CPU backend is not implemented yet — only the audio tower has a \
-                 CPU path today (see the CPU section of HANDOFF.md).  A software \
-                 D3D12 device exists on this machine as a stopgap: run with \
-                 `--device dx12` and pick the adapter whose type is Cpu."
+                "DeviceSelector::Cpu is the host backend, not a wgpu device — \
+                 use WgpuAsr::load_on(.., DeviceSelector::Cpu) or `transcribe --cpu-dec`"
             );
         }
         let instance = wgpu::Instance::default();

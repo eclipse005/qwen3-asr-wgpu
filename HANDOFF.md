@@ -3,6 +3,17 @@
 **新窗口请把工作区开在 `D:\qwen3-asr-wgpu`，把本文件全文交给 AI。**
 改完对齐或 RTFx 后同步更新本文。不要再写第二份启动提示词。
 
+> **本窗口（2026-09-15，第三轮）**：**CPU 后端做完了，五个运行时全绿。**
+> `src/cpu_decoder.rs`：f16 权重（load 时一次性展成 f32）+ f32 累加 + rayon 按输出行并行，
+> 逐 op 镜像 GPU 的 f16 舍入点；`--cpu-dec`（= `--device cpu`），**没有 GPU 时 `auto` 自动回落**。
+> 0.6B 六个 fixture **6/6 MATCH**，RTFx 3.59 / 3.06 / 2.70 / 2.84 / 2.11 / 2.03（15s…180s）。
+> 三个实测病理（都写进 `src/cpu_decoder.rs` 的注释）：按 batch 切并行 ⇒ decode 355 ms/token；
+> 按 (行,输出) 切 ⇒ 权重每行重读一次、prefill 5.5 s；`f16→f32` 留在内循环 ⇒
+> 转换受限（125 MB/s）。修完 prefill 5.4 s → 1.36 s。
+> **180s_en 五运行时矩阵（0.6B，逐字对 python-hf，全部 MATCH）**：
+> `vulkan:0` 10.5 s / **17.8×**、`dx12:0` 13.7 s / 12.9×、`cpu` 83.6 s / 2.11×、
+> `vulkan:1`（Intel 集显）49 s / 3.6×、`gl:0` 51 s / 3.46×。
+
 > **本窗口（2026-09-15，第二轮）**：**多设备真的通了**。给 API 加了一等的设备选择
 > （`DeviceSelector` / `list_devices()` / `--device` / `--list-devices`），
 > 顺手抓到并修掉一个跨厂商 bug：**`Features::SUBGROUP` 是能力位、不是宽度** ——

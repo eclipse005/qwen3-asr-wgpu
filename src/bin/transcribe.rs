@@ -40,10 +40,15 @@ fn main() -> Result<()> {
         for t in WgpuAsr::device_targets() {
             println!("{}", t.describe());
         }
-        println!("  {:<10} (not implemented yet — see the CPU section of HANDOFF.md)", "cpu");
+        println!("* {:<10} host backend: CPU audio tower + CPU text decoder (--cpu-dec)", "cpu");
         return Ok(());
     }
-    let adapter = arg(&args, "--device").or_else(|| arg(&args, "--adapter"));
+    // `--cpu-dec` is `--device cpu`; `--cpu-enc` only swaps the audio tower.
+    let adapter = if flag(&args, "--cpu-dec") {
+        Some("cpu".to_string())
+    } else {
+        arg(&args, "--device").or_else(|| arg(&args, "--adapter"))
+    };
     let max_new: usize = arg(&args, "--max-new")
         .and_then(|s| s.parse().ok())
         .unwrap_or(512);

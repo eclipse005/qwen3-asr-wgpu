@@ -322,15 +322,80 @@ impl Diff {
     }
 }
 
+/// Which text decoder this instance runs: the wgpu one, or the host one.
+///
+/// Both expose the same three things the caller needs — `prefill`, `step` and
+/// `max_seq` — so the rest of the engine is backend-agnostic; only the
+/// diagnostics and the per-op timings differ (the CPU path has neither).
+enum TextBackend {
+    Gpu(WgpuTextDecoder),
+    Cpu(crate::cpu_decoder::CpuTextDecoder),
+}
+
+impl TextBackend {
+    fn prefill(&mut self, hidden_words: &[u8], s: usize, kv_start: usize) -> Result<i32> {
+        match self {
+            Self::Gpu(d) => d.prefill(hidden_words, s, kv_start),
+            Self::Cpu(d) => d.prefill(hidden_words, s, kv_start),
+        }
+    }
+
+    fn step(&mut self) -> Result<i32> {
+        match self {
+            Self::Gpu(d) => d.step(),
+            Self::Cpu(d) => d.step(),
+        }
+    }
+
+    fn max_seq(&self) -> usize {
+        match self {
+            Self::Gpu(d) => d.max_seq,
+            Self::Cpu(d) => d.max_seq,
+        }
+    }
+
+    fn gpu(&self) -> Option<&Gpu> {
+        match self {
+            Self::Gpu(d) => Some(&d.gpu),
+            Self::Cpu(_) => None,
+        }
+    }
+
+    /// `(host submit, host read)` milliseconds — the GPU decoder's split of the
+    /// per-step host time.  The CPU path has no submits to account for.
+    fn host_ms(&self) -> (f64, f64) {
+        match self {
+            Self::Gpu(d) => (d.host_submit_ms, d.host_read_ms),
+            Self::Cpu(_) => (0.0, 0.0),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Gpu(d) => format!("gpu ({})", d.gpu.info.name),
+            Self::Cpu(d) => d.describe(),
+        }
+    }
+
+    /// Both decoders take the same f16-rounded tables, so the rotation the model
+    /// sees does not depend on the backend.
+    fn set_rope_tables(&mut self, cos: &[f16], sin: &[f16]) {
+        match self {
+            Self::Gpu(d) => d.set_rope_tables(cos, sin),
+            Self::Cpu(d) => d.set_rope_tables(cos, sin),
+        }
+    }
+}
+
 pub struct WgpuAsr {
     config: AsrConfig,
     tokenizer: Tokenizer,
     encoder: CpuAudioEncoder,
-    /// Present only when [`EncoderBackend::Gpu`] was requested *and* built.
+    /// `None` when the tower is unavailable (or `--cpu-enc` was given).
     gpu_encoder: Option<GpuAudioEncoder>,
     mel: MelExtractor,
     tensors: std::collections::HashMap<String, weights::RawTensor>,
-    decoder: WgpuTextDecoder,
+    decoder: TextBackend,
 }
 
 impl WgpuAsr {
@@ -374,15 +439,31 @@ impl WgpuAsr {
             &config.thinker_config.audio_config,
         )?;
         let n_mels = config.thinker_config.audio_config.num_mel_bins;
-        let gpu = pollster::block_on(Gpu::new_with(selector))?;
-        let gpu_encoder = match backend {
-            EncoderBackend::Cpu => None,
-            EncoderBackend::Gpu => {
+        // `cpu` means the CPU text decoder, which needs no adapter at all; a
+        // GPU selector that cannot be satisfied is an error, except for `auto`,
+        // which falls back to the CPU (that is what "auto" has to mean on a
+        // machine with no usable GPU).
+        let want_cpu = selector == DeviceSelector::Cpu;
+        let gpu = if want_cpu {
+            None
+        } else {
+            match pollster::block_on(Gpu::new_with(selector.clone())) {
+                Ok(g) => Some(g),
+                Err(e) if selector == DeviceSelector::Auto => {
+                    eprintln!("[device] no usable GPU ({e:#}); falling back to the CPU backend");
+                    None
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        let gpu_encoder = match (&gpu, backend) {
+            (None, _) | (_, EncoderBackend::Cpu) => None,
+            (Some(gpu), EncoderBackend::Gpu) => {
                 let ac = &config.thinker_config.audio_config;
                 // `n_window_infer` is the attention window in *mel frames*
                 // (800 shipped = 8 chunks of 100).
                 let window_infer = ac.n_window_infer.max(ac.n_window * 2);
-                match GpuAudioEncoder::load(&gpu, &tensors, "thinker.audio_tower", ac, window_infer) {
+                match GpuAudioEncoder::load(gpu, &tensors, "thinker.audio_tower", ac, window_infer) {
                     Ok(e) => Some(e),
                     Err(e) => {
                         eprintln!("[gpu encoder] unavailable, falling back to CPU: {e:#}");
@@ -392,14 +473,27 @@ impl WgpuAsr {
             }
         };
         let text_cfg = TextConfig::from_model_dir(model_dir)?;
-        let decoder = WgpuTextDecoder::load(
-            gpu,
-            model_dir,
-            "thinker.model",
-            text_cfg,
-            DECODER_MAX_SEQ,
-            DECODER_MAX_SEQ,
-        )?;
+        crate::cpu_decoder::check_config(&text_cfg)?;
+        let mut decoder = match gpu {
+            Some(gpu) => TextBackend::Gpu(WgpuTextDecoder::load(
+                gpu,
+                model_dir,
+                "thinker.model",
+                text_cfg,
+                DECODER_MAX_SEQ,
+                DECODER_MAX_SEQ,
+            )?),
+            None => {
+                eprintln!("[decoder] CPU backend (no GPU involved)");
+                TextBackend::Cpu(crate::cpu_decoder::CpuTextDecoder::load(
+                    model_dir,
+                    "thinker.model",
+                    text_cfg,
+                    DECODER_MAX_SEQ,
+                    DECODER_MAX_SEQ,
+                )?)
+            }
+        };
         let text = &config.thinker_config.text_config;
         let (cos, sin) = compute_mrope_cos_sin(
             &text_positions(DECODER_MAX_SEQ),
@@ -434,14 +528,21 @@ impl WgpuAsr {
         pollster::block_on(crate::gpu::list_targets())
     }
 
-    /// The device this instance actually runs on.
-    pub fn device(&self) -> &wgpu::AdapterInfo {
-        &self.decoder.gpu.info
+    /// The device this instance actually runs on, or `None` on the CPU backend.
+    pub fn device(&self) -> Option<&wgpu::AdapterInfo> {
+        self.decoder.gpu().map(|g| &g.info)
     }
 
-    /// One-line description of that device (name, backend, driver, limits).
+    /// One-line description of the running backend (device name, runtime,
+    /// driver and limits — or that this is the CPU path).
     pub fn device_description(&self) -> String {
-        self.decoder.gpu.describe()
+        match self.decoder.gpu() {
+            Some(g) => g.describe(),
+            None => format!(
+                "cpu ({} threads, f16 weights, rayon)",
+                rayon::current_num_threads()
+            ),
+        }
     }
 
     /// True when the GPU audio tower is loaded (i.e. `--gpu-enc` took effect).
@@ -663,7 +764,10 @@ impl WgpuAsr {
         n_frames: usize,
     ) -> Result<()> {
         let cs = self.encoder.config().n_window * 2;
-        let gpu = self.decoder.gpu();
+        let TextBackend::Gpu(dec) = &self.decoder else {
+            anyhow::bail!("--diag-enc needs the GPU text decoder and audio tower");
+        };
+        let gpu = &dec.gpu;
         let Some(enc) = self.gpu_encoder.as_mut() else {
             anyhow::bail!("--diag-enc needs the GPU audio tower (it is the default; drop --cpu-enc)");
         };
@@ -1066,11 +1170,15 @@ impl WgpuAsr {
         n_frames: usize,
         compare: bool,
     ) -> Result<Vec<f32>> {
+        let TextBackend::Gpu(dec) = &self.decoder else {
+            // CPU text decoder ⇒ no GPU to encode on either.
+            return self.encoder.forward(mel, n_mels, n_frames);
+        };
         let Some(enc) = self.gpu_encoder.as_mut() else {
             return self.encoder.forward(mel, n_mels, n_frames);
         };
         let t = Instant::now();
-        let out16 = enc.encode(self.decoder.gpu(), mel, n_mels, n_frames)?;
+        let out16 = enc.encode(&dec.gpu, mel, n_mels, n_frames)?;
         let gpu_ms = t.elapsed().as_secs_f64() * 1000.0;
         let embeds: Vec<f32> = out16.iter().map(|v| v.to_f32()).collect();
         if compare {
@@ -1228,14 +1336,15 @@ impl WgpuAsr {
             std::fs::write(dir.join("audio_embeds.f32"), bytes)?;
         }
         let gen = self.generate_from_embeds(audio_embeds, max_new_tokens, opts, stream)?;
+        let host = self.decoder.host_ms();
         eprintln!(
             "mel={:.0}ms enc={:.0}ms prefill={:.0}ms decode={:.0}ms [host submit {:.0} / read {:.0}] tokens={} seq={}",
             t_mel_ms,
             t_enc_ms,
             gen.prefill_ms,
             gen.decode_ms,
-            self.decoder.host_submit_ms,
-            self.decoder.host_read_ms,
+            host.0,
+            host.1,
             gen.ids.len(),
             gen.seq_len,
         );
@@ -1277,9 +1386,9 @@ impl WgpuAsr {
         )?;
         let seq_len = input_ids.len();
         anyhow::ensure!(
-            seq_len + max_new_tokens + 8 <= self.decoder.max_seq,
+            seq_len + max_new_tokens + 8 <= self.decoder.max_seq(),
             "seq {seq_len} + max_new {max_new_tokens} exceeds decoder max_seq {}",
-            self.decoder.max_seq
+            self.decoder.max_seq()
         );
 
         let name = "thinker.model.embed_tokens.weight";

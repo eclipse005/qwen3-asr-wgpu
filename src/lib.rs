@@ -18,6 +18,7 @@
 pub mod audio_encoder;
 pub mod audio_encoder_gpu;
 pub mod config;
+pub mod cpu_decoder;
 pub mod cpu_tensor;
 pub mod decoder;
 pub mod golden;
