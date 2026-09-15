@@ -21,33 +21,225 @@ pub struct Gpu {
     pub features: wgpu::Features,
 }
 
+/// Which device to run on.
+///
+/// One binary, several devices is the whole point of the port, so the choice is
+/// explicit and enumerable rather than "whatever wgpu hands back": a caller can
+/// run on the integrated GPU while the discrete one is busy, pin a backend for
+/// an A/B, or address the same machine's adapters by index.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DeviceSelector {
+    /// The default: first discrete GPU, else the first adapter.
+    #[default]
+    Auto,
+    /// Case-insensitive substring of the adapter name (`"nvidia"`, `"arc"`).
+    Name(String),
+    /// Index into [`list_devices`].
+    Index(usize),
+    /// Only consider these backends (Vulkan / Dx12 / Metal / Gl).
+    Backend(wgpu::Backends),
+    /// Only consider this class of device (integrated / discrete / virtual / cpu).
+    Type(wgpu::DeviceType),
+}
+
+impl DeviceSelector {
+    /// Parse a CLI-style spec: `auto`, a name (`nvidia`), `#1`/`1` (index),
+    /// `vulkan|dx12|metal|gl|webgpu` (backend), or
+    /// `integrated|discrete|virtual|cpu` (device type).
+    pub fn parse(spec: &str) -> Result<Self> {
+        let s = spec.trim();
+        if s.is_empty() || s.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        if let Some(rest) = s.strip_prefix('#') {
+            return Self::parse_index(rest);
+        }
+        if let Ok(i) = s.parse::<usize>() {
+            return Ok(Self::Index(i));
+        }
+        let backends: &[(&str, wgpu::Backends)] = &[
+            ("vulkan", wgpu::Backends::VULKAN),
+            ("dx12", wgpu::Backends::DX12),
+            ("d3d12", wgpu::Backends::DX12),
+            ("metal", wgpu::Backends::METAL),
+            ("gl", wgpu::Backends::GL),
+            ("webgpu", wgpu::Backends::BROWSER_WEBGPU),
+        ];
+        if let Some((_, b)) = backends.iter().find(|(n, _)| s.eq_ignore_ascii_case(n)) {
+            return Ok(Self::Backend(*b));
+        }
+        let types: &[(&str, wgpu::DeviceType)] = &[
+            ("integrated", wgpu::DeviceType::IntegratedGpu),
+            ("discrete", wgpu::DeviceType::DiscreteGpu),
+            ("virtual", wgpu::DeviceType::VirtualGpu),
+            ("cpu", wgpu::DeviceType::Cpu),
+        ];
+        if let Some((_, t)) = types.iter().find(|(n, _)| s.eq_ignore_ascii_case(n)) {
+            return Ok(Self::Type(*t));
+        }
+        Ok(Self::Name(s.to_lowercase()))
+    }
+
+    fn parse_index(s: &str) -> Result<Self> {
+        Ok(Self::Index(
+            s.trim().parse::<usize>().context("device index")?,
+        ))
+    }
+
+    fn backends(&self) -> wgpu::Backends {
+        match self {
+            Self::Backend(b) => *b,
+            _ => wgpu::Backends::all(),
+        }
+    }
+
+    fn matches(&self, info: &wgpu::AdapterInfo) -> bool {
+        match self {
+            Self::Auto => true,
+            Self::Name(n) => info.name.to_lowercase().contains(n),
+            Self::Index(_) => true,
+            Self::Backend(b) => match info.backend {
+                wgpu::Backend::Vulkan => b.contains(wgpu::Backends::VULKAN),
+                wgpu::Backend::Dx12 => b.contains(wgpu::Backends::DX12),
+                wgpu::Backend::Metal => b.contains(wgpu::Backends::METAL),
+                wgpu::Backend::Gl => b.contains(wgpu::Backends::GL),
+                wgpu::Backend::BrowserWebGpu => b.contains(wgpu::Backends::BROWSER_WEBGPU),
+                _ => false,
+            },
+            Self::Type(t) => info.device_type == *t,
+        }
+    }
+}
+
+/// `#0 NVIDIA … (Vulkan, DiscreteGpu), #1 Intel …` — for "no such device" errors.
+fn list_names(adapters: &[wgpu::Adapter]) -> String {
+    adapters
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let info = a.get_info();
+            format!("#{i} {} ({:?}, {:?})", info.name, info.backend, info.device_type)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One enumerated adapter — everything you need to *choose* a device, and to
+/// know whether it can run this engine at all, without creating one.
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    pub name: String,
+    pub backend: wgpu::Backend,
+    pub device_type: wgpu::DeviceType,
+    pub driver: String,
+    pub driver_info: String,
+    /// `max_storage_buffer_binding_size` — the limit the tiling exists for.
+    pub max_binding_bytes: u64,
+    pub max_workgroup_storage: u32,
+    pub subgroup: bool,
+    /// The adapter's promised subgroup width range.  Kernels that fold lane xors
+    /// need `32..=32`; anything else must take the shared-memory path.
+    pub subgroup_min: u32,
+    pub subgroup_max: u32,
+    pub timestamps: bool,
+}
+
+impl DeviceInfo {
+    /// One line, same shape as [`Gpu::describe`].
+    pub fn describe(&self) -> String {
+        let sg = if !self.subgroup {
+            "none".to_string()
+        } else if self.subgroup_min == self.subgroup_max {
+            self.subgroup_min.to_string()
+        } else {
+            format!("{}..{}", self.subgroup_min, self.subgroup_max)
+        };
+        format!(
+            "{} ({:?}, {:?}) | {} {} | wg workgroup storage {} B, binding {} MiB, subgroup {sg}",
+            self.name,
+            self.backend,
+            self.device_type,
+            self.driver,
+            self.driver_info,
+            self.max_workgroup_storage,
+            self.max_binding_bytes / (1024 * 1024),
+        )
+    }
+
+    fn from_adapter(a: &wgpu::Adapter) -> Self {
+        let i = a.get_info();
+        let l = a.limits();
+        let f = a.features();
+        Self {
+            name: i.name,
+            backend: i.backend,
+            device_type: i.device_type,
+            driver: i.driver,
+            driver_info: i.driver_info,
+            max_binding_bytes: l.max_storage_buffer_binding_size,
+            max_workgroup_storage: l.max_compute_workgroup_storage_size,
+            subgroup: f.contains(wgpu::Features::SUBGROUP),
+            subgroup_min: i.subgroup_min_size,
+            subgroup_max: i.subgroup_max_size,
+            timestamps: f.contains(wgpu::Features::TIMESTAMP_QUERY),
+        }
+    }
+}
+
+/// Every adapter this instance can see, in wgpu's enumeration order — the order
+/// [`DeviceSelector::Index`] indexes into.
+pub async fn list_devices() -> Vec<DeviceInfo> {
+    let instance = wgpu::Instance::default();
+    instance
+        .enumerate_adapters(wgpu::Backends::all())
+        .await
+        .iter()
+        .map(DeviceInfo::from_adapter)
+        .collect()
+}
+
 impl Gpu {
     /// Enumerate adapters and pick one.  `prefer` matches a case-insensitive
     /// substring of the adapter name (e.g. `"nvidia"`, `"intel"`); without it the
     /// first discrete GPU wins, falling back to whatever is available.
+    ///
+    /// Shorthand for [`Gpu::new_with`] with [`DeviceSelector::Name`] / `Auto`.
     pub async fn new(prefer: Option<&str>) -> Result<Self> {
+        let sel = match prefer {
+            Some(p) => DeviceSelector::parse(p)?,
+            None => DeviceSelector::Auto,
+        };
+        Self::new_with(sel).await
+    }
+
+    /// The explicit form: choose by name, index, backend or device type.
+    pub async fn new_with(selector: DeviceSelector) -> Result<Self> {
         let instance = wgpu::Instance::default();
-        let adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
+        let adapters = instance.enumerate_adapters(selector.backends()).await;
         if adapters.is_empty() {
-            bail!("no wgpu adapters found");
+            bail!(
+                "no wgpu adapters found (selector {selector:?}); try listing them first"
+            );
         }
 
-        let mut chosen = None;
-        if let Some(w) = prefer {
-            let w = w.to_lowercase();
-            chosen = adapters
-                .iter()
-                .find(|a| a.get_info().name.to_lowercase().contains(&w));
-            if chosen.is_none() {
-                bail!("no adapter matching {:?}", w);
-            }
-        }
-        let adapter = match chosen {
-            Some(a) => a,
-            None => adapters
+        let adapter = match &selector {
+            DeviceSelector::Auto => adapters
                 .iter()
                 .find(|a| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu)
                 .unwrap_or(&adapters[0]),
+            DeviceSelector::Index(i) => adapters.get(*i).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "device #{i} does not exist ({} adapter(s) visible: {})",
+                    adapters.len(),
+                    list_names(&adapters)
+                )
+            })?,
+            sel => adapters.iter().find(|a| sel.matches(&a.get_info())).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no adapter matches {sel:?} (visible: {})",
+                    list_names(&adapters)
+                )
+            })?,
         };
 
         let info = adapter.get_info();

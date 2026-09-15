@@ -12,7 +12,7 @@ use crate::audio_encoder::CpuAudioEncoder;
 use crate::audio_encoder_gpu::GpuAudioEncoder;
 use crate::config::AsrConfig;
 use crate::decoder::{TextConfig, WgpuTextDecoder};
-use crate::gpu::Gpu;
+use crate::gpu::{DeviceSelector, Gpu};
 use crate::mel::{load_audio_wav, MelExtractor, HOP_LENGTH, MEL_SAMPLE_RATE, N_FFT};
 use crate::mrope::{compute_mrope_cos_sin, text_positions};
 use crate::prompt::{self, TranscribeResult, ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID};
@@ -340,9 +340,27 @@ impl WgpuAsr {
         Self::load_with(model_dir, adapter, EncoderBackend::Gpu)
     }
 
+    /// [`Self::load`] with an explicit [`DeviceSelector`] — by name, index,
+    /// backend or device type.  See [`crate::gpu::list_devices`] to enumerate.
+    pub fn load_on(model_dir: &Path, selector: DeviceSelector) -> Result<Self> {
+        Self::load_with_selector(model_dir, selector, EncoderBackend::Gpu)
+    }
+
     pub fn load_with(
         model_dir: &Path,
         adapter: Option<&str>,
+        backend: EncoderBackend,
+    ) -> Result<Self> {
+        let selector = match adapter {
+            Some(a) => DeviceSelector::parse(a)?,
+            None => DeviceSelector::Auto,
+        };
+        Self::load_with_selector(model_dir, selector, backend)
+    }
+
+    pub fn load_with_selector(
+        model_dir: &Path,
+        selector: DeviceSelector,
         backend: EncoderBackend,
     ) -> Result<Self> {
         let config = AsrConfig::from_file(&model_dir.join("config.json"))
@@ -356,7 +374,7 @@ impl WgpuAsr {
             &config.thinker_config.audio_config,
         )?;
         let n_mels = config.thinker_config.audio_config.num_mel_bins;
-        let gpu = pollster::block_on(Gpu::new(adapter))?;
+        let gpu = pollster::block_on(Gpu::new_with(selector))?;
         let gpu_encoder = match backend {
             EncoderBackend::Cpu => None,
             EncoderBackend::Gpu => {
@@ -402,6 +420,22 @@ impl WgpuAsr {
             tensors,
             decoder,
         })
+    }
+
+    /// Every adapter wgpu can see on this machine, in the order
+    /// [`DeviceSelector::Index`] indexes into.  Cheap: no device is created.
+    pub fn devices() -> Vec<crate::gpu::DeviceInfo> {
+        pollster::block_on(crate::gpu::list_devices())
+    }
+
+    /// The device this instance actually runs on.
+    pub fn device(&self) -> &wgpu::AdapterInfo {
+        &self.decoder.gpu.info
+    }
+
+    /// One-line description of that device (name, backend, driver, limits).
+    pub fn device_description(&self) -> String {
+        self.decoder.gpu.describe()
     }
 
     /// True when the GPU audio tower is loaded (i.e. `--gpu-enc` took effect).

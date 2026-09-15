@@ -29,7 +29,17 @@ fn main() -> Result<()> {
     let wav = PathBuf::from(arg(&args, "--wav").unwrap_or_else(|| {
         r"D:\qwen3-asr-rs\tests\fixtures\15s_en.wav".to_string()
     }));
-    let adapter = arg(&args, "--adapter");
+    // Device selection: `--adapter nvidia` (name substring, the old spelling)
+    // or `--device <spec>` with `auto | name | #index | index | vulkan|dx12|metal|gl
+    // | integrated|discrete|virtual|cpu`.  `--list-devices` prints what is
+    // visible and exits.
+    if flag(&args, "--list-devices") || flag(&args, "--devices") {
+        for (i, d) in WgpuAsr::devices().iter().enumerate() {
+            println!("[{i}] {}  timestamps={}", d.describe(), d.timestamps);
+        }
+        return Ok(());
+    }
+    let adapter = arg(&args, "--device").or_else(|| arg(&args, "--adapter"));
     let max_new: usize = arg(&args, "--max-new")
         .and_then(|s| s.parse().ok())
         .unwrap_or(512);

@@ -505,7 +505,16 @@ impl WgpuTextDecoder {
         // 5 shared-memory rounds.  Both produce the SAME reduction tree, so the
         // results are bit-identical (A/B: 1.17-1.18x, 0 differing outputs on
         // 18992 rows) — see `shaders::gemv` and `docs/wgpu-best-practices-audit.md`.
-        let subgroup = gpu.features.contains(wgpu::Features::SUBGROUP);
+        //
+        // The capability bit alone is NOT enough: the butterfly folds lane xors
+        // 16/8/4/2/1 and maps output rows with `warp = lid >> 5`, i.e. it assumes
+        // exactly 32 lanes.  Intel's Vulkan driver reports SUBGROUP as a range
+        // (8..32) and taking it produced a model's worth of garbage with no
+        // error anywhere — the failure was visible only in the transcript.  Use
+        // the shuffle path only when the adapter promises exactly 32 lanes.
+        let subgroup = gpu.features.contains(wgpu::Features::SUBGROUP)
+            && gpu.info.subgroup_min_size == 32
+            && gpu.info.subgroup_max_size == 32;
         let pipes = Pipes {
             gemv_qkv: build("gemv_qkv", &shaders::gemv(cfg.fused_qkv_cols(), hs, false, subgroup), "gemv", None)?,
             gemv_o: build("gemv_o", &shaders::gemv(hs, q_dim, true, subgroup), "gemv", None)?,

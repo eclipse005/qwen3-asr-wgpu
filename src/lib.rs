@@ -31,7 +31,7 @@ pub mod shaders;
 pub mod weights;
 
 pub use decoder::{TextConfig, WgpuTextDecoder};
-pub use gpu::Gpu;
+pub use gpu::{list_devices, DeviceInfo, DeviceSelector, Gpu};
 pub use inference::{supported_languages, StreamToken, TranscribeOptions, WgpuAsr};
 pub use processor::{AsrTranscription, Decoded, ReturnFormat, TranscriptionRequest};
 pub use prompt::TranscribeResult;
