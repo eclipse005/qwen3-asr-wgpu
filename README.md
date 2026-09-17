@@ -1,46 +1,10 @@
 # qwen3-asr-wgpu
 
-A **wgpu** inference engine for [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR):
-the whole pipeline — log-mel front end, audio tower, text decoder — runs on the
-GPU through one WebGPU-style API, so the same code targets Vulkan, D3D12 and
-Metal instead of one vendor's runtime.
+[Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) 的 Rust + wgpu 推理实现。整条流水线——log-mel 前端、音频塔、文本解码器——都跑在 GPU 上：同一份 WGSL 内核、同一套算术，由 **Vulkan / Metal / D3D12 / OpenGL(ES)** 任意一条运行时驱动，另有自带的 CPU 后端，零深度学习框架依赖。
 
-It is a *port*, not a re-implementation: every kernel is written against the
-reference's arithmetic (down to accumulation order, the bit-exact `exp`, and
-where f16 rounding happens), and every claim below is measured on the machine
-described under [Measured envelope](#measured-envelope).
+Qwen3-ASR 是阿里通义千问开源的语音识别模型，官方称支持 52 种语言和方言，提供 0.6B 与 1.7B 两种规格。本实现的验收门禁是官方 python-hf 的冻结转写文本：0.6B / 1.7B × 6 条音频（15 s ~ 180 s）12/12 逐字节一致，每次改动重跑。
 
-**Verified targets** — the same verbatim-parity gate (0.6B, 180 s English clip,
-against the frozen python-hf text) on every runtime this machine has:
-
-| target | device | enc | prefill | decode | elapsed | RTFx | verdict |
-|---|---|---|---|---|---|---|---|
-| `vulkan:0` | NVIDIA P104-100 | 1012 | 1534 | 5788 | 10.5 s | **17.8×** | MATCH |
-| `dx12:0` | NVIDIA GTX 1070 | 1007 | 1644 | 8934 | 13.7 s | 12.9× | MATCH |
-| `cpu` | host (20 threads; `gemm` prefill) | — | — | — | 48.8 s | 3.61× | MATCH |
-| `vulkan:1` | Intel iGPU | 9176 | 14816 | 25062 | 49 s | 3.6× | MATCH |
-| `gl:0` | Intel iGPU (OpenGL) | 7083 | 12131 | 29992 | 51 s | 3.46× | MATCH |
-
-On **D3D12 the pipeline build takes ~5.5 minutes** (344 s on Intel, 328 s on
-NVIDIA, against 4.6 / 6.6 s on Vulkan for their own Vulkan adapters).  It is not
-cached away: wgpu 30's D3D12 backend does not expose
-`Features::PIPELINE_CACHE`, so there is no cache to persist the build into where
-it actually hurts — and on Vulkan, which does expose it, the build is a rounding
-error (cold and warm loads both measure 6.7 s).  The timings above are *after*
-that load; D3D12 stays a fallback for when Vulkan is unavailable, and `vulkan:N`
-is the practical choice.
-
-`cpu` is the host backend (`--cpu-dec`): no adapter, f16 weights widened to f32
-once at load, rayon over output rows and over `(row, head)` in the attention.
-Its six-fixture RTFx: 4.25 / 3.77 / 3.95 / 4.17 / 3.61 / 3.47 (15 s … 180 s).
-
-`Features::SUBGROUP` is a capability, not a width: some drivers grant it with
-`subgroup_min_size..max_size = 8..32`, where a 32-lane xor butterfly reduces
-across the wrong lanes and the model produces fluent garbage with no error
-anywhere.  Shuffle paths are gated on the adapter promising exactly 32 lanes;
-the shared-memory fallback is bit-identical.
-
-```
+```text
 wav ──► mel (STFT, 128 bins) ──► audio tower (conv stem + 18 transformer layers)
                                    │
                                    ▼
@@ -50,43 +14,79 @@ wav ──► mel (STFT, 128 bins) ──► audio tower (conv stem + 18 transfo
                      language <NAME><asr_text>transcript
 ```
 
-## Status
+## 多后端支持
 
-| | |
-|---|---|
-| **Parity** | **12/12** byte-identical to the frozen Python reference (`0.6B` and `1.7B` × 6 clips, 15 s … 180 s), re-gated on every change |
-| **RTFx** (0.6B, 15 s → 180 s) | 24.4 / 21.3 / 19.7 / 24.0 / 17.8 / 20.1 (English short → Chinese 180 s) |
-| **VRAM** (peak, 15 s → 180 s) | 2.05 → 2.80 GiB (**0.6B**) and 4.34 → 5.34 GiB (**1.7B**) — the KV cache is grown on demand, so the floor is what a 15 s clip costs |
-| **vs Python on the same GPU** | 1.95× (0.6B) and 1.52× (1.7B) over 29 languages × 20 clips (FLEURS; WER/CER within ±0.7 pp) |
-| **Long audio** | a **15-minute** clip transcribes end to end — 12 065-token prompt, 3 343-token transcript, 98 s, RTFx 9.4 |
-| **Not ported** | time stamps (`Qwen3-ForcedAligner` is a second model), batching, the vLLM backend |
+选择轴是**运行时**，不是硬件厂商：同一张卡可以通过多条运行时走到，而那是不同的代码路径（数值也可能不同），所以厂商与设备类型只出现在设备列表里，不出现在选择器里。带索引的写法用于同一运行时的多块设备，形状同 llama.cpp 的 `Vulkan0` / `CPU`。
 
-Long audio is the interesting case: materialising the `s²` attention matrix at 15
-minutes is 2 × 4.7 GB and does not fit an 8 GB card. This port tiles the prefill
-attention into key slabs, which is what turns "refused" into "runs".
-
-## Quick start
+| 运行时 | 说明 |
+|--------|------|
+| `vulkan[:N]` | Vulkan |
+| `metal[:N]` | Metal（macOS / iOS） |
+| `dx12[:N]` | D3D12；wgpu 在 Windows 上走 D3D12 compute，没有 DirectML（那是另一套 API） |
+| `gl[:N]` | OpenGL / GLES，wgpu 的兼容运行时，能力最弱，老机器只剩它 |
+| `cpu` | 自带的 CPU 后端：CPU 音频塔 + CPU 文本解码，不创建 adapter |
+| `auto` | 默认：独显 → 集显 → 兜底 |
 
 ```bash
-cargo build --release
+cargo run --release --bin transcribe -- --list-devices   # 只列设备，不创建 device
+# * vulkan:0   NVIDIA P104-100 (NVIDIA, dGPU, driver …) binding 2047 MiB, subgroup 32
+#   dx12:0     NVIDIA GeForce GTX 1070 (NVIDIA, dGPU, …) binding 2047 MiB, no subgroup
+#   vulkan:1   Intel(R) Graphics (Intel, iGPU, …) binding 1023 MiB, subgroup 8..32
+#   gl:0       Intel(R) Graphics (Intel, iGPU, …) binding 1024 MiB, no subgroup
+#   cpu        the host backend (CPU audio tower + CPU text decoder)
+
+cargo run --release --bin transcribe -- --device vulkan:1 …   # 集显走 Vulkan
+cargo run --release --bin transcribe -- --device dx12:0 …     # 独显走 D3D12
+cargo run --release --bin transcribe -- --device nvidia …     # 适配器名子串（兜底写法）
 ```
 
-Weights: the `-hf` checkpoints (`Qwen/Qwen3-ASR-0.6B`, `Qwen/Qwen3-ASR-1.7B`).
-The loader reads `thinker.model.*` tensors straight out of the safetensors file.
+同一份门禁（0.6B、180 s 英文、对冻结 python-hf 文本逐词比对）在这台机器上每条运行时的读数：
+
+| 后端 | 设备 | enc | prefill | decode | elapsed | RTFx | 结果 |
+|------|------|-----|---------|--------|---------|------|------|
+| `vulkan:0` | NVIDIA P104-100 | 1012 | 1534 | 5788 | 10.5 s | **17.8×** | MATCH |
+| `dx12:0` | NVIDIA GTX 1070 | 1007 | 1644 | 8934 | 13.7 s | 12.9× | MATCH |
+| `cpu` | 主机（20 线程，`gemm` prefill） | — | — | — | 48.8 s | 3.61× | MATCH |
+| `vulkan:1` | Intel 集显 | 9176 | 14816 | 25062 | 49 s | 3.6× | MATCH |
+| `gl:0` | Intel 集显（OpenGL） | 7083 | 12131 | 29992 | 51 s | 3.46× | MATCH |
+
+两点说明：
+
+* **D3D12 的 pipeline 构建约 5.5 分钟**（Intel 344 s、NVIDIA 328 s；同一台机器上各自的 Vulkan adapter 只要 4.6 / 6.6 s），上表是构建之后的读数。wgpu 30 的 D3D12 后端不暴露 `Features::PIPELINE_CACHE`，这笔开销缓存不掉，所以 D3D12 只作 Vulkan 不可用时的兜底，日常用 `vulkan:N`。
+* **`Features::SUBGROUP` 是能力，不是宽度**：有的驱动会给出 8..32 的区间，此时 32 lane 的 xor butterfly 会归约到错误的 lane，模型流畅地输出垃圾而全程零报错。所有 shuffle 路径都以「adapter 明确承诺正好 32 lane」为前提，否则退回 shared-memory 路径（结果逐位相同）。`--list-devices` 把 subgroup 宽度列出来，就是为了这个。
+
+`cpu` 是自带的主机后端（`--cpu-dec`）：不用 adapter，加载时把 f16 权重展宽成 f32，用 rayon 并行输出行与 attention 的 `(row, head)`。它六条 fixture 的 RTFx：4.25 / 3.77 / 3.95 / 4.17 / 3.61 / 3.47。
+
+Metal 的代码路径在（同一批 WGSL 内核 + 运行时协商的 limits），但这台机器上没有跑过：只标「未验证」，不替它下结论——没跑过就是没跑过，未验证不等于不可用。
+
+## 安装
+
+```toml
+[dependencies]
+qwen3-asr-wgpu = { git = "https://github.com/eclipse005/qwen3-asr-wgpu.git" }
+```
+
+| Feature | 说明 |
+|---------|------|
+| `hub` | 从 HuggingFace 下载模型（`AsrInference::from_pretrained`）。默认关闭：它会把 reqwest 和 TLS 一起拉进来，而本地 checkpoint 并不需要 |
+
+命令行工具：`cargo build --release`，产物是 `target/release/transcribe`。
+
+## 使用
+
+### 命令行
 
 ```bash
-# whole pipeline, one call
 cargo run --release --bin transcribe -- \
-    --model  /path/to/Qwen3-ASR-0.6B-hf \
-    --wav    clip.wav --adapter nvidia --max-new 512
+    --model /path/to/Qwen3-ASR-0.6B-hf \
+    --wav   clip.wav --device vulkan:0 --max-new 512
 ```
 
-Useful flags: `--lang en` (force a language; ISO code or full name), `--context`
-/`--prompt "hotwords"` (the chat template's system message), `--languages`,
-`--cpu-enc` (CPU audio tower, for A/B), `--baseline file.txt` (compare against a
-frozen reference text), `--dump dir/` (mel/embeddings/ids).
+`--model` 也可以走 `QASR_MODEL`，`--wav` 走 `QASR_WAV`。
 
-### Library use
+常用参数：`--lang en`（强制语言，ISO 码或全名，按参考实现的 30 个语言名校验）、`--context` / `--prompt "hotwords"`（chat template 的 system message）、`--languages`（打印支持的语言）、`--cpu-enc`（音频塔走 CPU，用于 A/B）、`--baseline file.txt`（与冻结参考文本比对，打印 `MATCH` / `MISMATCH`）、`--dump dir/`（导出 mel / embeddings / ids）。
+
+### 作为库
 
 ```rust
 use qwen3_asr_wgpu::{AsrInference, Backend, TranscribeOptions};
@@ -96,9 +96,7 @@ let out = asr.transcribe("clip.wav", TranscribeOptions::default())?;
 println!("[{}] {}", out.language, out.text);
 ```
 
-`AsrInference` owns the model and every method takes `&self`, so one instance can
-be *shared* rather than duplicated — 0.6B's weights are ~1.2 GiB and each copy
-would carry its own KV cache too:
+`AsrInference` 持有模型且所有方法都是 `&self`，所以一个实例可以 `Arc` 出去共享——0.6B 的权重约 1.2 GiB，每份拷贝还会各带一套 KV cache：
 
 ```rust
 let asr = std::sync::Arc::new(AsrInference::load(dir, Backend::best())?);
@@ -106,18 +104,9 @@ let worker = std::sync::Arc::clone(&asr);
 std::thread::spawn(move || worker.transcribe("clip.wav", TranscribeOptions::default()));
 ```
 
-Concurrent calls serialize on the internal mutex; a transcription is not split
-across threads. Everything else is per-call state — each generation prefills its
-own prompt from KV position zero, so nothing leaks between calls.
+并发调用在内部的互斥锁上串行；一次转写不会被拆到多个线程上。其余都是每次调用各自的状态——每次生成都从 KV 位置 0 重新 prefill，调用之间不残留。
 
-Errors are one enum, `AsrError` (`ModelLoad`, `AudioDecode`, `Inference`,
-`InvalidOptions`), with `Result<T>` as the alias every entry point returns.
-
-`TranscribeOptions` carries the whole request — `language` (ISO code or full
-name, validated against the 30 supported ones), `context` (the hotwords that
-become the chat template's `system` message) and `max_new_tokens` (default
-2048). There is no second, positional copy of the ceiling to fall out of sync
-with. The struct is `#[non_exhaustive]` and has `with_*` setters:
+`TranscribeOptions` 承载整个请求（`language`、`context`、`max_new_tokens`，默认 2048），是 `#[non_exhaustive]` 的，配 `with_*` setter：
 
 ```rust
 let opts = TranscribeOptions::default()
@@ -126,135 +115,76 @@ let opts = TranscribeOptions::default()
     .with_max_new_tokens(700);
 ```
 
-When a language is forced the result reports it back in
-`TranscribeResult::language`; with auto-detection the field is whatever the model
-named. Streaming is the same picture — `transcribe_streaming` takes a per-token
-callback, and `create_streaming_session` takes audio incrementally
-(`push_samples` → `flush`).
+强制语言时结果会把语言回填到 `TranscribeResult::language`；自动识别时这个字段是模型自己命名的那个。流式是同一套：`transcribe_streaming` 接每 token 的回调，`create_streaming_session` 接增量音频（`push_samples` → `flush`）。
 
-With `features = ["hub"]`, `AsrInference::from_pretrained(model_id, cache_dir, backend)`
-downloads `Qwen/Qwen3-ASR-0.6B` (or `1.7B`) and loads it; the `hub` feature is
-off by default because it pulls in reqwest and TLS.
+错误是一个枚举 `AsrError`（`ModelLoad` / `AudioDecode` / `Inference` / `InvalidOptions`），各入口统一返回 `Result<T>`。
 
-### Choosing the runtime and device
-
-The selectable axis is the **runtime**, with an optional index for machines that
-have several devices on one runtime — the shape ONNX Runtime's execution
-providers and llama.cpp's `CUDA0`/`Vulkan0`/`CPU` names use.  The **vendor is
-not a selector**: a card of one vendor is reachable through several runtimes, and
-those are different code paths (they even differ in numerics — see the parity
-matrix above), so vendor and device class belong in the listing, not the choice.
-
-```bash
-cargo run --release --bin transcribe -- --list-devices
-# * vulkan:0   NVIDIA P104-100 (NVIDIA, dGPU, driver 572.75) binding 2047 MiB, subgroup 32
-#   dx12:0     NVIDIA GeForce GTX 1070 (NVIDIA, dGPU, ...) binding 2047 MiB, no subgroup
-#   vulkan:1   Intel(R) Graphics (Intel, iGPU, ...) binding 1023 MiB, subgroup 8..32
-#   dx12:1     Intel(R) Graphics (Intel, iGPU, ...) binding 2047 MiB, no subgroup
-#   gl:0       Intel(R) Graphics (Intel, iGPU, ...) binding 1024 MiB, no subgroup
-#   dx12:3     Microsoft Basic Render Driver (Microsoft, CPU, ...)
-#   cpu        the host backend (CPU audio tower + CPU text decoder)
-
-cargo run --release --bin transcribe -- --device vulkan:1 …   # iGPU through Vulkan
-cargo run --release --bin transcribe -- --device dx12:0 …     # dGPU through D3D12
-```
-
-The runtimes are `vulkan`, `metal`, `dx12`, `gl` (the four wgpu drives) and
-`cpu` (our own host implementation).  There is deliberately **no `cuda` and no
-`dml`**: this crate has no CUDA backend, and wgpu drives Windows through D3D12
-*compute* — DirectML is a different API that would be a separate integration.
-`gl` is wgpu's compatibility runtime (OpenGL/GLES, weakest feature set); it is
-kept in the list because old machines only have it.
-
-**What is verified where.** Everything above was measured on Windows + NVIDIA.
-The Vulkan, D3D12, GL and host paths are all gated on this machine; the Metal
-path has not been run anywhere.  Nothing in the engine is Windows- or
-NVIDIA-specific — the shaders are WGSL, the device is whatever
-`DeviceSelector` picks, and `build.rs` builds the vendored resampler with CMake
-on any platform — but "not verified" is not "works", and the first run on a new
-runtime is where a driver-specific surprise would show up.  The likely one is
-subgroup handling: shuffle paths are gated on the adapter promising exactly 32
-lanes, and the shared-memory fallback is bit-identical, so an adapter that
-reports something else takes the slow-but-correct path.
+### 设备选择（库内）
 
 ```rust
 use qwen3_asr_wgpu::{AsrInference, DeviceSelector};
 
-for t in AsrInference::device_targets() { println!("{}", t.describe()); }  // no device created
-let asr = AsrInference::load_on("model-dir".as_ref(),
-                                DeviceSelector::Runtime { api: wgpu::Backend::Vulkan, index: 1 })?;
+for t in AsrInference::device_targets() { println!("{}", t.describe()); }   // 不创建 device
+let asr = AsrInference::load_on("model-dir".as_ref(), DeviceSelector::parse("vulkan:1")?)?;
 println!("running on {}", asr.device_description());
 ```
 
-`--adapter <name>` (the older spelling) still works and is the last-resort
-substring form.  Whatever a target grants — binding limit, workgroup storage,
-subgroup width — the engine reads from the *negotiated* limits, so a target that
-cannot run a given clip is refused explicitly rather than producing garbage.
+`Backend` 是粗粒度的一词选择（`Auto` / `Gpu` / `Cpu`），`DeviceSelector` 是细粒度的运行时 + 索引；`--adapter <name>` 是更早的写法，现在退化成「适配器名子串」这一种。目标给出的能力（binding 上限、workgroup storage、subgroup 宽度）一律按协商后的 limits 读取，跑不动就明确拒绝，而不是产出垃圾。
 
-### The reference pipeline's API
+### 与参考实现相同的三段式 API
 
-The Python side is three steps — `processor.apply_transcription_request(...)`,
-`model.generate(**inputs, ...)`, `processor.decode(ids, return_format=...)` —
-and so is this crate ([`src/processor.rs`](src/processor.rs)):
+Python 侧是 `processor.apply_transcription_request(...)` → `model.generate(...)` → `processor.decode(ids, return_format=...)` 三步，本 crate 也是（`src/processor.rs`）：
 
 ```rust
 use qwen3_asr_wgpu::{AsrInference, Backend, ReturnFormat, TranscribeOptions};
 
 let asr = AsrInference::load("Qwen3-ASR-0.6B-hf".as_ref(), Backend::best())?;
-let opts = TranscribeOptions::default().with_max_new_tokens(512);  // + language, context
+let opts = TranscribeOptions::default().with_max_new_tokens(512);
 
-let req  = asr.apply_transcription_request_file("clip.wav".as_ref(), &opts)?;
-let ids  = asr.generate(&req)?;                          // greedy, stops at EOS
-let out  = asr.decode(&ids, ReturnFormat::Parsed)?;      // {"language", "transcription"}
+let req = asr.apply_transcription_request_file("clip.wav".as_ref(), &opts)?;
+let ids = asr.generate(&req)?;                        // 贪心，遇到 EOS 停
+let out = asr.decode(&ids, ReturnFormat::Parsed)?;    // {"language", "transcription"}
 println!("{}: {}", out.language().unwrap_or("?"), out.transcription_text());
 ```
 
-`max_new_tokens` rides in the request's options rather than being passed again to
-`generate`, so the ceiling is fixed where the request is built — the same rule
-`transcribe` follows.
+`max_new_tokens` 固定在请求的 options 里，不再传给 `generate`——上限只有一个地方定义。
 
-`decode` implements all three upstream formats (`Raw`, `Parsed`,
-`TranscriptionOnly`) with the reference's exact semantics — including
-`Raw` keeping the special tokens and `Parsed` dropping them. Note that `decode`
-reports the language the *model* named, which is the reference's
-`_parse_single_output`: when the language was forced the metadata lives in the
-prompt and the field is empty. `transcribe` fills it in from the request instead
-— the one place the two disagree. The `#[ignore]`d test
-`processor_api_matches_the_one_call_wrapper` pins them together.
+`decode` 实现了上游全部三个格式（`Raw` / `Parsed` / `TranscriptionOnly`），语义照搬：`Raw` 保留特殊 token，`Parsed` 去掉。注意 `decode` 报的是**模型自己说出**的语言（参考实现的 `_parse_single_output`）：强制语言时元信息在 prompt 里，这个字段是空的；`transcribe` 会从请求里把它补上——这是两者唯一不一致的地方，`#[ignore]` 的测试 `processor_api_matches_the_one_call_wrapper` 把它钉住。
 
-## Verification
+## 模型下载
 
-* `cargo test --release` — the pure-CPU half (tokenizer / prompt / mel geometry,
-  config parsing).
-* `cargo test --release --test public_api -- --ignored` — the public API against
-  a real model: the frozen-text check, `Backend::Cpu`, the incremental session,
-  and one instance serving two threads.  Needs
-  `QASR_TEST_MODEL` / `QASR_TEST_WAV`, and `QASR_TEST_BASELINE` for the
-  verbatim comparison.
-* `cargo run --release --bin transcribe -- --model <dir> --wav clip.wav
-  --adapter nvidia --max-new 512 --baseline frozen.txt` — the whole pipeline,
-  with a verbatim comparison against a frozen reference transcript
-  (`MATCH` / `MISMATCH`).
-* `cargo run --release --bin transcribe -- --diag-enc` — the audio tower's own
-  oracle: stage by stage against the host reference, including a host
-  recomputation of the attention operands.
+权重用 `-hf` checkpoint（版权归原作者）：
 
-## Measured envelope
+- [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B)
+- [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B)
 
-Same machine throughout (Windows, NVIDIA P104-100 8 GB, Vulkan, one GPU job at a
-time). 0.6B unless noted.
+加载器直接按 `thinker.model.*` 从 safetensors 里取张量。打开 `hub` feature 后还可以用 `AsrInference::from_pretrained("Qwen/Qwen3-ASR-0.6B", cache_dir, backend)` 直接下载。
 
-| clip | mel | audio tower | prefill | decode | total | RTFx |
-|---|---|---|---|---|---|---|
+官方项目与文档：
+
+- 代码与说明：[QwenLM/Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR)
+- 模型集合：[Qwen3-ASR on Hugging Face](https://huggingface.co/collections/Qwen/qwen3-asr)
+
+## 性能
+
+同一台机器（Windows、NVIDIA P104-100 8 GB、Vulkan、一次只跑一个 GPU 任务），0.6B：
+
+| 音频 | mel | 音频塔 | prefill | decode | 总计 | RTFx |
+|------|-----|--------|---------|--------|------|------|
 | 15 s | 2 ms | 107 | 151 | 346 | 0.64 s | 23.6 |
-| 180 s | 25 ms | 1012 | 1534 | 5788 | 8.4 s + 1.45 s front end | 17.8 |
+| 180 s | 25 ms | 1012 | 1534 | 5788 | 8.4 s + 1.45 s 前端 | 17.8 |
 | 15 min | 121 ms | 5236 | 16 259 | 76 556 | 98.3 s | **9.4** |
 
-Memory, peak `memory.used` sampled every ~100 ms on an otherwise idle card (the
-same six clips, both models, `vulkan:0`):
+六条 fixture 的 RTFx：24.4 / 21.3 / 19.7 / 24.0 / 17.8 / 20.1。
 
-| clip | 0.6B peak | 1.7B peak |
-|---|---|---|
+对同机器同 GPU 上的 Python 实现：0.6B 1.95×、1.7B 1.52×（29 种语言 × 20 条 FLEURS 抽样，WER/CER 差在 ±0.7 pp 内）。
+
+长音频是最有意思的一档：15 分钟音频要是把 `s²` attention 矩阵材料化就是 2 × 4.7 GB，8 GB 卡放不下。本实现把 prefill attention 切成 key slab，于是「直接拒绝」变成「能跑」——15 分钟音频（12 065 token prompt、3 343 token 转写）98 s 跑完。
+
+显存（峰值 `memory.used`，每 ~100 ms 采样，六条 fixture、两个规格）：
+
+| 音频 | 0.6B 峰值 | 1.7B 峰值 |
+|------|-----------|-----------|
 | 15 s en | 2.05 GiB | 4.34 GiB |
 | 30 s zh | 2.05 GiB | 4.34 GiB |
 | 90 s en | 2.30 GiB | 4.59 GiB |
@@ -262,47 +192,30 @@ same six clips, both models, `vulkan:0`):
 | 180 s en | 2.80 GiB | 5.34 GiB |
 | 180 s zh | 2.80 GiB | 5.34 GiB |
 
-The KV cache is 112 KiB per slot (28 layers × 8 KV heads × 128, f16, K and V —
-the same geometry for both models) and it is **allocated on demand**: `max_seq`,
-16 384 tokens, is the ceiling the rope tables are built for, not the allocation,
-so a 15-second clip holds 1 024 slots (112 MiB) where a long one grows to fit its
-prompt.  Capacity is grow-only and stepped by 256 slots, so a run of clips of one
-shape allocates once: a resize measures 0.4 ms (1 792 slots) to 37 ms (12 032)
-inside runs that last tens of seconds, and a 15-minute request (12 065-token
-prompt plus 2 048 new) needs 1.53 GiB rather than the fixed 1.75.  What a longer
-clip adds beyond the cache is on the audio-tower side — the same 180 s clip with
-`--cpu-enc` stays at the floor and `--max-new` does not move the peak, which
-leaves the tower's per-window workspace (`n_head × n_window` buffers) as the only
-other thing that scales with audio length.  An 881 s clip (11 475-token prompt,
-12 032 slots) peaks at 5.03 GiB on 0.6B; 1.7B does not fit that prompt on this
-8 GB card — its prefill scratch runs out of memory just past 7.3 GiB — so long
-audio is a 0.6B story here.  The O(s²) prefill scratch is gone: the slabbed
-attention needs 398 MB at 15 minutes instead of 2 × 4.7 GB.
+KV cache 每 slot 112 KiB（28 层 × 8 KV head × 128，f16 的 K 与 V；两个规格几何相同），并且是**按需分配**的：`max_seq`（16 384 token）只是 rope 表的天花板，不是分配量——15 秒音频只占 1 024 slot（112 MiB），长音频按需增长。容量只增不减、按 256 slot 步进，所以连着跑同一形状的音频只分配一次（一次 resize 0.4 ms @1 792 slot 到 37 ms @12 032 slot），15 分钟请求需要 1.53 GiB，而不是固定预分配那 1.75 GiB。
 
-Where the time goes at 15 minutes: decode 78 % (the KV scan is instruction-bound,
-not bandwidth-bound: ~86 GB/s effective against ~250 GB/s available), prefill
-17 % (60 % of it the two attention GEMMs, already at this card's ~2.1 TFLOP/s
-ceiling), audio tower 5 % (at its weight-bandwidth roofline).
+15 分钟时的时间去向：decode 78 %（KV 扫描是指令受限而非带宽受限：有效 ~86 GB/s，对着 ~250 GB/s 的可用带宽）、prefill 17 %（其中 60 % 是两个 attention GEMM，已经贴着这张卡 ~2.1 TFLOP/s 的天花板）、音频塔 5 %（贴着权重带宽 roofline）。
 
-## Source map
+## 一致性 / 验证
 
-| file | what lives there |
-|---|---|
-| `src/mel.rs` | log-mel front end (torch-compatible STFT, `center=True`), wav loading, vendored soxr HQ resampling |
-| `src/audio_encoder.rs` | CPU audio tower — the reference the GPU one is diffed against (`--cpu-enc`) |
-| `src/audio_encoder_gpu.rs` | GPU audio tower: conv stem, window packing, 18 transformer layers |
-| `src/decoder.rs` | text decoder: GEMV decode path, prefill (GEMM chain + attention), KV cache |
-| `src/shaders.rs` | every WGSL kernel, generated as Rust string functions with the invariants spelled out |
-| `src/inference.rs` | the engine (`Inner`) and its public handle `AsrInference`: model load, mel → tower → prompt → prefill → decode |
-| `src/backend.rs` | `Backend` — the one-word backend choice |
-| `src/error.rs` | `AsrError` / `Result`, the public error type |
-| `src/streaming.rs` | incremental sessions (`create_streaming_session` → `push_samples` → `flush`) |
-| `src/diagnostics.rs` | probe and dump hooks — engine internals, deliberately not on `AsrInference` |
-| `src/hub.rs` | HuggingFace download (`hub` feature) |
-| `src/processor.rs` | the reference processor API (`apply_transcription_request` / `generate` / `decode`) |
-| `src/prompt.rs` | chat template + the reference's output parsing (`language X<asr_text>…`) |
-| `src/bin/` | `transcribe` (CLI) and 11 probes / benches |
+* 转写门禁：`cargo run --release --bin transcribe -- --model <dir> --wav clip.wav --device vulkan:0 --max-new 512 --baseline frozen.txt` —— 与冻结参考文本逐词比对，打印 `MATCH` / `MISMATCH`。上面那张跨后端表就是这么跑出来的，每个后端过的是同一份门禁。
+* `cargo test --release` —— 纯 CPU 的一半：tokenizer / prompt / mel 几何、config 解析。
+* `cargo test --release --test public_api -- --ignored` —— 真实模型上的公开 API：冻结文本比对、`Backend::Cpu`、增量 session、一个实例服务两个线程。需要 `QASR_TEST_MODEL` / `QASR_TEST_WAV`，逐字比对还要 `QASR_TEST_BASELINE`。
+* `cargo run --release --bin transcribe -- --diag-enc` —— 音频塔自己的 oracle：逐级对主机参考，包括主机侧重算 attention 的算子。
+
+**覆盖范围**：上表里每条运行时都在这台机器上跑过门禁；Metal 没有。没有批处理，也没有 vLLM 后端——转写本身是单条音频一次调用。时间戳/强制对齐不在本仓库，见同系列的 [qwen-aligner-wgpu](https://github.com/eclipse005/qwen-aligner-wgpu)。
+
+## 致谢 / 原版出处
+
+本仓库是**独立的 Rust 推理实现**，用于加载并运行官方发布的 Qwen3-ASR 权重；**不是** Alibaba / Qwen 官方发行版，与原作者无隶属关系。
+
+| 组件 | 原版 | 链接 | 协议（以官方页面为准） |
+|------|------|------|------------------------|
+| 模型权重 | Qwen3-ASR 0.6B / 1.7B | [HF 0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) · [HF 1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | Apache-2.0 |
+| 官方推理与文档 | Qwen3-ASR | [QwenLM/Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) | Apache-2.0 |
+
+使用模型权重时请遵守原作者许可证；本仓库的 Rust 推理代码以本仓库 License 为准。
 
 ## License
 
-Apache-2.0, matching upstream Qwen3-ASR. See `LICENSE`.
+Apache-2.0，与上游 Qwen3-ASR 一致。内置的 soxr 重采样器在 `third_party/soxr` 下，协议见该目录。
