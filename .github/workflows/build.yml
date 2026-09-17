@@ -6,6 +6,11 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      package:
+        description: Build and upload the three platform binaries
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -38,12 +43,12 @@ jobs:
       - name: Check the hub feature
         run: cargo check --release --features hub
 
-  # Packages are only built for a release tag: an ordinary push runs the tests
-  # and stops there.  Running this workflow manually on a tag ref produces
-  # packages too, without a Release.
+  # Packages are built for a release tag, or when asked for by hand through the
+  # `package` input.  An ordinary push runs the tests and stops there, and the
+  # release attachment stays tag-only.
   package:
     name: package / ${{ matrix.name }}
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.package
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -108,6 +113,7 @@ jobs:
           path: qwen3-asr-wgpu-${{ matrix.name }}.${{ matrix.archive }}
 
       - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: qwen3-asr-wgpu-${{ matrix.name }}.${{ matrix.archive }}
