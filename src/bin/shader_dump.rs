@@ -39,6 +39,7 @@ fn main() -> anyhow::Result<()> {
         "gqa_single" => shaders::gqa_decode_single(num(2)?, num(3)?, num(4)?, num(5)?, 1024),
         "gqa_merge" => shaders::gqa_split_merge(num(2)?),
         "extract" => shaders::qkv_extract(num(2)?, num(3)?, num(4)?),
+        "gemv" => shaders::gemv(num(2)?, num(3)?, num(4)? != 0, sg(), num(5)?),
         "repeat_kv" => shaders::repeat_kv(num(2)?),
         "list" => {
             println!(
@@ -68,6 +69,8 @@ fn main() -> anyhow::Result<()> {
             }
         } else if name == "extract" {
             "qkv_extract"
+        } else if name.starts_with("gemv") || name.starts_with("gemm") {
+            if name.starts_with("gemv") { "gemv" } else { "gemm" }
         } else if name == "repeat_kv" {
             "repeat_kv"
         } else {
