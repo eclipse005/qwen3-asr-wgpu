@@ -16,7 +16,8 @@ param(
     [int]$MaxNew = 1024,
     # `transcribe` prints several phases; compare whichever one the change is
     # supposed to move so a win in one phase can't hide a loss in another.
-    [ValidateSet('rtfx', 'mel', 'enc', 'pre', 'dec')][string]$On = 'rtfx'
+    # `sub`/`read` are the decode's two halves -- CPU record vs GPU wait.
+    [ValidateSet('rtfx', 'mel', 'enc', 'pre', 'dec', 'sub', 'read')][string]$On = 'rtfx'
 )
 $ErrorActionPreference = 'Stop'
 # Without this a CJK transcript decodes as the console code page and swallows
@@ -37,7 +38,7 @@ foreach ($rep in 1..$Reps) {
         $lines = & $exe --model $model --wav $wavPath --max-new $MaxNew --baseline $base 2>&1 |
             ForEach-Object { "$_" }
         $text = $lines -join "`n"
-        $ph = [regex]::Match($text, 'mel=(\d+)ms enc=(\d+)ms prefill=(\d+)ms decode=(\d+)ms')
+        $ph = [regex]::Match($text, 'mel=(\d+)ms enc=(\d+)ms prefill=(\d+)ms decode=(\d+)ms \[host submit (\d+) / read (\d+)\]')
         $vs = @($lines | Where-Object { "$_" -like 'vs *: *' }) | Select-Object -Last 1
         if (-not ("$vs" -like '*: MATCH')) { $verdict[$arm] = 'MISMATCH' }
         $acc[$arm] += [pscustomobject]@{
@@ -46,6 +47,8 @@ foreach ($rep in 1..$Reps) {
             enc  = [int]$ph.Groups[2].Value
             pre  = [int]$ph.Groups[3].Value
             dec  = [int]$ph.Groups[4].Value
+            sub  = [int]$ph.Groups[5].Value
+            read = [int]$ph.Groups[6].Value
         }
     }
 }
@@ -68,6 +71,7 @@ foreach ($arm in @($A, $B)) {
 }
 $va = $med[$A].$On
 $vb = $med[$B].$On
-"delta: {0} {1:+0.0%;-0.0%}   (decode {2:+0;-0} ms, prefill {3:+0;-0} ms)" -f `
-    $On, (($vb - $va) / $va), ($med[$B].dec - $med[$A].dec), ($med[$B].pre - $med[$A].pre)
+"delta: {0} {1:+0.0%;-0.0%}   (decode {2:+0;-0} ms, prefill {3:+0;-0} ms, submit {4:+0;-0} ms, read {5:+0;-0} ms)" -f `
+    $On, (($vb - $va) / $va), ($med[$B].dec - $med[$A].dec), ($med[$B].pre - $med[$A].pre), `
+    ($med[$B].sub - $med[$A].sub), ($med[$B].read - $med[$A].read)
 if ($verdict[$A] -eq 'MISMATCH' -or $verdict[$B] -eq 'MISMATCH') { exit 1 }

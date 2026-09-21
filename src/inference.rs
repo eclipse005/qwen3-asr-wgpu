@@ -1470,14 +1470,60 @@ impl Inner {
             if let Some(cb) = stream.as_deref_mut() {
                 emit_token(cb, &self.tokenizer, &generated)?;
             }
-            for _ in 1..max_new_tokens {
-                let tok = self.decoder.step()?;
-                if eos.contains(&tok) {
-                    break;
+            let pipelined = pipelined_decode() && stream.is_none();
+            if let TextBackend::Gpu(d) = &mut self.decoder {
+                if pipelined {
+                    // One step in flight.  `record_step` runs while the previous
+                    // step is still executing, so the 229-dispatch record -- which
+                    // `step` makes the GPU idle through -- is off the critical
+                    // path; the token is taken before this step is submitted, so
+                    // an EOS drops the recorded step instead of running it.
+                    let mut steps = 0usize;
+                    let mut done = false;
+                    while steps + 1 < max_new_tokens {
+                        d.record_step()?;
+                        if steps > 0 {
+                            let tok = d.take_token()?;
+                            if eos.contains(&tok) {
+                                done = true;
+                                break;
+                            }
+                            generated.push(tok as u32);
+                        }
+                        d.submit_step()?;
+                        steps += 1;
+                    }
+                    // The last step is in flight and belongs to the transcript:
+                    // `for _ in 1..max_new` is `max_new - 1` steps and this is the
+                    // `max_new - 1`th.
+                    if !done && steps > 0 {
+                        let tok = d.take_token()?;
+                        if !eos.contains(&tok) {
+                            generated.push(tok as u32);
+                        }
+                    }
+                } else {
+                    for _ in 1..max_new_tokens {
+                        let tok = d.step()?;
+                        if eos.contains(&tok) {
+                            break;
+                        }
+                        generated.push(tok as u32);
+                        if let Some(cb) = stream.as_deref_mut() {
+                            emit_token(cb, &self.tokenizer, &generated)?;
+                        }
+                    }
                 }
-                generated.push(tok as u32);
-                if let Some(cb) = stream.as_deref_mut() {
-                    emit_token(cb, &self.tokenizer, &generated)?;
+            } else {
+                for _ in 1..max_new_tokens {
+                    let tok = self.decoder.step()?;
+                    if eos.contains(&tok) {
+                        break;
+                    }
+                    generated.push(tok as u32);
+                    if let Some(cb) = stream.as_deref_mut() {
+                        emit_token(cb, &self.tokenizer, &generated)?;
+                    }
                 }
             }
         }
@@ -1505,6 +1551,26 @@ fn spec_study_k() -> Option<usize> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|k| (2..=64).contains(k))
+}
+
+/// `QASR_DEC_PIPE=1`: run the decode loop as a one-deep pipeline -- record step
+/// `k+1` while step `k` executes, then take step `k`'s token, then submit --
+/// instead of the serial `step()` that makes the GPU wait out each step's
+/// recording (the cost `QASR_RECORD_PAD` prices).  **Opt-in, default off**: as
+/// measured it is too small to keep (0.6B / 90 s_en 2586 -> 2571 ms, 1.7B
+/// +3 ms) because `enc.finish()` -- the command buffer's validation -- is still
+/// on the critical side of the await; the fix is to hold a *finished*
+/// `CommandBuffer` in `record_step` instead of an encoder.  Not gated either:
+/// see `HANDOFF.md`.  The serial loop is what the streaming path uses in any
+/// case, because a callback wants a token the moment it exists.
+fn pipelined_decode() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("QASR_DEC_PIPE").unwrap_or_default().as_str(),
+            "1" | "on" | "true"
+        )
+    })
 }
 
 /// How many drafted tokens survive one verification pass, measured.

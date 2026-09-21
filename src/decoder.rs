@@ -60,6 +60,55 @@ pub fn gemv_rpw() -> usize {
 /// has no SM count -- so it is a documented constant, like the tile shapes.
 const WARP_SLOTS: usize = 960;
 
+/// `QASR_RECORD_PAD=n`: how many extra times a decode step is recorded into a
+/// throwaway encoder that is never submitted.  Pure CPU work, no GPU work, so it
+/// prices the recording half of a step -- see `step`.
+fn record_pad() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("QASR_RECORD_PAD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+    })
+}
+
+fn env_split(name: &str) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(1)
+}
+
+/// `QASR_SUBMIT_SPLIT=n` (default 1): record a decode step in `n` command buffers
+/// and submit each one as it is recorded, so the GPU starts executing the first
+/// slice while the CPU is still recording the rest.  The step's 229 dispatches are
+/// ~0.38 ms of pure CPU work per token and the GPU waits out every microsecond of
+/// it (`QASR_RECORD_PAD` prices that: two extra recordings per step cost +129 ms of
+/// decode and +124 ms of it shows up as `host submit`, with both arms MATCHing).
+/// Slicing is worth it only if a submit is cheaper than the record it hides.
+///
+/// `QASR_PASS_SPLIT=n`: the same slices as `n` passes of *one* encoder and one
+/// submit.  That has none of the overlap and all of the pass-boundary barriers, so
+/// running the two knobs separately separates the win from its cost -- if slicing
+/// loses, this says whether the barrier or the submit is what took it.
+fn submit_split() -> usize {
+    env_split("QASR_SUBMIT_SPLIT")
+}
+
+fn pass_split() -> usize {
+    env_split("QASR_PASS_SPLIT")
+}
+
+/// The `c`th of `n` slices of a decode step: the layers cut as evenly as the
+/// integer division allows, the embedding prologue riding on the first slice and
+/// the `lm_head`/argmax/token-copy epilogue on the last.  The dispatch sequence
+/// does not depend on `n`; only where the pass and submit boundaries fall.
+fn step_slice(c: usize, n: usize, layers: usize) -> (usize, usize, bool, bool) {
+    (layers * c / n, layers * (c + 1) / n, c == 0, c + 1 == n)
+}
+
 /// Rows per *warp* for `o_proj` and `down_proj`, which are the two shapes
 /// `rows_per_warp` is worth anything on.
 ///
@@ -772,6 +821,12 @@ pub struct WgpuTextDecoder {
     pub host_submit_ms: f64,
     pub host_read_ms: f64,
 
+    /// A recorded-but-unsubmitted step, held so the record can overlap the step
+    /// in flight -- see `record_step` / `submit_step`.
+    pending: Option<wgpu::CommandEncoder>,
+    /// The token map armed for the step in flight, taken by `take_token`.
+    pending_map: Option<std::sync::mpsc::Receiver<anyhow::Result<()>>>,
+
     embed_table: wgpu::Buffer,
     layers: Vec<Layer>,
     pipes: Pipes,
@@ -1195,6 +1250,8 @@ impl WgpuTextDecoder {
             pos: 0,
             host_submit_ms: 0.0,
             host_read_ms: 0.0,
+            pending: None,
+            pending_map: None,
             embed_table,
             layers,
             pipes,
@@ -1342,7 +1399,26 @@ impl WgpuTextDecoder {
         (gx, gy)
     }
 
+    /// One decode step: prologue, all layers, epilogue.
     pub fn encode_step(&self, enc: &mut wgpu::CommandEncoder, pos: usize) {
+        self.encode_step_slice(enc, pos, 0, self.layers.len(), true, true);
+    }
+
+    /// A slice of a decode step: layers `lo..hi`, plus the embedding prologue if
+    /// `embed` and the `lm_head`/argmax/token-copy epilogue if `tail`.  This is
+    /// `encode_step` with the boundaries left open so `QASR_SUBMIT_SPLIT` /
+    /// `QASR_PASS_SPLIT` can cut the step into several passes or several submits
+    /// (`step_slice`); the dispatch sequence is the same for every `n`, so an A/B
+    /// of the two prices the boundary and not the work.
+    fn encode_step_slice(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        pos: usize,
+        lo: usize,
+        hi: usize,
+        embed: bool,
+        tail: bool,
+    ) {
         let cfg = &self.cfg;
         let cur_len = pos + 1;
         let gemv_grid = |rows: usize| (rows / gemv_rpw()) as u32;
@@ -1359,11 +1435,13 @@ impl WgpuTextDecoder {
 
         let mut cp = enc.begin_compute_pass(&Default::default());
 
-        cp.set_pipeline(&self.pipes.embed);
-        cp.set_bind_group(0, &self.bg_embed, &[]);
-        cp.dispatch_workgroups(1, 1, 1);
+        if embed {
+            cp.set_pipeline(&self.pipes.embed);
+            cp.set_bind_group(0, &self.bg_embed, &[]);
+            cp.dispatch_workgroups(1, 1, 1);
+        }
 
-        for l in &self.layers {
+        for l in &self.layers[lo..hi] {
             if !k("qkv") {
                 cp.set_pipeline(&self.pipes.gemv_qkv_norm);
                 cp.set_bind_group(0, &l.bg_gemv_qkv_norm, &[]);
@@ -1439,6 +1517,7 @@ impl WgpuTextDecoder {
             }
         }
 
+        if tail {
         if !k("lm") {
         cp.set_pipeline(&self.pipes.gemv_lm_norm);
         cp.set_bind_group(0, &self.bg_gemv_lm_norm, &[]);
@@ -1456,6 +1535,9 @@ impl WgpuTextDecoder {
 
         drop(cp);
         enc.copy_buffer_to_buffer(&self.scratch.token, 0, &self.scratch.token_staging, 0, 4);
+        } else {
+            drop(cp);
+        }
     }
 
     fn encode_gqa<'pass>(&self, cp: &mut wgpu::ComputePass<'pass>, l: &Layer, cur_len: usize) {
@@ -1526,15 +1608,117 @@ impl WgpuTextDecoder {
         }
     }
 
+    /// Record the next decode step into a held encoder, without submitting it.
+    ///
+    /// `step` does this and then waits, so the GPU sits idle for the ~0.4 ms of
+    /// CPU the step's 229 dispatches need -- `QASR_RECORD_PAD` prices exactly that
+    /// (two extra recordings per step, zero GPU work: +129 ms of decode, +124 of
+    /// it in `host submit`, both arms MATCH).  Recording under this API instead
+    /// lets the caller do it while the *previous* step is still executing: nothing
+    /// here reads a decode result, because the embedding for the next step is read
+    /// on the GPU out of `token_buf`.  The one thing that must wait is the uniform
+    /// write, which `submit_step` does after the previous token has come back --
+    /// the shaders read those uniforms while the step runs, so rewriting them with
+    /// a step in flight would corrupt it.
+    ///
+    /// So a pipelined loop is: `record_step` (overlapped) -> `take_token` (blocks
+    /// on the step in flight) -> `submit_step`.  Bit-identical to `step`: same
+    /// dispatches in the same order into the same pass, and the uniforms are still
+    /// written before the submit that reads them.
+    pub fn record_step(&mut self) -> Result<()> {
+        anyhow::ensure!(self.pending.is_none(), "step already recorded");
+        let pos = self.pos;
+        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+        self.encode_step(&mut enc, pos);
+        self.pending = Some(enc);
+        Ok(())
+    }
+
+    /// Write the recorded step's uniforms, submit it, arm its token readback, and
+    /// advance `pos`.
+    pub fn submit_step(&mut self) -> Result<()> {
+        let enc = self.pending.take().context("no recorded step")?;
+        let t_host = std::time::Instant::now();
+        self.write_step_uniforms(self.pos);
+        self.gpu.queue.submit([enc.finish()]);
+        // Arm the map now so it resolves with *this* step: the copy that fills
+        // `token_staging` is the last command in the buffer just submitted.
+        let slice = self.scratch.token_staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r.map_err(|e| anyhow::anyhow!("map token: {e}")));
+        });
+        self.pending_map = Some(rx);
+        self.pos += 1;
+        self.host_submit_ms += t_host.elapsed().as_secs_f64() * 1000.0;
+        Ok(())
+    }
+
+    /// The token of the step in flight, blocking until the GPU hands it over.
+    pub fn take_token(&mut self) -> Result<i32> {
+        let rx = self.pending_map.take().context("no step in flight")?;
+        let t_read = std::time::Instant::now();
+        self.gpu
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .context("poll token")?;
+        rx.recv().context("map callback dropped")??;
+        let slice = self.scratch.token_staging.slice(..);
+        let v = {
+            let d = slice.get_mapped_range()?;
+            i32::from_le_bytes([d[0], d[1], d[2], d[3]])
+        };
+        self.scratch.token_staging.unmap();
+        self.host_read_ms += t_read.elapsed().as_secs_f64() * 1000.0;
+        Ok(v)
+    }
+
     /// One decode step at `self.pos`, then `pos += 1`.  Returns the token argmax
     /// wrote into `token_buf[0]` (which the *next* step will embed).
     pub fn step(&mut self) -> Result<i32> {
         let pos = self.pos;
         let t_host = std::time::Instant::now();
         self.write_step_uniforms(pos);
-        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
-        self.encode_step(&mut enc, pos);
-        self.gpu.queue.submit([enc.finish()]);
+        let layers = self.layers.len();
+        let n = submit_split().min(layers.max(1));
+        if n > 1 {
+            // Record slice by slice and submit each as it is recorded: the GPU
+            // starts on slice 0 (and on the shared-memory latency behind it) while
+            // the CPU is still recording the rest of the step.  Every slice's
+            // uniforms were written above, before the first submit, so nothing
+            // here races a step in flight.
+            for c in 0..n {
+                let (lo, hi, embed, tail) = step_slice(c, n, layers);
+                let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+                self.encode_step_slice(&mut enc, pos, lo, hi, embed, tail);
+                self.gpu.queue.submit([enc.finish()]);
+            }
+        } else {
+            let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+            let m = pass_split().min(layers.max(1));
+            if m > 1 {
+                for c in 0..m {
+                    let (lo, hi, embed, tail) = step_slice(c, m, layers);
+                    self.encode_step_slice(&mut enc, pos, lo, hi, embed, tail);
+                }
+            } else {
+                self.encode_step(&mut enc, pos);
+            }
+            // Pessimisation probe for the step's *record* cost.  `QASR_RECORD_PAD=n`
+            // records the same step `n` more times into a throwaway encoder and never
+            // submits it, so it adds pure CPU work and exactly zero GPU work: a 1:1
+            // rise in the step time says the record is dead time the GPU waits out,
+            // and a smaller rise says part of it is already hidden.  Both arms have to
+            // MATCH -- the probe cannot change the tokens.
+            if let Some(n) = record_pad() {
+                for _ in 0..n {
+                    let mut throw = self.gpu.device.create_command_encoder(&Default::default());
+                    self.encode_step(&mut throw, pos);
+                    std::mem::drop(throw.finish());
+                }
+            }
+            self.gpu.queue.submit([enc.finish()]);
+        }
         self.host_submit_ms += t_host.elapsed().as_secs_f64() * 1000.0;
         let t_read = std::time::Instant::now();
         let v = self.read_token()?;
