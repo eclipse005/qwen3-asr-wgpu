@@ -1843,7 +1843,17 @@ fn enc_skip(name: &str) -> bool {
 }
 
 /// `cp.dispatch_workgroups`, plus the `QASR_ENC_DUP` repeat.
+///
+/// **Every named dispatch is also a `QASR_ENC_SKIP` site**, because the guard is
+/// here rather than at each call: without that, a name only reachable through
+/// `dup_dispatch` answered "+0.0%, MATCH" to a skip -- a silent no-op that reads
+/// exactly like a free op, which is how the conv stem's four ops went a round
+/// without an exact price.  The explicit `enc_skip` calls in the callers stay:
+/// they skip the uniform writes too.
 fn dup_dispatch(cp: &mut wgpu::ComputePass<'_>, name: &str, gx: u32, gy: u32, gz: u32) {
+    if enc_skip(name) {
+        return;
+    }
     cp.dispatch_workgroups(gx, gy, gz);
     if enc_dup(name) {
         cp.dispatch_workgroups(gx, gy, gz);
