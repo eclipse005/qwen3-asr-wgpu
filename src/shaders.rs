@@ -1351,6 +1351,7 @@ pub fn gqa_decode_split_p1_pair(
     row0: bool,
     coop: bool,
     pf: bool,
+    coal: bool,
 ) -> String {
     assert_eq!(d % 2, 0);
     assert_eq!(rep, 2, "paired split handles exactly the 2 q heads of a kv head");
@@ -1361,7 +1362,22 @@ pub fn gqa_decode_split_p1_pair(
     // FMAs, same reduction -- it separates "the strided row pattern costs" from
     // "the loads cost", the question the paired kernel (+1.0%) and the
     // accumulator depth (flat) between them could not settle.
-    let krow_expr = if row0 { "0u" } else { "row4" };
+    // `coal` is a second diagnostic: it keeps the 16 loads per lane and the loop
+    // shape but re-aims them at consecutive addresses across lanes, i.e. the
+    // access pattern a dim-major K layout would produce.  Values are wrong (it is
+    // only ever a duplicated dispatch), so it answers one question: is the
+    // *pattern* worth more than the ~1.3% the cooperative form got?
+    let kv_index = if row0 {
+        "0u + j4".to_string()
+    } else if coal {
+        // consecutive lanes read consecutive 16 B words, so one warp instruction
+        // covers 512 B = 4 cache lines instead of 32 -- but each lane still does
+        // all 16 loads, unlike the cooperative form which cut the per-lane load
+        // count.  That is what a dim-major K layout would look like.
+        "((row4 >> 4u) << 4u) + j4 * 32u + (lid.x & 31u)".to_string()
+    } else {
+        "row4 + j4".to_string()
+    };
     // `coop` is the fix that probe implies: a group of 8 lanes walks one key's
     // 256 B row together, each lane taking two `vec4`, then a 3-round xor tree
     // folds the eight partial dots.  A warp then covers four *contiguous* rows
@@ -1464,7 +1480,7 @@ pub fn gqa_decode_split_p1_pair(
                  \x20       let row4 = (kbase + (t_start + t) * D2) >> 2u;\n\
                  \x20       for (var j4 = 0u; j4 < D4; j4 = j4 + 1u) {\n",
             );
-            t.push_str(&format!("            let kv = KC4[{krow_expr} + j4];\n"));
+            t.push_str(&format!("            let kv = KC4[{kv_index}];\n"));
             t.push_str("            let qa = Q4[qa4 + j4];\n");
             t.push_str("            let qb = Q4[qb4 + j4];\n");
         }

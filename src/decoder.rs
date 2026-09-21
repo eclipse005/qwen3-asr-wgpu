@@ -319,6 +319,10 @@ struct Pipes {
     /// loads are L1 hits.  Only reachable through `QASR_DUP`, never on the
     /// default path.
     gqa_split_pair256_row0: wgpu::ComputePipeline,
+    /// Diagnostic: `gqa_split_pair256` with the K reads re-aimed at consecutive
+    /// addresses across lanes (what a dim-major K layout would look like).  Only
+    /// reachable through `QASR_DUP`.
+    gqa_split_pair256_coal: wgpu::ComputePipeline,
     gqa_split256: wgpu::ComputePipeline,
     gqa_split512: wgpu::ComputePipeline,
     gqa_merge: wgpu::ComputePipeline,
@@ -438,9 +442,9 @@ fn slab_path(s: usize) -> bool {
 /// the config does not have exactly two q heads per kv head.  The paired kernel
 /// assumes `REP == 2`; anything else keeps the old (correct, just 2x the KV
 /// traffic) path so a different checkpoint cannot silently break.
-fn pair_split_src(nqh: usize, nkvh: usize, hd: usize, chunk: usize, row0: bool, coop: bool, pf: bool) -> String {
+fn pair_split_src(nqh: usize, nkvh: usize, hd: usize, chunk: usize, row0: bool, coop: bool, pf: bool, coal: bool) -> String {
     if nqh / nkvh == 2 {
-        shaders::gqa_decode_split_p1_pair(hd, chunk, 2, row0, coop, pf)
+        shaders::gqa_decode_split_p1_pair(hd, chunk, 2, row0, coop, pf, coal)
     } else {
         shaders::gqa_decode_split_p1(nqh, nkvh, hd, chunk)
     }
@@ -634,9 +638,10 @@ impl WgpuTextDecoder {
             gqa256: build("gqa256", &shaders::gqa_decode_single(nqh, nkvh, hd, 256, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl))?,
             gqa512: build("gqa512", &shaders::gqa_decode_single(nqh, nkvh, hd, 512, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl))?,
             gqa_split128: build("gqa_split128", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 128), "gqa_split_p1", Some(&split_pl))?,
-            gqa_split_pair256: build("gqa_split_pair256", &pair_split_src(nqh, nkvh, hd, 256, false, subgroup && gqa_coop(), gqa_pf()), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
-            gqa_split_pair512: build("gqa_split_pair512", &pair_split_src(nqh, nkvh, hd, 512, false, subgroup && gqa_coop(), gqa_pf()), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
-            gqa_split_pair256_row0: build("gqa_split_pair256_row0", &shaders::gqa_decode_split_p1_pair(hd, 256, 2, true, false, false), "gqa_split_p1_pair", Some(&split_pl))?,
+            gqa_split_pair256: build("gqa_split_pair256", &pair_split_src(nqh, nkvh, hd, 256, false, subgroup && gqa_coop(), gqa_pf(), false), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
+            gqa_split_pair512: build("gqa_split_pair512", &pair_split_src(nqh, nkvh, hd, 512, false, subgroup && gqa_coop(), gqa_pf(), false), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
+            gqa_split_pair256_row0: build("gqa_split_pair256_row0", &shaders::gqa_decode_split_p1_pair(hd, 256, 2, true, false, false, false), "gqa_split_p1_pair", Some(&split_pl))?,
+            gqa_split_pair256_coal: build("gqa_split_pair256_coal", &shaders::gqa_decode_split_p1_pair(hd, 256, 2, false, false, false, true), "gqa_split_p1_pair", Some(&split_pl))?,
             gqa_split256: build("gqa_split256", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 256), "gqa_split_p1", Some(&split_pl))?,
             gqa_split512: build("gqa_split512", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 512), "gqa_split_p1", Some(&split_pl))?,
             gqa_merge: build("gqa_merge", &shaders::gqa_split_merge(hd), "gqa_merge", None)?,
@@ -1229,6 +1234,12 @@ impl WgpuTextDecoder {
         // Diagnostic: the same dispatch with every K read aimed at row 0, so all
         // loads are L1 hits.  Read as the QASR_DUP delta against this arm; the
         // first dispatch is the real one so the output is unaffected.
+        if dup == "gqa_p1_coal" {
+            cp.set_pipeline(&self.pipes.gqa_split_pair256_coal);
+            cp.set_bind_group(0, &l.bg_gqa_split, &[]);
+            cp.dispatch_workgroups(split_x, n_chunks, 1);
+            cp.set_pipeline(split);
+        }
         if dup == "gqa_p1_row0" {
             cp.set_pipeline(&self.pipes.gqa_split_pair256_row0);
             cp.set_bind_group(0, &l.bg_gqa_split, &[]);
