@@ -54,6 +54,14 @@ fn main() -> anyhow::Result<()> {
         16
     } else if args.iter().any(|a| a == "--mix4") {
         4
+    } else if args.iter().any(|a| a == "--mix4bar2") {
+        // `--mix4` plus the two `workgroupBarrier`s the real GEMM pays per k-slab
+        // (one after the stores that fills the tile, one after the compute that
+        // releases it).  26 TFLOP/s apart is `/16`; this is the arm that says
+        // whether the barrier is what separates 3.80 from the GEMM's 2.91.
+        42
+    } else if args.iter().any(|a| a == "--mix4bar1") {
+        41
     } else if args.iter().any(|a| a == "--mixA") {
         // 8 scalar B loads + 2 vec4 A loads per 64 FMAs: the GEMM's ratio with
         // *only* its broadcast operand vectorised.
@@ -89,14 +97,14 @@ fn shader(mix: usize) -> String {
             body.push_str(&format!("    c{i} = fma(c{i}, a, b);\n"));
         }
         match mix {
-            4 => {
+            4 | 41 | 42 => {
                 // Four `vec4` loads per iteration = 16 words per lane, the same
                 // 512 words per warp per iteration the scalar arm moves.  Lane L
                 // takes chunk `base + L`, so a phase's eight chunks are
                 // contiguous words and every bank is used once.
                 for i in 0..4 {
                     body.push_str(&format!(
-                        "    let v{r}_{i} = tile[((idx * 4u + {o}u + lid.x) & 511u)];\n",
+                        "    let v{r}_{i} = vec4<f32>(tile[((idx * 4u + {o}u + lid.x) & 511u)]);\n",
                         o = i * 128
                     ));
                 }
@@ -107,6 +115,14 @@ fn shader(mix: usize) -> String {
                             "    c{k} = fma(c{k}, v{r}_{i}[{e}], b);\n"
                         ));
                     }
+                }
+                // The barrier test: one or two workgroup syncs per iteration,
+                // i.e. what the GEMM pays per 16 k-steps at BK = 16.
+                if mix == 41 || mix == 42 {
+                    body.push_str("    workgroupBarrier();\n");
+                }
+                if mix == 42 {
+                    body.push_str("    workgroupBarrier();\n");
                 }
             }
             16 => {
@@ -239,6 +255,10 @@ async fn run(prefer: Option<&str>, mix: usize) -> anyhow::Result<()> {
     let queue = &gpu.queue;
 
     let src = shader(mix);
+    if std::env::var("QASR_DUMP").is_ok() {
+        print!("{src}");
+        return Ok(());
+    }
     let pipe = gpu.pipeline("fma", &src, "main", None)?;
     let out = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
@@ -263,6 +283,8 @@ async fn run(prefer: Option<&str>, mix: usize) -> anyhow::Result<()> {
     let fmas_per_lane = ITERS as f64 * fma_per_iter as f64;
     let arm = match mix {
         4 => "4 vec4 shared loads + 80 FMA per iteration",
+        41 => "4 vec4 + 80 FMA + 1 workgroupBarrier per iteration",
+        42 => "4 vec4 + 80 FMA + 2 workgroupBarrier per iteration",
         8 => "2 vec4 (A) + 8 scalar (B) shared loads + 80 FMA per iteration",
         16 => "16 scalar shared loads + 80 FMA per iteration",
         99 => "the original 8-load arm (address depends on c0 -- see below)",
