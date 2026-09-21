@@ -460,9 +460,21 @@ const MAX_SLAB: usize = 16;
 /// The threshold stays at 4096 until either the slab path is made to agree or a
 /// long fixture exists; do not lower it to collect the 42 ms.
 /// Use the warp-shuffle tail in the prefill softmax's two reduction trees
-/// instead of the last five smem rounds.  On by default; `QASR_SM_SUBGROUP=0`
+/// instead of the last five smem rounds.  Each tree crosses warps above distance
+/// 32 and stays inside one warp below it, so those levels become
+/// `subgroupShuffleXor` -- same operands, same order, same bits -- and the
+/// barriers per row go from 20 to 10.  On by default; `QASR_SM_SUBGROUP=0`
 /// restores the smem tree so the two can be A/B'd from one binary.
-fn sm_subgroup() -> bool {
+///
+/// Worth 4.7% of the prefill because that kernel is 18 960 one-row workgroups
+/// and therefore barrier-latency-bound.  **The same surgery on the decode split
+/// kernel's stage 2/3 trees was measured at -0.2% on the decode step** and
+/// reverted: 8 barriers per stage down to 3 bought 6 ms of 2622, because that
+/// kernel has few workgroups with a lot of work each, so its barriers are
+/// already amortised.  Same tree, same trick, no transfer -- the mechanism is
+/// the workgroup count and the work per workgroup, not the barrier count
+/// itself.
+fn sg_reduce() -> bool {
     static SG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SG.get_or_init(|| {
         !matches!(
@@ -721,8 +733,8 @@ impl WgpuTextDecoder {
             gqa256: build("gqa256", &shaders::gqa_decode_single(nqh, nkvh, hd, 256, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl))?,
             gqa512: build("gqa512", &shaders::gqa_decode_single(nqh, nkvh, hd, 512, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl))?,
             gqa_split128: build("gqa_split128", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 128), "gqa_split_p1", Some(&split_pl))?,
-            gqa_split_pair256: build("gqa_split_pair256", &pair_split_src(nqh, nkvh, hd, 256, false, subgroup && gqa_coop(), gqa_pf(), false, gqa_depth()), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
-            gqa_split_pair512: build("gqa_split_pair512", &pair_split_src(nqh, nkvh, hd, 512, false, subgroup && gqa_coop(), gqa_pf(), false, gqa_depth()), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
+            gqa_split_pair256: build("gqa_split_pair256", &pair_split_src(nqh, nkvh, hd, 256, false, subgroup && gqa_coop()  , gqa_pf(), false, gqa_depth()), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
+            gqa_split_pair512: build("gqa_split_pair512", &pair_split_src(nqh, nkvh, hd, 512, false, subgroup && gqa_coop()  , gqa_pf(), false, gqa_depth()), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
             gqa_split_pair256_row0: build("gqa_split_pair256_row0", &shaders::gqa_decode_split_p1_pair(hd, 256, 2, true, false, false, false, 1), "gqa_split_p1_pair", Some(&split_pl))?,
             gqa_split_pair256_coal: build("gqa_split_pair256_coal", &shaders::gqa_decode_split_p1_pair(hd, 256, 2, false, false, false, true, 1), "gqa_split_p1_pair", Some(&split_pl))?,
             gqa_split256: build("gqa_split256", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 256), "gqa_split_p1", Some(&split_pl))?,
@@ -737,12 +749,12 @@ impl WgpuTextDecoder {
             gemm_causal: build("gemm_causal", &shaders::prefill_gemm_causal(), "gemm", Some(&gemm_pl))?,
             gemm_av_causal: build("gemm_av_causal", &shaders::prefill_gemm_causal_av(), "gemm", Some(&gemm_pl))?,
             softmax: std::collections::HashMap::from([
-                (32, build("softmax32", &shaders::softmax_causal(32, subgroup && sm_subgroup()), "softmax", Some(&sm_pl))?),
-                (64, build("softmax64", &shaders::softmax_causal(64, subgroup && sm_subgroup()), "softmax", Some(&sm_pl))?),
-                (128, build("softmax128", &shaders::softmax_causal(128, subgroup && sm_subgroup()), "softmax", Some(&sm_pl))?),
-                (256, build("softmax256", &shaders::softmax_causal(256, subgroup && sm_subgroup()), "softmax", Some(&sm_pl))?),
-                (512, build("softmax512", &shaders::softmax_causal(512, subgroup && sm_subgroup()), "softmax", Some(&sm_pl))?),
-                (1024, build("softmax1024", &shaders::softmax_causal(1024, subgroup && sm_subgroup()), "softmax", Some(&sm_pl))?),
+                (32, build("softmax32", &shaders::softmax_causal(32, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
+                (64, build("softmax64", &shaders::softmax_causal(64, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
+                (128, build("softmax128", &shaders::softmax_causal(128, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
+                (256, build("softmax256", &shaders::softmax_causal(256, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
+                (512, build("softmax512", &shaders::softmax_causal(512, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
+                (1024, build("softmax1024", &shaders::softmax_causal(1024, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
             ]),
             repeat_kv: build("repeat_kv", &shaders::repeat_kv(nqh / nkvh), "repeat_kv", Some(&rk_pl))?,
             slab_stats: build(
