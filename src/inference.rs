@@ -1441,6 +1441,27 @@ impl Inner {
         let first = self.decoder.prefill(&hidden_bytes, seq_len, 0)?;
         let t_prefill = t2.elapsed();
 
+        // Speculative-decode feasibility study.  Decode is memory-bound: it
+        // re-reads every weight for every token, so a batched pass that verifies
+        // K drafted positions at once amortises those reads K ways.  Whether that
+        // pays depends entirely on how many drafted tokens survive verification,
+        // and that can be measured *without* building the batched engine: drive
+        // the existing sequential `step()` with the drafted tokens, which gives
+        // the model's argmax under exactly the prefix the batched pass would see.
+        // Runs only under `QASR_SPEC_STUDY`; the KV it writes above `seq_len` is
+        // rewritten by the real decode below, which never reads past its own
+        // position, so the transcript is unaffected.
+        if let Some(k) = spec_study_k() {
+            if let TextBackend::Gpu(gpu_dec) = &mut self.decoder {
+                let p0 = gpu_dec.pos;
+                study_speculative(gpu_dec, first, k)?;
+                gpu_dec.pos = p0;
+                gpu_dec.set_input_token(first);
+            } else {
+                eprintln!("[spec-study] skipped: the CPU text backend has no batched pass");
+            }
+        }
+
         let eos = [ENDOFTEXT_TOKEN_ID as i32, IM_END_TOKEN_ID as i32];
         let mut generated: Vec<u32> = Vec::new();
         let t3 = Instant::now();
@@ -1475,6 +1496,181 @@ pub(crate) struct Generation {
     pub seq_len: usize,
     pub prefill_ms: f64,
     pub decode_ms: f64,
+}
+
+/// `QASR_SPEC_STUDY=<K>`: run the speculative-decode feasibility study at block
+/// width `K` after the prompt prefill.  Unset (or < 2) disables it.
+fn spec_study_k() -> Option<usize> {
+    std::env::var("QASR_SPEC_STUDY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|k| (2..=64).contains(k))
+}
+
+/// How many drafted tokens survive one verification pass, measured.
+///
+/// A batched verification pass would run the `K`-token block in one forward pass
+/// and accept the longest drafted prefix the model agrees with.  This drives the
+/// existing sequential `step()` instead: feeding drafted token `g_i` at position
+/// `p+i` returns the model's argmax *at* `p+i`, i.e. its token for `p+i+1` given
+/// the drafted prefix `g_0..g_i` — which for a causal model is exactly what the
+/// batched pass computes for row `i+1`.  So the accept length measured here is
+/// the accept length the batched engine would get, at the same arithmetic.
+///
+/// Two draft sources are tried, neither needing a second model:
+/// `repeat` re-guesses the last accepted token for the whole block, `shift`
+/// reuses the previous pass's own outputs (the Jacobi/lookahead iterate).
+fn study_speculative(
+    dec: &mut WgpuTextDecoder,
+    first: i32,
+    k_max: usize,
+) -> Result<()> {
+    let blocks: usize = std::env::var("QASR_SPEC_STUDY_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    let p0 = dec.pos;
+    let mut ks = vec![k_max];
+    if k_max >= 4 {
+        ks.push(k_max / 2);
+    }
+    if k_max >= 8 {
+        ks.push(2);
+    }
+    ks.sort_unstable();
+    ks.dedup();
+    eprintln!(
+        "[spec-study] prompt={p0} blocks={blocks} ks={ks:?} (sequential simulation; \
+         pass cost is K sequential steps here, not the batched cost)"
+    );
+
+    // Self-test: a plain greedy walk through this same feed-token-then-step path
+    // must reproduce the decode's own token stream.  If it does not, the
+    // harness is lying and every number below is noise.
+    {
+        let n = 16.min(64);
+        let mut t = first;
+        let mut walk: Vec<i32> = Vec::with_capacity(n);
+        for i in 0..n {
+            dec.pos = p0 + i;
+            dec.set_input_token(t);
+            t = dec.step()?;
+            walk.push(t);
+        }
+        let shown: Vec<String> = walk.iter().map(|v| v.to_string()).collect();
+        eprintln!("[spec-study] greedy walk (must equal decode's tokens): {}", shown.join(" "));
+    }
+    eprintln!(
+        "{:>3} {:>7} {:>7} {:>7} {:>9} {:>8}   advance histogram (1..=K)",
+        "K", "mode", "passes", "tokens", "tok/pass", "vs 1.0"
+    );
+    for &k in &ks {
+        for mode in ["repeat", "shift"] {
+            let r = study_one(dec, p0, first, k, blocks, mode)?;
+            let per_pass = r.tokens as f64 / r.passes as f64;
+            let hist: Vec<String> = (1..=k.min(r.hist.len().saturating_sub(1)))
+                .map(|i| format!("{}", r.hist[i]))
+                .collect();
+            eprintln!(
+                "{:>3} {:>7} {:>7} {:>7} {:>9.3} {:>8.2}x   {}",
+                k,
+                mode,
+                r.passes,
+                r.tokens,
+                per_pass,
+                per_pass,
+                hist.join(" ")
+            );
+        }
+    }
+    eprintln!(
+        "[spec-study] tok/pass is the whole result: effective ms/token = \
+         batched_pass_cost(K) / tok_per_pass, against 8.1 ms/token sequential."
+    );
+    Ok(())
+}
+
+struct StudyResult {
+    passes: usize,
+    tokens: usize,
+    hist: Vec<usize>,
+}
+
+fn study_one(
+    dec: &mut WgpuTextDecoder,
+    p0: usize,
+    first: i32,
+    k: usize,
+    blocks: usize,
+    mode: &str,
+) -> Result<StudyResult> {
+    dec.pos = p0;
+    dec.set_input_token(first);
+    // Model's token at the position before the block start; `first` is the
+    // argmax the prefill produced at `p0`, i.e. the token at `p0` itself.
+    let mut prev = first;
+    let mut p = p0;
+    let mut carry: Vec<i32> = Vec::new();
+    let mut passes = 0usize;
+    let mut tokens = 0usize;
+    let mut hist = vec![0usize; k + 2];
+
+    for _ in 0..blocks {
+        // Position `p` already has a known token (`prev`): the batched pass would
+        // feed it as row 0 and only speculate rows 1..K-1.  So the draft covers
+        // positions p+1..p+K-1 and a pass gains `j` tokens where `j` is the first
+        // row whose draft the model rejects (j == K when none is rejected: K-1
+        // confirmed plus the one the model hands back at the end).
+        let mut guess: Vec<i32> = vec![prev; k];
+        guess[0] = prev;
+        if mode == "shift" {
+            for i in 1..k {
+                if i - 1 < carry.len() {
+                    guess[i] = carry[i - 1];
+                }
+            }
+        }
+
+        // Feed the block and collect the model's argmax per position.
+        let mut o = vec![0i32; k];
+        for (i, g) in guess.iter().enumerate() {
+            dec.pos = p + i;
+            dec.set_input_token(*g);
+            o[i] = dec.step()?;
+        }
+
+        // `o[i]` is the model's token at `p+i+1` given `guess[0..=i]`, so draft
+        // `guess[i]` for position `p+i` is confirmed by `o[i-1]`.
+        let mut j = k;
+        for i in 1..k {
+            if guess[i] != o[i - 1] {
+                j = i;
+                break;
+            }
+        }
+        let adv = j; // 1..=k tokens gained this pass
+        if passes < 6 && std::env::var("QASR_SPEC_STUDY_TRACE").is_ok() {
+            eprintln!(
+                "    trace k={k} {mode} blk#{passes} p={p} prev={prev} guess=[{}] o=[{}] j={j} adv={adv}",
+                guess.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
+                o.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
+            );
+        }
+        passes += 1;
+        tokens += adv;
+        hist[adv.min(k)] += 1;
+
+        // The new block starts at `p + adv`; `o[i]` is the model's token at
+        // `p+i+1`, so `o[adv-1]` is the token at the new block start and
+        // `o[adv..]` are the pass's own outputs for the positions after it.
+        prev = o[adv - 1];
+        carry = if adv < k { o[adv..].to_vec() } else { Vec::new() };
+        p += adv;
+        if p + k > p0 + 4096 {
+            break;
+        }
+    }
+    Ok(StudyResult { passes, tokens, hist })
 }
 
 fn write_f32_dump(dir: &Path, name: &str, data: &[f32]) -> Result<()> {
