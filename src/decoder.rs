@@ -2138,6 +2138,13 @@ impl WgpuTextDecoder {
         let mut cp = enc.begin_compute_pass(&Default::default());
 
         let dup = std::env::var("QASR_DUP").unwrap_or_default();
+        // `QASR_SKIP` on the prefill's four *projections* -- the phase's dominant
+        // cost had no exact price at all (only `QASR_DUP`, which inflates a GEMM
+        // by 35-65%), so their share of `pre` was an inference from `gemm_bench`.
+        // Skipping changes the transcript, not the phase line: `pre` stays
+        // comparable, which is the same argument the encoder's skips rest on.
+        let skip = std::env::var("QASR_SKIP").unwrap_or_default();
+        let sk = |name: &str| skip == name;
 
         for (li, layer) in self.layers.iter().enumerate() {
             let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2154,11 +2161,13 @@ impl WgpuTextDecoder {
             cp.set_bind_group(0, &bg, &[]);
             cp.dispatch_workgroups(s as u32, 1, 1);
 
-            gemm!(
-                &mut cp, &self.pipes.gemm, &normed, &layer.qkv_w, &qkv,
-                s, cfg.fused_qkv_cols(), hs, cfg.fused_qkv_cols(), 0, 0, 0,
-                (cfg.fused_qkv_cols() / 128) as u32, (mp / 128) as u32, 1
-            );
+            if !sk("p_qkv") {
+                gemm!(
+                    &mut cp, &self.pipes.gemm, &normed, &layer.qkv_w, &qkv,
+                    s, cfg.fused_qkv_cols(), hs, cfg.fused_qkv_cols(), 0, 0, 0,
+                    (cfg.fused_qkv_cols() / 128) as u32, (mp / 128) as u32, 1
+                );
+            }
 
             let bg_ex = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("p.extract"),
@@ -2402,11 +2411,13 @@ impl WgpuTextDecoder {
                 }
             }
 
-            gemm!(
-                &mut cp, &self.pipes.gemm_acc, &attn_flat, &layer.o_w, &h_buf,
-                s, hs, nqh * hd, hs, 0, 0, 0,
-                (hs / 128) as u32, (mp / 128) as u32, 1
-            );
+            if !sk("p_o") {
+                gemm!(
+                    &mut cp, &self.pipes.gemm_acc, &attn_flat, &layer.o_w, &h_buf,
+                    s, hs, nqh * hd, hs, 0, 0, 0,
+                    (hs / 128) as u32, (mp / 128) as u32, 1
+                );
+            }
 
             let bg_rms2 = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("p.rms2"),
@@ -2425,11 +2436,13 @@ impl WgpuTextDecoder {
                 cp.dispatch_workgroups(s as u32, 1, 1);
             }
 
-            gemm!(
-                &mut cp, &self.pipes.gemm, &norm2, &layer.gu_w, &gu,
-                s, 2 * inter, hs, 2 * inter, 0, 0, 0,
-                ((2 * inter) / 128) as u32, (mp / 128) as u32, 1
-            );
+            if !sk("p_gu") {
+                gemm!(
+                    &mut cp, &self.pipes.gemm, &norm2, &layer.gu_w, &gu,
+                    s, 2 * inter, hs, 2 * inter, 0, 0, 0,
+                    ((2 * inter) / 128) as u32, (mp / 128) as u32, 1
+                );
+            }
 
             let bg_silu = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("p.silu"),
@@ -2447,11 +2460,13 @@ impl WgpuTextDecoder {
                 cp.dispatch_workgroups(silu_grid.0, silu_grid.1, 1);
             }
 
-            gemm!(
-                &mut cp, &self.pipes.gemm_acc, &activated, &layer.dp_w, &h_buf,
-                s, hs, inter, hs, 0, 0, 0,
-                (hs / 128) as u32, (mp / 128) as u32, 1
-            );
+            if !sk("p_dp") {
+                gemm!(
+                    &mut cp, &self.pipes.gemm_acc, &activated, &layer.dp_w, &h_buf,
+                    s, hs, inter, hs, 0, 0, 0,
+                    (hs / 128) as u32, (mp / 128) as u32, 1
+                );
+            }
 
             let submit_every = if s >= 4096 { 2 } else { 4 };
             if s >= 512 && (li + 1) % submit_every == 0 {
