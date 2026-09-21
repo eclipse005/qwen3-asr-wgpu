@@ -311,6 +311,7 @@ struct Pipes {
     extract: wgpu::ComputePipeline,
     gqa256: wgpu::ComputePipeline,
     gqa512: wgpu::ComputePipeline,
+     gqa_split128: wgpu::ComputePipeline,
     gqa_split256: wgpu::ComputePipeline,
     gqa_split512: wgpu::ComputePipeline,
     gqa_merge: wgpu::ComputePipeline,
@@ -386,6 +387,13 @@ fn kv_bind_groups(
 }
 
 /// Capacity of the single-block attention path.
+///
+/// Above this `cur_len` attention switches to split-K plus a merge dispatch.
+/// The crossover was re-measured with the single path widened to 4096 (same
+/// shader, bigger score buffer, byte-identical output): 90 s_en 22.32 vs 23.33
+/// RTFx and 180 s_en 18.85 vs 20.87, so the split path's parallelism is worth
+/// more than the merge dispatch it costs, and 1024 is the right side of the
+/// crossover.
 pub const GQA_SINGLE_CAP: usize = 1024;
 
 /// KV slots allocated at load (112 KiB each, see [`WgpuTextDecoder::load`]).
@@ -413,7 +421,24 @@ fn slab_path(s: usize) -> bool {
     }
 }
 
+/// Split-attention chunk width.
+///
+/// The chunk sets both the workgroup count (one per `(q_head, chunk)`, so
+/// `nh x ceil(cur_len/chunk)`) and how many partials the merge dispatch has to
+/// combine.  `QASR_GQA_CHUNK` pins it to one of the two built kernels so the
+/// granularity can be A/B'd from a single binary.
 fn gqa_split_chunk(cur_len: usize) -> usize {
+    static FORCED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let forced = *FORCED.get_or_init(|| {
+        std::env::var("QASR_GQA_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| matches!(v, 128 | 256 | 512))
+            .unwrap_or(0)
+    });
+    if forced != 0 {
+        return forced;
+    }
     if cur_len >= 2048 {
         512
     } else {
@@ -544,6 +569,7 @@ impl WgpuTextDecoder {
             extract: build("qkv_extract", &shaders::qkv_extract(nqh, nkvh, hd), "qkv_extract", None)?,
             gqa256: build("gqa256", &shaders::gqa_decode_single(nqh, nkvh, hd, 256, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl))?,
             gqa512: build("gqa512", &shaders::gqa_decode_single(nqh, nkvh, hd, 512, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl))?,
+            gqa_split128: build("gqa_split128", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 128), "gqa_split_p1", Some(&split_pl))?,
             gqa_split256: build("gqa_split256", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 256), "gqa_split_p1", Some(&split_pl))?,
             gqa_split512: build("gqa_split512", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 512), "gqa_split_p1", Some(&split_pl))?,
             gqa_merge: build("gqa_merge", &shaders::gqa_split_merge(hd), "gqa_merge", None)?,
@@ -1098,7 +1124,11 @@ impl WgpuTextDecoder {
         }
         let chunk = gqa_split_chunk(cur_len) as u32;
         let n_chunks = (cur_len as u32).div_ceil(chunk);
-        let split = if chunk == 512 { &self.pipes.gqa_split512 } else { &self.pipes.gqa_split256 };
+        let split = match chunk {
+            128 => &self.pipes.gqa_split128,
+            512 => &self.pipes.gqa_split512,
+            _ => &self.pipes.gqa_split256,
+        };
         let dup = std::env::var("QASR_DUP").unwrap_or_default();
         cp.set_pipeline(split);
         cp.set_bind_group(0, &l.bg_gqa_split, &[]);
