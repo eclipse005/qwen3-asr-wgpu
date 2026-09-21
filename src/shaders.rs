@@ -2188,9 +2188,50 @@ fn prefill_gemm_impl(
 /// whole row, the flat path): the row index is still absolute, so the causal
 /// bound is `p + 1 - row0` clamped at zero.  With `row0 = 0` the bound collapses
 /// to `min(p + 1, valid)` — the flat path is untouched.
-pub fn softmax_causal(bs: usize) -> String {
+pub fn softmax_causal(bs: usize, subgroup: bool) -> String {
+    // The two reduction trees cross warps above distance 32 and stay inside one
+    // warp below it, so the last five levels (16, 8, 4, 2, 1) can be a shuffle
+    // instead of five smem rounds plus five barriers.  Lane 0's accumulation is
+    // the same one either way: the XOR butterfly's operands at each step are the
+    // `lid + sh` pair the linear tree uses, and `max` and the running sum are
+    // both exact in the same order.  That is 20 barriers per row down to 10.
+    let (max_tail, sum_tail) = if subgroup {
+        (
+            "    if (lid.x < 32u) {\n\
+             \x20       var t = red_max[lid.x];\n\
+             \x20       t = max(t, subgroupShuffleXor(t, 16u));\n\
+             \x20       t = max(t, subgroupShuffleXor(t, 8u));\n\
+             \x20       t = max(t, subgroupShuffleXor(t, 4u));\n\
+             \x20       t = max(t, subgroupShuffleXor(t, 2u));\n\
+             \x20       t = max(t, subgroupShuffleXor(t, 1u));\n\
+             \x20       red_max[lid.x] = t;\n\
+             \x20   }\n"
+                .to_string(),
+            "    if (lid.x < 32u) {\n\
+             \x20       var t = red_sum[lid.x];\n\
+             \x20       t = t + subgroupShuffleXor(t, 16u);\n\
+             \x20       t = t + subgroupShuffleXor(t, 8u);\n\
+             \x20       t = t + subgroupShuffleXor(t, 4u);\n\
+             \x20       t = t + subgroupShuffleXor(t, 2u);\n\
+             \x20       t = t + subgroupShuffleXor(t, 1u);\n\
+             \x20       red_sum[lid.x] = t;\n\
+             \x20   }\n"
+                .to_string(),
+        )
+    } else {
+        let keep = "    for (var sh = 16u; sh > 0u; sh = sh >> 1u) {\n\
+                    \x20   if (lid.x < sh) {{ red_{r}[lid.x] = {op}; }}\n\
+                    \x20   workgroupBarrier();\n\
+                    \x20   }\n";
+        (
+            keep.replace("{r}", "max")
+                .replace("{op}", "max(red_max[lid.x], red_max[lid.x + sh])"),
+            keep.replace("{r}", "sum")
+                .replace("{op}", "red_sum[lid.x] + red_sum[lid.x + sh]"),
+        )
+    };
     format!(
-        "struct Cfg {{ n_w: u32, n_x: u32, valid: u32, m: u32, mp: u32, scale: f32, gx: u32, row0: u32 }};
+        "{enable}struct Cfg {{ n_w: u32, n_x: u32, valid: u32, m: u32, mp: u32, scale: f32, gx: u32, row0: u32 }};
 
 @group(0) @binding(0) var<storage, read>       X:   array<u32>;
 @group(0) @binding(1) var<storage, read_write> Out: array<u32>;
@@ -2239,10 +2280,11 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
     }}
     red_max[lid.x] = lmax;
     workgroupBarrier();
-    for (var sh = BS >> 1u; sh > 0u; sh = sh >> 1u) {{
+    for (var sh = BS >> 1u; sh > 16u; sh = sh >> 1u) {{
         if (lid.x < sh) {{ red_max[lid.x] = max(red_max[lid.x], red_max[lid.x + sh]); }}
         workgroupBarrier();
     }}
+{max_tail}    workgroupBarrier();
     let row_max = red_max[0];
     workgroupBarrier();
 
@@ -2253,10 +2295,11 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
     }}
     red_sum[lid.x] = lsum;
     workgroupBarrier();
-    for (var sh = BS >> 1u; sh > 0u; sh = sh >> 1u) {{
+    for (var sh = BS >> 1u; sh > 16u; sh = sh >> 1u) {{
         if (lid.x < sh) {{ red_sum[lid.x] = red_sum[lid.x] + red_sum[lid.x + sh]; }}
         workgroupBarrier();
     }}
+{sum_tail}    workgroupBarrier();
     let inv_sum = 1.0 / red_sum[0];
     workgroupBarrier();
 
@@ -2280,6 +2323,9 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
 }}
 ",
         bs = bs,
+        enable = "",
+        max_tail = max_tail,
+        sum_tail = sum_tail,
     )
 }
 
