@@ -2531,34 +2531,34 @@ fn prefill_gemm_impl(
 /// whole row, the flat path): the row index is still absolute, so the causal
 /// bound is `p + 1 - row0` clamped at zero.  With `row0 = 0` the bound collapses
 /// to `min(p + 1, valid)` — the flat path is untouched.
-pub fn softmax_causal(bs: usize, subgroup: bool) -> String {
-    // Three rewrites of this kernel have been measured and reverted; do not
-    // re-derive them.
-    //
-    //   * word-at-a-time in the max/sum passes (the fix that paid in the audio
-    //     layer norm): +3 ms, 3 reps.
-    //   * `exp2(y * LOG2E)` for `exp(y)`: 719 against a 719 ms baseline.  This is
-    //     *not* evidence that the exp is cheap -- naga lowers `exp` to the same
-    //     instruction, so the rewrite was a no-op.  It is evidence that guessing
-    //     at this kernel from its instruction mix does not work.
-    //   * keeping stage 3's exp values in `var<workgroup>` for stage 4 to read
-    //     instead of recomputing: **683 ms (off) against 689 ms (on), 5 reps
-    //     interleaved, both arms MATCH** -- an smem round trip costs more than
-    //     the exp it saves.  That was the one with arithmetic behind it (two
-    //     exps per element over 11.2M element-visits per layer) and it was still
-    //     wrong.
-    //
-    // What *did* pay here was the barrier count: see `sg_reduce` in
-    // `decoder.rs`.  The lesson this kernel keeps teaching is that its cost is
-    // in latency -- barriers and the three global row reads -- and not in the
-    // arithmetic or the instruction count.
-    // The two reduction trees cross warps above distance 32 and stay inside one
-    // warp below it, so the last five levels (16, 8, 4, 2, 1) can be a shuffle
-    // instead of five smem rounds plus five barriers.  Lane 0's accumulation is
-    // the same one either way: the XOR butterfly's operands at each step are the
-    // `lid + sh` pair the linear tree uses, and `max` and the running sum are
-    // both exact in the same order.  That is 20 barriers per row down to 10.
+/// The flat causal softmax at a **physical** workgroup width of `bp` computing a
+/// **logical** reduction tree of width `bt` (`bt >= bp`, `bt % bp == 0`).
+///
+/// `bt` is the width the arithmetic is defined at -- it sets both the
+/// element-to-lane map (`lane l takes elements l, l+bt, ...`) and the tree's
+/// operand pairing.  `bp` only decides how many threads share the work: each
+/// thread emulates `r = bt/bp` lanes and folds the tree's first `log2(r)` levels
+/// *inside itself*, in the tree's own operand order, so the value that reaches
+/// `red_max[t]` / `red_sum[t]` is the same f32 the wider tree would have built
+/// from those lanes.
+///
+/// The reason to want that: at `bt = 1024` a workgroup is one per SM
+/// (`1024 x ~40 registers`), so the row's 16-barrier tree plus its two cold row
+/// reads run only 15 rows at a time.  `docs/perf.md` prices it at 80 ms of a
+/// 90 s_en prefill.  Capping the block *changes the tree* and the gate caught it
+/// (`1.7B / 180s_zh` MISMATCH at r22); this changes only the thread count, so the
+/// two are not the same experiment and only one of them is safe.
+///
+/// The max fold is order-free (max is exact); the sum fold must place the
+/// parentheses exactly where the tree would: level 1 pairs lane `k` with lane
+/// `k + r/2`, level 2 with `k + r/4`, and so on, each as `left + right`.
+pub fn softmax_causal_tree(bp: usize, bt: usize, subgroup: bool) -> String {
+    assert!(bt >= bp && bt % bp == 0, "softmax_causal_tree: bt must be a multiple of bp");
+    let r = bt / bp;
+    assert!(r.is_power_of_two(), "softmax_causal_tree: the emulation factor must be a power of two");
+    assert!(bp >= 32, "softmax_causal_tree: the shuffle tail needs 32 lanes");
     let (max_tail, sum_tail) = if subgroup {
+
         (
             "    if (lid.x < 32u) {\n\
              \x20       var t = red_max[lid.x];\n\
@@ -2593,6 +2593,81 @@ pub fn softmax_causal(bs: usize, subgroup: bool) -> String {
                 .replace("{op}", "red_sum[lid.x] + red_sum[lid.x + sh]"),
         )
     };
+    // The two row passes.  At `r == 1` this is the original one element per
+    // thread per iteration, emitted unchanged; above it each thread walks its `r`
+    // lanes together, one element each per iteration, so a lane still sees its
+    // elements in ascending order and the fold below is the tree's own first
+    // levels.  Nothing about the values or their order depends on `bp`.
+    let lanes = |op: &str| -> String {
+        if r == 1 {
+            return if op == "max" {
+                "    var lmax = bitcast<f32>(0xFF800000u);\n\
+                 \x20   for (var j = lid.x; j < valid; j = j + {bt}u) {\n\
+                 \x20       let v = half_at(unpack2x16float(X[base_x + (j >> 1u)]), j);\n\
+                 \x20       let sc = v * scale;\n\
+                 \x20       if (sc > lmax) { lmax = sc; }\n\
+                 \x20   }\n\
+                 \x20   red_max[lid.x] = lmax;\n"
+                    .replace("{bt}", &bt.to_string())
+            } else {
+                "    var lsum = 0.0;\n\
+                 \x20   for (var j = lid.x; j < valid; j = j + {bt}u) {\n\
+                 \x20       let v = half_at(unpack2x16float(X[base_x + (j >> 1u)]), j);\n\
+                 \x20       lsum = lsum + exp(v * scale - row_max);\n\
+                 \x20   }\n\
+                 \x20   red_sum[lid.x] = lsum;\n"
+                    .replace("{bt}", &bt.to_string())
+            };
+        }
+        let init = if op == "max" { "bitcast<f32>(0xFF800000u)" } else { "0.0" };
+        // The two passes share a function scope, so the accumulators need
+        // different names (m* and s*, not both *).
+        let pre = if op == "max" { "m" } else { "s" };
+        let mut accl = String::new();
+        for k in 0..r {
+            accl.push_str(&format!("    var {pre}{k} = {init};\n"));
+        }
+        let mut body = String::new();
+        for k in 0..r {
+            body.push_str(&format!("        let j{k} = base + lid.x + {}u;\n", k * bp));
+            body.push_str(&format!("        if (j{k} < valid) {{\n"));
+            body.push_str(&format!(
+                "            let v{k} = half_at(unpack2x16float(X[base_x + (j{k} >> 1u)]), j{k});\n"
+            ));
+            if op == "max" {
+                body.push_str(&format!("            {pre}{k} = max({pre}{k}, v{k} * scale);\n"));
+            } else {
+                body.push_str(&format!(
+                    "            {pre}{k} = {pre}{k} + exp(v{k} * scale - row_max);\n"
+                ));
+            }
+            body.push_str("        }\n");
+        }
+        // Fold the tree's first `log2(r)` levels here, pairing `k` with
+        // `k + half` exactly as the wider tree does.
+        let mut cur: Vec<String> = (0..r).map(|k| format!("{pre}{k}")).collect();
+        while cur.len() > 1 {
+            let half = cur.len() / 2;
+            let mut next = Vec::with_capacity(half);
+            for i in 0..half {
+                next.push(if op == "max" {
+                    format!("max({}, {})", cur[i], cur[i + half])
+                } else {
+                    format!("({} + {})", cur[i], cur[i + half])
+                });
+            }
+            cur = next;
+        }
+        let folded = cur.pop().unwrap();
+        let lname = if op == "max" { "lmax" } else { "lsum" };
+        let arr = if op == "max" { "red_max" } else { "red_sum" };
+        format!(
+            "{accl}    for (var base = 0u; base < valid; base = base + {bt}u) {{\n{body}\
+             \x20   }}\n\
+             \x20   let {lname} = {folded};\n\
+             \x20   {arr}[lid.x] = {lname};\n",
+        )
+    };
     format!(
         "{enable}struct Cfg {{ n_w: u32, n_x: u32, valid: u32, m: u32, mp: u32, scale: f32, gx: u32, row0: u32 }};
 
@@ -2600,13 +2675,11 @@ pub fn softmax_causal(bs: usize, subgroup: bool) -> String {
 @group(0) @binding(1) var<storage, read_write> Out: array<u32>;
 @group(0) @binding(2) var<uniform>             cfg: Cfg;
 
-const BS: u32 = {bs}u;
-
 {HALF_AT}
-var<workgroup> red_max: array<f32, {bs}>;
-var<workgroup> red_sum: array<f32, {bs}>;
+var<workgroup> red_max: array<f32, {bp}>;
+var<workgroup> red_sum: array<f32, {bp}>;
 
-@compute @workgroup_size({bs})
+@compute @workgroup_size({bp})
 fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
            @builtin(local_invocation_id) lid: vec3<u32>) {{
     // X rows are n_x-strided (tile-padded scores, one row per head*pos);
@@ -2629,21 +2702,14 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
     // Only the reductions are skipped; the branch is workgroup-uniform (it
     // depends on the row alone), so it may skip the barriers.
     if (valid == 0u) {{
-        for (var w = lid.x; w < cfg.n_w; w = w + BS) {{
+        for (var w = lid.x; w < cfg.n_w; w = w + {bp}u) {{
             Out[base_o + w] = 0u;
         }}
         return;
     }}
 
-    var lmax = bitcast<f32>(0xFF800000u);
-    for (var j = lid.x; j < valid; j = j + BS) {{
-        let v = half_at(unpack2x16float(X[base_x + (j >> 1u)]), j);
-        let sc = v * scale;
-        if (sc > lmax) {{ lmax = sc; }}
-    }}
-    red_max[lid.x] = lmax;
-    workgroupBarrier();
-    for (var sh = BS >> 1u; sh > 16u; sh = sh >> 1u) {{
+{load_max}    workgroupBarrier();
+    for (var sh = {bp}u >> 1u; sh > 16u; sh = sh >> 1u) {{
         if (lid.x < sh) {{ red_max[lid.x] = max(red_max[lid.x], red_max[lid.x + sh]); }}
         workgroupBarrier();
     }}
@@ -2651,14 +2717,8 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
     let row_max = red_max[0];
     workgroupBarrier();
 
-    var lsum = 0.0;
-    for (var j = lid.x; j < valid; j = j + BS) {{
-        let v = half_at(unpack2x16float(X[base_x + (j >> 1u)]), j);
-        lsum = lsum + exp(v * scale - row_max);
-    }}
-    red_sum[lid.x] = lsum;
-    workgroupBarrier();
-    for (var sh = BS >> 1u; sh > 16u; sh = sh >> 1u) {{
+{load_sum}    workgroupBarrier();
+    for (var sh = {bp}u >> 1u; sh > 16u; sh = sh >> 1u) {{
         if (lid.x < sh) {{ red_sum[lid.x] = red_sum[lid.x] + red_sum[lid.x + sh]; }}
         workgroupBarrier();
     }}
@@ -2668,7 +2728,7 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
 
     // one thread per f16 word — no read-modify-write races, and the per-element
     // arithmetic is the same as one element per thread
-    for (var w = lid.x; w < cfg.n_w; w = w + BS) {{
+    for (var w = lid.x; w < cfg.n_w; w = w + {bp}u) {{
         let j0 = w * 2u;
         let j1 = j0 + 1u;
         var e0 = 0.0;
@@ -2685,11 +2745,18 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
     }}
 }}
 ",
-        bs = bs,
+        bp = bp,
         enable = "",
+        load_max = lanes("max"),
+        load_sum = lanes("sum"),
         max_tail = max_tail,
         sum_tail = sum_tail,
     )
+}
+
+/// The shipped flat causal softmax: `bt == bp`, i.e. no lane emulation.
+pub fn softmax_causal(bs: usize, subgroup: bool) -> String {
+    softmax_causal_tree(bs, bs, subgroup)
 }
 
 /// Per-*slab* softmax statistics for the tiled prefill attention: one

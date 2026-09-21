@@ -93,6 +93,75 @@ fn block_for_reduction(last: usize) -> u32 {
     bs.min(1024).max(32)
 }
 
+/// Physical/workgroup and logical/*tree* widths for the prefill's flat causal
+/// softmax.
+///
+/// `block_for_reduction` grows the block with the row so a row is covered in one
+/// or two iterations, which at `cur_len = 1280` means **1024 threads** -- and
+/// that is one workgroup per SM (`1024 x ~40 registers` does not fit twice), so
+/// the whole card runs 15 rows at a time while each row is a 16-barrier
+/// reduction tree with two cold row reads inside it.  `QASR_DUP=p_softmax` prices
+/// it at **80 ms of a 90 s_en prefill** (2.3% of a run), thirteen times off its
+/// byte bound, and the parallelism that would hide it is four times too low.
+///
+/// Capping the block at 256 by itself takes the prefill from 512 to 451 ms and
+/// **passes all twelve fixtures** (`scripts/bench-sm256.tsv`) -- but it *is* a
+/// summation-order change, and narrowing it so only this kernel moved made
+/// `1.7B / 180s_zh` MISMATCH (r22).  Two perturbation classes at ~1e-7 in
+/// different kernels happened to cancel in the first run: that is a razor's
+/// edge, not a measurement.
+///
+/// So the shipped form keeps the **tree width exactly as it was** and only moves
+/// the *physical* width: [`softmax_causal_tree`] has each of the 128 threads
+/// emulate `tree/128` lanes and fold the tree's first levels inside the thread,
+/// in the tree's own operand order.  That is bit-identical by construction, so
+/// the gate is a bug detector here rather than an arbiter, and the physical width
+/// becomes a legal knob (`QASR_SM_BS`, one of [`SM_BS_CHOICES`]).
+///
+/// The sweep behind `128` (0.6B, median of three interleaved reps, prefill ms):
+///
+/// | phys | 90s_en (tree 1024) | 180s_zh (tree 1024) |
+/// |---|---|---|
+/// | 256 | 461 / 460 | - |
+/// | **128** | **455** | **998** |
+/// | 64 | 452 | 1005 |
+///
+/// 64 and 128 are a wash -- each wins one fixture by 0.7%, which is the
+/// resolution of the method -- and both are 1-2% ahead of 256.  128 is shipped
+/// because it is ahead where the softmax's share is largest and because it never
+/// needs to emulate more than 8 lanes (`tree/128`), where 64 needs 16.
+fn softmax_blocks(last: usize) -> (u32, u32) {
+    let tree = block_for_reduction(last);
+    let forced: u32 = std::env::var("QASR_SM_BS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let phys = if forced != 0 {
+        assert!(
+            SM_BS_CHOICES.contains(&forced),
+            "QASR_SM_BS={forced}: only {SM_BS_CHOICES:?} have pipelines built \
+             (`softmax_wide`); a width with no pipeline for this row's tree would \
+             otherwise fall back to a *different* tree, which is the r22 mistake"
+        );
+        forced
+    } else {
+        SOFTMAX_BS_PHYS
+    };
+    if tree <= phys {
+        (tree, tree)
+    } else {
+        (phys, tree)
+    }
+}
+
+/// Physical workgroup width for the flat softmax; see [`softmax_blocks`].
+const SOFTMAX_BS_PHYS: u32 = 128;
+
+/// The physical widths `softmax_wide` has pipelines for, for every `tree` the
+/// row-length ladder can produce (256, 512, 1024).  `softmax_blocks` asserts on
+/// anything else rather than silently narrowing the tree.
+const SM_BS_CHOICES: [u32; 3] = [64, 128, 256];
+
 pub(crate) fn grid_xy(workgroups: usize) -> (u32, u32) {
     let gx = workgroups.clamp(1, 65_535) as u32;
     let gy = workgroups.div_ceil(gx as usize).max(1) as u32;
@@ -335,6 +404,9 @@ struct Pipes {
     gemm_causal: wgpu::ComputePipeline,
     gemm_av_causal: wgpu::ComputePipeline,
     softmax: std::collections::HashMap<usize, wgpu::ComputePipeline>,
+    /// Narrower physical workgroups computing a wider tree, keyed by
+    /// `(phys, tree)`; see [`softmax_blocks`] and `softmax_causal_tree`.
+    softmax_wide: std::collections::HashMap<(usize, usize), wgpu::ComputePipeline>,
     repeat_kv: wgpu::ComputePipeline,
     slab_stats: wgpu::ComputePipeline,
     slab_weights: wgpu::ComputePipeline,
@@ -755,6 +827,19 @@ impl WgpuTextDecoder {
                 (256, build("softmax256", &shaders::softmax_causal(256, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
                 (512, build("softmax512", &shaders::softmax_causal(512, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
                 (1024, build("softmax1024", &shaders::softmax_causal(1024, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
+            ]),
+            // Every `(phys, tree)` the shipped `SOFTMAX_BS_PHYS` can meet must be
+            // here: `tree` is the row-length ladder (256/512/1024), and a physical
+            // width that lands on a missing pair is a panic, not a fallback.
+            softmax_wide: std::collections::HashMap::from([
+                ((64, 256), build("softmax64x256", &shaders::softmax_causal_tree(64, 256, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
+                ((64, 512), build("softmax64x512", &shaders::softmax_causal_tree(64, 512, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
+                ((64, 1024), build("softmax64x1024", &shaders::softmax_causal_tree(64, 1024, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
+                ((128, 256), build("softmax128x256", &shaders::softmax_causal_tree(128, 256, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
+                ((128, 512), build("softmax128x512", &shaders::softmax_causal_tree(128, 512, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
+                ((128, 1024), build("softmax128x1024", &shaders::softmax_causal_tree(128, 1024, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
+                ((256, 512), build("softmax256x512", &shaders::softmax_causal_tree(256, 512, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
+                ((256, 1024), build("softmax256x1024", &shaders::softmax_causal_tree(256, 1024, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
             ]),
             repeat_kv: build("repeat_kv", &shaders::repeat_kv(nqh / nkvh), "repeat_kv", Some(&rk_pl))?,
             slab_stats: build(
@@ -2179,10 +2264,18 @@ impl WgpuTextDecoder {
                     );
                 }
 
-                let bs = block_for_reduction(cur) as usize;
+                let (phys, tree) = softmax_blocks(cur);
+                // `phys == tree` is the shipped kernel; otherwise the physical
+                // width is narrower than the arithmetic's tree and each thread
+                // emulates `tree/phys` lanes (see `softmax_causal_tree`).
+                let sm_pipe = if phys == tree {
+                    &self.pipes.softmax[&(tree as usize)]
+                } else {
+                    &self.pipes.softmax_wide[&(phys as usize, tree as usize)]
+                };
                 let bg_sm = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("p.sm"),
-                    layout: &self.pipes.softmax[&bs].get_bind_group_layout(0),
+                    layout: &sm_pipe.get_bind_group_layout(0),
                     entries: &[
                         wgpu::BindGroupEntry { binding: 0, resource: scores.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 1, resource: attn.as_entire_binding() },
@@ -2196,7 +2289,7 @@ impl WgpuTextDecoder {
                         },
                     ],
                 });
-                cp.set_pipeline(&self.pipes.softmax[&bs]);
+                cp.set_pipeline(sm_pipe);
                 cp.set_bind_group(0, &bg_sm, &[0]);
                 cp.dispatch_workgroups(softmax_grid.0, softmax_grid.1, 1);
                 if dup == "p_softmax" {
