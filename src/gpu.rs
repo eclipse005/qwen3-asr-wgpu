@@ -653,22 +653,51 @@ impl<'a> BulkUpload<'a> {
     /// every staging memcpy.  The budget is what bounds how much can be in
     /// flight.
     pub fn upload(&mut self, buf: &wgpu::Buffer, data: &[u8]) -> Result<()> {
+        self.upload_at(buf, 0, data)
+    }
+
+    /// [`Self::upload`] at an explicit offset — so a fused matrix (`q|k|v`,
+    /// `gate|up`) can be written part by part instead of being concatenated on
+    /// the host first.  The offset must be a multiple of 4 (wgpu's copy
+    /// alignment); every f16 row is a multiple of 2, and every call site here
+    /// passes whole matrices.
+    pub fn upload_at(&mut self, buf: &wgpu::Buffer, offset: u64, data: &[u8]) -> Result<()> {
+        anyhow::ensure!(offset % 4 == 0, "upload offset {offset} is not 4-byte aligned");
         let budget = (STAGING_BUDGET as usize).max(1);
-        let mut off = 0usize;
+        let mut off = offset;
         for piece in data.chunks(budget) {
             if self.pending + piece.len() as u64 > STAGING_BUDGET {
                 self.pump()?;
             }
             let t = std::time::Instant::now();
-            self.gpu.queue.write_buffer(buf, off as u64, piece);
+            self.gpu.queue.write_buffer(buf, off, piece);
             crate::load_trace::transfer::add_write(
                 t.elapsed().as_nanos() as u64,
                 piece.len() as u64,
             );
             self.pending += piece.len() as u64;
-            off += piece.len();
+            off += piece.len() as u64;
         }
         Ok(())
+    }
+
+    /// Allocate a storage buffer and fill it from `pieces`, each `(offset, bytes)`.
+    ///
+    /// The pieces come straight out of [`crate::weights`] in the layout the
+    /// kernels want, so a fused matrix is never materialised twice: an f16
+    /// checkpoint contributes its own mapped bytes, a bf16 one a single
+    /// narrowing pass into the destination layout.
+    pub fn upload_pieces(
+        &mut self,
+        label: &str,
+        pieces: &[(u64, bytes::Bytes)],
+    ) -> Result<wgpu::Buffer> {
+        let total: u64 = pieces.iter().map(|(_, b)| b.len() as u64).sum();
+        let buf = self.storage(label, total);
+        for (off, data) in pieces {
+            self.upload_at(&buf, *off, data)?;
+        }
+        Ok(buf)
     }
 
     /// Retire whatever is still staged.  Call before the first real dispatch.

@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use safetensors::Dtype;
 
 use crate::gpu::{BulkUpload, Gpu};
 use crate::shaders;
@@ -592,7 +593,9 @@ impl WgpuTextDecoder {
             bytemuck::bytes_of(&RmsCfg { eps: cfg.rms_norm_eps, _a: 0.0, _b: 0.0, _c: 0.0 }),
         )?;
 
+        let t_embed = std::time::Instant::now();
         let embed = weights::get_matrix(&w, &format!("{prefix}.embed_tokens.weight"))?;
+        crate::load_trace::note("decoder: embed narrow", t_embed);
         if embed.rows != vocab || embed.cols != hs {
             bail!(
                 "embed_tokens is [{}x{}], expected [{vocab}x{hs}]",
@@ -601,6 +604,7 @@ impl WgpuTextDecoder {
             );
         }
         let embed_table = upload_weight(&mut up, "embed_tokens", &embed)?;
+        crate::load_trace::note("decoder: embed upload", t_embed);
         let norm_buf = upload_vec(
             &mut up,
             "final_norm_w",
@@ -668,23 +672,32 @@ impl WgpuTextDecoder {
         let mut layers = Vec::with_capacity(nl);
         let mut t_conv = std::time::Duration::ZERO;
         let mut t_up = std::time::Duration::ZERO;
+        // Conversions run one layer ahead on another thread, so the narrowing of
+        // layer i+1 happens while layer i crosses the bus — the two are the only
+        // things this load does, and only one of them is on the critical path.
+        // The channel bounds the lookahead to a couple of layers' host memory.
+        std::thread::scope(|scope| -> Result<()> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<LayerWeights>>(PREFETCH_LAYERS);
+        scope.spawn(move || {
+            for i in 0..nl {
+                let p = format!("{prefix}.layers.{i}");
+                if tx.send(convert_layer(&w, &p)).is_err() {
+                    break; // consumer went away
+                }
+            }
+        });
         for i in 0..nl {
-            let p = format!("{prefix}.layers.{i}");
             let t = std::time::Instant::now();
-            let qkv_w = fused_qkv(&w, &format!("{p}.self_attn"))?;
-            let o_w = weights::get_matrix(&w, &format!("{p}.self_attn.o_proj.weight"))?;
-            let gu_w = fused_gate_up(&w, &format!("{p}.mlp"))?;
-            let dp_w = weights::get_matrix(&w, &format!("{p}.mlp.down_proj.weight"))?;
-            let iln_v = weights::get_vector(&w, &format!("{p}.input_layernorm.weight"))?;
-            let pln_v = weights::get_vector(&w, &format!("{p}.post_attention_layernorm.weight"))?;
-            let qn_v = weights::get_vector(&w, &format!("{p}.self_attn.q_norm.weight"))?;
-            let kn_v = weights::get_vector(&w, &format!("{p}.self_attn.k_norm.weight"))?;
+            let lw = rx
+                .recv()
+                .map_err(|_| anyhow!("weight conversion thread died at layer {i}"))??;
             t_conv += t.elapsed();
+            let LayerWeights { qkv: qkv_p, o: o_w, gu: gu_p, dp: dp_w, iln: iln_v, pln: pln_v, qn: qn_v, kn: kn_v } = lw;
 
             let t = std::time::Instant::now();
-            let qkv = upload_weight(&mut up, "qkv_w", &qkv_w)?;
+            let qkv = up.upload_pieces("qkv_w", &qkv_p)?;
             let o = upload_weight(&mut up, "o_w", &o_w)?;
-            let gu = upload_weight(&mut up, "gu_w", &gu_w)?;
+            let gu = up.upload_pieces("gu_w", &gu_p)?;
             let dp = upload_weight(&mut up, "dp_w", &dp_w)?;
             let iln = upload_vec(&mut up, "iln_w", &iln_v)?;
             let pln = upload_vec(&mut up, "pln_w", &pln_v)?;
@@ -743,7 +756,10 @@ impl WgpuTextDecoder {
                 bg_gqa_merge,
             });
         }
+        Ok(())
+        })?;
 
+        let t_tail = std::time::Instant::now();
         let bg_final_rms = rms_bg(&scratch.h, &norm_buf, &scratch.final_norm);
         let bg_gemv_lm = gemv_bg(&pipes.gemv_lm, &embed_table, &scratch.final_norm, &scratch.logits);
         let bg_gemv_lm_norm = gemv_norm_bg(&pipes.gemv_lm_norm, &embed_table, &scratch.h, &scratch.logits, &norm_buf);
@@ -777,6 +793,7 @@ impl WgpuTextDecoder {
         });
 
         up.finish()?;
+        crate::load_trace::note("decoder: tail (bind groups + drain)", t_tail);
         crate::load_trace::note_dur("decoder: host convert", t_conv);
         crate::load_trace::note_dur("decoder: gpu upload", t_up);
         crate::load_trace::note("decoder: weights + upload", t_weights);
@@ -1304,19 +1321,89 @@ fn upload_vec(up: &mut BulkUpload, label: &str, v: &[half::f16]) -> Result<wgpu:
     Ok(b)
 }
 
-fn fused_qkv(w: &HashMap<String, weights::RawTensor>, prefix: &str) -> Result<PackedWeight> {
-    let q = weights::get_matrix(w, &format!("{prefix}.q_proj.weight"))?;
-    let k = weights::get_matrix(w, &format!("{prefix}.k_proj.weight"))?;
-    let v = weights::get_matrix(w, &format!("{prefix}.v_proj.weight"))?;
-    let cols = q.cols;
-    PackedWeight::concat_rows(&[q, k, v], cols)
+/// Fuse `parts` into one row-major `[part0 | part1 | ...]` matrix, as
+/// `(offset, bytes)` pieces ready for a single destination buffer.
+///
+/// The concatenation used to be a `PackedWeight` of its own: a full copy of
+/// every fused matrix (890 MiB of the 0.6 B decoder) made purely so the upload
+/// could see one slice.  The kernels only need the parts to be *contiguous*, so
+/// an f16 checkpoint contributes its own mapped bytes at their offsets (no copy
+/// at all), and a bf16/f32 one is narrowed straight into the fused layout —
+/// without the per-part buffers the piecewise version needed.
+fn fused_pieces(
+    w: &HashMap<String, weights::RawTensor>,
+    prefix: &str,
+    parts: &[&str],
+) -> Result<Vec<(u64, bytes::Bytes)>> {
+    let tensors: Vec<&weights::RawTensor> = parts
+        .iter()
+        .map(|p| {
+            let name = format!("{prefix}.{p}.weight");
+            w.get(&name).ok_or_else(|| anyhow!("weight not found: {name}"))
+        })
+        .collect::<Result<_>>()?;
+
+    if tensors.iter().all(|t| t.dtype == Dtype::F16) {
+        let mut pieces = Vec::with_capacity(tensors.len());
+        let mut off = 0u64;
+        for t in &tensors {
+            pieces.push((off, t.data.clone()));
+            off += t.data.len() as u64;
+        }
+        return Ok(pieces);
+    }
+
+    let mut out = Vec::with_capacity(total_bytes(&tensors)?);
+    for t in &tensors {
+        let start = out.len();
+        out.resize(start + t.data.len() / t.dtype.size() * 2, 0);
+        t.narrow_f16_into(&mut out[start..])?;
+    }
+    Ok(vec![(0, out.into())])
 }
 
-fn fused_gate_up(w: &HashMap<String, weights::RawTensor>, prefix: &str) -> Result<PackedWeight> {
-    let g = weights::get_matrix(w, &format!("{prefix}.gate_proj.weight"))?;
-    let u = weights::get_matrix(w, &format!("{prefix}.up_proj.weight"))?;
-    let cols = g.cols;
-    PackedWeight::concat_rows(&[g, u], cols)
+/// How many layers of converted weights the prefetch thread may run ahead with.
+///
+/// Two layers is ~34 MiB at 0.6 B (~90 MiB at 1.7 B): enough that the narrowing
+/// of the next layer always overlaps the transfer of the current one, and small
+/// enough not to be a memory decision.
+const PREFETCH_LAYERS: usize = 2;
+
+/// One decoder layer's weights, converted and ready to be staged.
+struct LayerWeights {
+    qkv: Vec<(u64, bytes::Bytes)>,
+    o: PackedWeight,
+    gu: Vec<(u64, bytes::Bytes)>,
+    dp: PackedWeight,
+    iln: Vec<half::f16>,
+    pln: Vec<half::f16>,
+    qn: Vec<half::f16>,
+    kn: Vec<half::f16>,
+}
+
+/// Read one layer's tensors out of the checkpoint in upload-ready form.
+fn convert_layer(w: &HashMap<String, weights::RawTensor>, p: &str) -> Result<LayerWeights> {
+    Ok(LayerWeights {
+        o: weights::get_matrix(w, &format!("{p}.self_attn.o_proj.weight"))?,
+        dp: weights::get_matrix(w, &format!("{p}.mlp.down_proj.weight"))?,
+        qkv: fused_pieces(w, &format!("{p}.self_attn"), &["q_proj", "k_proj", "v_proj"])?,
+        gu: fused_pieces(w, &format!("{p}.mlp"), &["gate_proj", "up_proj"])?,
+        iln: weights::get_vector(w, &format!("{p}.input_layernorm.weight"))?,
+        pln: weights::get_vector(w, &format!("{p}.post_attention_layernorm.weight"))?,
+        qn: weights::get_vector(w, &format!("{p}.self_attn.q_norm.weight"))?,
+        kn: weights::get_vector(w, &format!("{p}.self_attn.k_norm.weight"))?,
+    })
+}
+
+fn total_bytes(tensors: &[&weights::RawTensor]) -> Result<usize> {
+    let mut total = 0usize;
+    for t in tensors {
+        if t.shape.len() != 2 {
+            return Err(anyhow!("expected 2D weight, got {:?}", t.shape));
+        }
+        total += t.shape[0] * t.shape[1] * 2;
+    }
+    Ok(total)
 }
 
 impl WgpuTextDecoder {

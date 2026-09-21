@@ -44,6 +44,34 @@ impl RawTensor {
         })
     }
 
+    /// Narrow this tensor's elements to little-endian f16 into `dst`.
+    ///
+    /// The destination form exists so a *fused* matrix (`q|k|v`, `gate|up`) can
+    /// be narrowed straight into its final row-major layout: one pass, no
+    /// intermediate `Vec<f16>`, and no concatenation copy afterwards.
+    pub fn narrow_f16_into(&self, dst: &mut [u8]) -> Result<()> {
+        let n = self.data.len() / self.dtype.size();
+        anyhow::ensure!(
+            dst.len() == n * 2,
+            "dst is {} bytes for {n} elements, needs {}",
+            dst.len(),
+            n * 2
+        );
+        match self.dtype {
+            // safetensors f16 is already little-endian, which is what the
+            // kernels read, so this is the file's own bytes.
+            Dtype::F16 => dst.copy_from_slice(&self.data),
+            Dtype::BF16 => narrow_into(&self.data, dst, 2, |c| {
+                f16::from_f32(f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            }),
+            Dtype::F32 => narrow_into(&self.data, dst, 4, |c| {
+                f16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            }),
+            other => return Err(anyhow!("unsupported dtype {other:?} for a weight matrix")),
+        }
+        Ok(())
+    }
+
     pub fn to_f32_vec(&self) -> Result<Vec<f32>> {
         Ok(match self.dtype {
             Dtype::F32 => self
@@ -235,15 +263,11 @@ impl PackedWeight {
         );
         let data: Bytes = match t.dtype {
             Dtype::F16 => t.data.clone(),
-            Dtype::BF16 => narrow(&t.data, n, 2, |c| {
-                f16::from_f32(f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
-            })
-            .into(),
-            Dtype::F32 => narrow(&t.data, n, 4, |c| {
-                f16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            })
-            .into(),
-            other => return Err(anyhow!("unsupported dtype {other:?} for a weight matrix")),
+            _ => {
+                let mut out = vec![0u8; n * 2];
+                t.narrow_f16_into(&mut out)?;
+                out.into()
+            }
         };
         Ok(Self { data, rows, cols })
     }
@@ -276,29 +300,28 @@ pub fn get_f16(
     Ok((t.to_f16_vec()?, t.shape.clone()))
 }
 
-/// Narrow `n` little-endian elements of `elem_bytes` each to f16, in parallel.
+/// Narrow `src` (little-endian `elem_bytes`-wide elements) to f16 in `dst`, in
+/// parallel.
 ///
 /// One pass over each of the source and destination, and the chunking is what
 /// makes a 780 M-element narrowing a load-time rounding error instead of the
 /// dominant cost.
-fn narrow(
+fn narrow_into(
     src: &[u8],
-    n: usize,
+    dst: &mut [u8],
     elem_bytes: usize,
     to_f16: impl Fn(&[u8]) -> half::f16 + Sync,
-) -> Vec<u8> {
+) {
     const CHUNK: usize = 1 << 16;
-    let mut out = vec![0u8; n * 2];
-    out.par_chunks_mut(CHUNK * 2)
+    dst.par_chunks_mut(CHUNK * 2)
         .enumerate()
-        .for_each(|(ci, dst)| {
+        .for_each(|(ci, chunk)| {
             let base = ci * CHUNK;
-            for (k, slot) in dst.chunks_exact_mut(2).enumerate() {
+            for (k, slot) in chunk.chunks_exact_mut(2).enumerate() {
                 let off = (base + k) * elem_bytes;
                 slot.copy_from_slice(&to_f16(&src[off..off + elem_bytes]).to_bits().to_le_bytes());
             }
         });
-    out
 }
 
 pub fn get_matrix(w: &HashMap<String, RawTensor>, name: &str) -> Result<PackedWeight> {

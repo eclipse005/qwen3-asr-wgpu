@@ -536,9 +536,15 @@ impl Inner {
         let t = Instant::now();
         let config = AsrConfig::from_file(&model_dir.join("config.json"))
             .with_context(|| format!("config {}", model_dir.display()))?;
-        let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
-            .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
-        crate::load_trace::note("config + tokenizer", t);
+        // The tokenizer is a ~250 ms single-threaded JSON parse that has nothing
+        // to do with the device, so it parses on its own thread and is joined at
+        // the end — by then it is always ready, and it is off the load's
+        // critical path instead of being 8% of it.
+        let tok_path = model_dir.join("tokenizer.json");
+        let tok_thread = std::thread::spawn(move || {
+            Tokenizer::from_file(tok_path).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))
+        });
+        crate::load_trace::note("config (+ tokenizer thread)", t);
         let t = Instant::now();
         let tensors = weights::load_tensors(model_dir)?;
         crate::load_trace::note("safetensors (mmap + header)", t);
@@ -630,6 +636,11 @@ impl Inner {
         let sin_f16: Vec<f16> = sin.iter().copied().map(f16::from_f32).collect();
         decoder.set_rope_tables(&cos_f16, &sin_f16);
         crate::load_trace::note("rope tables", t);
+        let t = Instant::now();
+        let tokenizer = tok_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("tokenizer thread panicked"))??;
+        crate::load_trace::note("tokenizer join", t);
         Ok(Self {
             config,
             tokenizer,
