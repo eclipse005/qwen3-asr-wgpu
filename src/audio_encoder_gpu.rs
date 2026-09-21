@@ -33,12 +33,18 @@ const ENC_EXTRACT_WG: usize = 256;
 /// its host-side mel packing, and print the conv geometry.
 ///
 /// The phase line in `transcribe` reports the encoder as one number, which hid
-/// the fact that the *conv stem* is 42% of it (0.6B / 90 s_en: conv 221 ms,
-/// transformer 304 ms for 1170 tokens).  Both halves are compute-bound and the
-/// conv is the faster one: it does ~397 GFLOP (level 2 alone is 299 -- its GEMM
-/// has k = 4320) at **1.80 TFLOP/s**, the same as the decoder's prefill, while
-/// the transformer's ~316 GFLOP takes ~302 ms of device time, **1.04 TFLOP/s**.
-/// So the encoder's headroom is not in the conv.
+/// the fact that the *conv stem* is 43% of it (0.6B / 90 s_en, r31: conv 148 ms,
+/// transformer 196 ms of an encoder 344 ms).  Both halves are compute-bound and
+/// the conv is the faster one: its 27 GEMMs (9 rounds x 3 levels) do **432 GFLOP
+/// at 3.66 TFLOP/s** -- the exact price is `QASR_ENC_SKIP=cgemm` removing 118 ms
+/// of the phase's 148, which is also the fastest GEMM rate anywhere in this
+/// project, above the prefill's 2.9-3.5 and above `gemm_bench`'s 3.24 for the
+/// analogous single call, against the card's 6.55 TFLOP/s measured FMA peak.
+/// The transformer's four projections are **1.98-2.91 TFLOP/s** by the same
+/// instrument.  So the encoder's headroom is not in the conv -- which was
+/// concluded here for the right reason ("the conv is the faster one") off two
+/// wrong numbers (1.80 and 1.04 TFLOP/s, from a `DUP` marginal and a ratio of
+/// wall clocks).  The numbers above are the exact ones.
 ///
 /// The trace also breaks the transformer's wall clock into the two blocking
 /// mid-loop `submit`+`poll` calls, compute-pass recording, `create_bind_group`
