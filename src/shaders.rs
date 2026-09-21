@@ -2916,6 +2916,11 @@ fn softmax(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
+    // Element-at-a-time, and deliberately so: the word-at-a-time rewrite that
+    // paid off in the audio layer norm (half the loads and unpacks) measured
+    // *slower* here -- +3 ms on a 243 ms transformer, 3 reps each -- so it was
+    // reverted.  The two passes below are only ~15 ms of the transformer between
+    // them, which is inside this probe's resolution.
     var mx = -3.0e38;
     for (var j: u32 = 0u; j < valid; j = j + 1u) {
         mx = max(mx, half_at(unpack2x16float(Sc[base + j / 2u]), j) * cfg.scale);
