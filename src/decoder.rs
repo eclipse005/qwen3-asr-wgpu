@@ -315,6 +315,10 @@ struct Pipes {
     /// Same phase with the REP q heads that share a kv head done in one pass.
     gqa_split_pair256: wgpu::ComputePipeline,
     gqa_split_pair512: wgpu::ComputePipeline,
+    /// Diagnostic: `gqa_split_pair256` with every K read aimed at row 0, so all
+    /// loads are L1 hits.  Only reachable through `QASR_DUP`, never on the
+    /// default path.
+    gqa_split_pair256_row0: wgpu::ComputePipeline,
     gqa_split256: wgpu::ComputePipeline,
     gqa_split512: wgpu::ComputePipeline,
     gqa_merge: wgpu::ComputePipeline,
@@ -436,7 +440,7 @@ fn slab_path(s: usize) -> bool {
 /// traffic) path so a different checkpoint cannot silently break.
 fn pair_split_src(nqh: usize, nkvh: usize, hd: usize, chunk: usize) -> String {
     if nqh / nkvh == 2 {
-        shaders::gqa_decode_split_p1_pair(hd, chunk, 2)
+        shaders::gqa_decode_split_p1_pair(hd, chunk, 2, false)
     } else {
         shaders::gqa_decode_split_p1(nqh, nkvh, hd, chunk)
     }
@@ -596,6 +600,7 @@ impl WgpuTextDecoder {
             gqa_split128: build("gqa_split128", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 128), "gqa_split_p1", Some(&split_pl))?,
             gqa_split_pair256: build("gqa_split_pair256", &pair_split_src(nqh, nkvh, hd, 256), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
             gqa_split_pair512: build("gqa_split_pair512", &pair_split_src(nqh, nkvh, hd, 512), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
+            gqa_split_pair256_row0: build("gqa_split_pair256_row0", &shaders::gqa_decode_split_p1_pair(hd, 256, 2, true), "gqa_split_p1_pair", Some(&split_pl))?,
             gqa_split256: build("gqa_split256", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 256), "gqa_split_p1", Some(&split_pl))?,
             gqa_split512: build("gqa_split512", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 512), "gqa_split_p1", Some(&split_pl))?,
             gqa_merge: build("gqa_merge", &shaders::gqa_split_merge(hd), "gqa_merge", None)?,
@@ -1184,6 +1189,15 @@ impl WgpuTextDecoder {
         cp.dispatch_workgroups(split_x, n_chunks, 1);
         if dup == "gqa_p1" {
             cp.dispatch_workgroups(split_x, n_chunks, 1);
+        }
+        // Diagnostic: the same dispatch with every K read aimed at row 0, so all
+        // loads are L1 hits.  Read as the QASR_DUP delta against this arm; the
+        // first dispatch is the real one so the output is unaffected.
+        if dup == "gqa_p1_row0" {
+            cp.set_pipeline(&self.pipes.gqa_split_pair256_row0);
+            cp.set_bind_group(0, &l.bg_gqa_split, &[]);
+            cp.dispatch_workgroups(split_x, n_chunks, 1);
+            cp.set_pipeline(split);
         }
         cp.set_pipeline(&self.pipes.gqa_merge);
         cp.set_bind_group(0, &l.bg_gqa_merge, &[]);

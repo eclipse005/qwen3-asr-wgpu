@@ -1032,7 +1032,7 @@ fn gqa(@builtin(workgroup_id) wgid: vec3<u32>,
         let row4 = (kbase + t * D2) >> 2u;
         for (var j4 = 0u; j4 < D4; j4 = j4 + 1u) {{
             let qv = Q4[q4 + j4];
-            let kv = KC4[row4 + j4];
+            let kv = KC4[{krow} + j4];
             let q0 = unpack2x16float(qv.x);
             let k0 = unpack2x16float(kv.x);
             dot = dot + (q0.x * k0.x + q0.y * k0.y);
@@ -1118,6 +1118,7 @@ fn gqa(@builtin(workgroup_id) wgid: vec3<u32>,
         d2 = d / 2,
         d4 = d / 8,
         rep = nqh / nkvh,
+        krow = "row4",
     )
 }
 
@@ -1237,7 +1238,7 @@ fn gqa_split_p1(@builtin(workgroup_id) wgid: vec3<u32>,
         let row4 = (kbase + (t_start + t) * D2) >> 2u;
         for (var j4 = 0u; j4 < D4; j4 = j4 + 1u) {{
             let qv = Q4[q4 + j4];
-            let kv = KC4[row4 + j4];
+            let kv = KC4[{krow} + j4];
             let q0 = unpack2x16float(qv.x);
             let k0 = unpack2x16float(kv.x);
             dot = dot + (q0.x * k0.x + q0.y * k0.y);
@@ -1322,6 +1323,7 @@ fn gqa_split_p1(@builtin(workgroup_id) wgid: vec3<u32>,
         d4 = d / 8,
         t_split = t_split,
         rep = nqh / nkvh,
+        krow = "row4",
     )
 }
 
@@ -1342,11 +1344,17 @@ fn gqa_split_p1(@builtin(workgroup_id) wgid: vec3<u32>,
 /// half sees exactly the same sequence of ops), and the same per-head key and
 /// dim strides.  Only the number of workgroups changes: `nkvh` instead of `nqh`
 /// per chunk, each doing `REP` heads' worth of work.
-pub fn gqa_decode_split_p1_pair(d: usize, chunk: usize, rep: usize) -> String {
+pub fn gqa_decode_split_p1_pair(d: usize, chunk: usize, rep: usize, row0: bool) -> String {
     assert_eq!(d % 2, 0);
     assert_eq!(rep, 2, "paired split handles exactly the 2 q heads of a kv head");
     let t_split = 256 / d;
     assert!(t_split >= 1);
+    // `row0` points every K read at row 0, so the whole workgroup shares one
+    // 256 B line set and every load is an L1 hit.  Same instruction count, same
+    // FMAs, same reduction -- it separates "the strided row pattern costs" from
+    // "the loads cost", the question the paired kernel (+1.0%) and the
+    // accumulator depth (flat) between them could not settle.
+    let krow_expr = if row0 { "0u" } else { "row4" };
     format!(
         "{HALF_AT}
 {EXP_BT}
@@ -1407,7 +1415,7 @@ fn gqa_split_p1_pair(@builtin(workgroup_id) wgid: vec3<u32>,
         var db = 0.0;
         let row4 = (kbase + (t_start + t) * D2) >> 2u;
         for (var j4 = 0u; j4 < D4; j4 = j4 + 1u) {{
-            let kv = KC4[row4 + j4];
+            let kv = KC4[{krow} + j4];
             let k0 = unpack2x16float(kv.x);
             let k1 = unpack2x16float(kv.y);
             let k2 = unpack2x16float(kv.z);
@@ -1526,6 +1534,7 @@ fn gqa_split_p1_pair(@builtin(workgroup_id) wgid: vec3<u32>,
         d2 = d / 2,
         d4 = d / 8,
         t_split = t_split,
+        krow = krow_expr,
     )
 }
 
