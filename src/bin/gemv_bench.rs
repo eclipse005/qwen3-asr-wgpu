@@ -441,31 +441,6 @@ fn main() -> Result<()> {
             Ok(t0.elapsed().as_secs_f64() * 1000.0 / iters as f64)
         };
 
-        let run_grid = |pipe: &wgpu::ComputePipeline, bg: &wgpu::BindGroup, g: u32| -> Result<f64> {
-            for _ in 0..3 {
-                let mut enc = gpu.device.create_command_encoder(&Default::default());
-                let mut cp = enc.begin_compute_pass(&Default::default());
-                cp.set_pipeline(pipe);
-                cp.set_bind_group(0, bg, &[]);
-                cp.dispatch_workgroups(g, 1, 1);
-                drop(cp);
-                gpu.queue.submit([enc.finish()]);
-            }
-            gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
-            let t0 = Instant::now();
-            for _ in 0..iters {
-                let mut enc = gpu.device.create_command_encoder(&Default::default());
-                let mut cp = enc.begin_compute_pass(&Default::default());
-                cp.set_pipeline(pipe);
-                cp.set_bind_group(0, bg, &[]);
-                cp.dispatch_workgroups(g, 1, 1);
-                drop(cp);
-                gpu.queue.submit([enc.finish()]);
-            }
-            gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
-            Ok(t0.elapsed().as_secs_f64() * 1000.0 / iters as f64)
-        };
-
         // Every alternative shares one explicit pipeline layout.  With
         // `None` each pipeline gets its *own* auto layout, and wgpu then
         // rejects a bind group built from another pipeline's layout
@@ -646,15 +621,25 @@ fn main() -> Result<()> {
         // barriers wgpu inserts between them are what the decode chain pays).
         // If per-dispatch time is flat in N, the price is the barrier/dispatch
         // itself and the only lever on the decode step is the dispatch *count*.
-        let chain = |n: u32| -> Result<f64> {
+        //
+        // `chain_of` is the only timing helper in this file whose number is a
+        // *kernel* time.  `run` and `run_grid` submit once per dispatch and their
+        // loop is therefore host-bound at ~30-50 us/submit -- which is why the
+        // `rows_per_wg` sweep below used to read 82-130 GB/s for every shape and
+        // every value, and why "flat everywhere" was a floor, not a finding.
+        let chain_of = |pipe: &wgpu::ComputePipeline,
+                        bg: &wgpu::BindGroup,
+                        g: u32,
+                        n: u32|
+         -> Result<f64> {
             let reps = 5u32;
             for _ in 0..2 {
                 let mut enc = gpu.device.create_command_encoder(&Default::default());
                 let mut cp = enc.begin_compute_pass(&Default::default());
-                cp.set_pipeline(&pipe_p);
-                cp.set_bind_group(0, &bg_p, &[]);
+                cp.set_pipeline(pipe);
+                cp.set_bind_group(0, bg, &[]);
                 for _ in 0..n {
-                    cp.dispatch_workgroups(grid, 1, 1);
+                    cp.dispatch_workgroups(g, 1, 1);
                 }
                 drop(cp);
                 gpu.queue.submit([enc.finish()]);
@@ -664,10 +649,10 @@ fn main() -> Result<()> {
             for _ in 0..reps {
                 let mut enc = gpu.device.create_command_encoder(&Default::default());
                 let mut cp = enc.begin_compute_pass(&Default::default());
-                cp.set_pipeline(&pipe_p);
-                cp.set_bind_group(0, &bg_p, &[]);
+                cp.set_pipeline(pipe);
+                cp.set_bind_group(0, bg, &[]);
                 for _ in 0..n {
-                    cp.dispatch_workgroups(grid, 1, 1);
+                    cp.dispatch_workgroups(g, 1, 1);
                 }
                 drop(cp);
                 gpu.queue.submit([enc.finish()]);
@@ -675,6 +660,7 @@ fn main() -> Result<()> {
             gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
             Ok(t0.elapsed().as_secs_f64() * 1e6 / (reps * n) as f64)
         };
+        let chain = |n: u32| -> Result<f64> { chain_of(&pipe_p, &bg_p, grid, n) };
         print!("  {name:<9} per-dispatch us: 1x {:>6.1}", chain(1)?);
         for n in [8u32, 32] {
             print!("  {n}x {:>6.1}", chain(n)?);
@@ -725,12 +711,17 @@ fn main() -> Result<()> {
         // a pure scheduling knob and the output is bit-identical at every value.
         // It sets how many workgroups the dispatch gets, which is what separates
         // `lm_head` (18 992 wg, 289 GB/s) from `o_proj` (128 wg, 82 GB/s).
+        //
+        // **Timed through `chain_of`, not `run_grid`.**  `run_grid` submits once
+        // per dispatch, and on this stack that costs ~30-50 us of host time per
+        // submit -- so the old version of this sweep measured the submit path and
+        // reported 82-130 GB/s for every shape and every `rpw`, which was read as
+        // "`rows_per_wg` is flat everywhere".  It was flat because it was pinned
+        // to a floor.  The scan below is the GPU's time for 32 chained
+        // dispatches, which is the shape the decode step actually issues.
+        let chain_prod = chain_of(&pipe_p, &bg_p, grid, 32)? / 1e3;
         print!("  {name:<9} rpw:");
         for rpw in [2usize, 4, 8, 16, 32] {
-            if rpw == 8 {
-                print!("  8: {:>6.1} (prod)", bw(ms_p));
-                continue;
-            }
             if rows / rpw > 65535 {
                 // One grid dimension is capped at 65535; `lm_head` needs a 2D
                 // grid for the small row counts, which is not what this sweep is
@@ -750,10 +741,10 @@ fn main() -> Result<()> {
                 ],
             });
             let grid_r = (rows / rpw) as u32;
-            let ms_r = run_grid(&pipe_r, &bg_r, grid_r)?;
-            print!("  {rpw}: {:>6.1}", bw(ms_r));
+            let ms_r = chain_of(&pipe_r, &bg_r, grid_r, 32)? / 1e3;
+            print!("  {rpw}: {:>6.1}{}", bw(ms_r), if rpw == 8 { "*" } else { "" });
         }
-        println!();
+        println!("   (* = production rpw, {:.1} GB/s)", bw(chain_prod));
         println!(
             "{:<11} {:>10.1} {:>14.1} {:>12.1} {:>12.1} {:>12.1} {:>12.1} {:>9.2}",
             name,

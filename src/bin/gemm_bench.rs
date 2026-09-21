@@ -22,7 +22,7 @@ const BK: usize = 16;
 /// `17*tx mod 32` -- all 16 distinct -- while `j` moves in whole blocks.  The
 /// values each thread reads, the order it accumulates them in and the FMA count
 /// are all unchanged, so this is bit-identical by construction.
-fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool, permb: bool) -> String {
+fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: usize, permb: bool, v4: bool) -> String {
     let bm = 16 * tm;
     let bn = 16 * tn;
     let pad = BK + 1;
@@ -30,6 +30,18 @@ fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool, permb: bool) 
     let n_bs = bn * BK / 256;
     assert_eq!(bm * BK % 256, 0);
     assert_eq!(bn * BK % 256, 0);
+    if v4 {
+        assert_eq!(permb, true, "the vec4 B layout *is* the permutation");
+        // The chunk store is written for `tm = tn = 8`: 512 chunks over 256
+        // threads is two per thread, `c0` and `c0 + CSTEP`.  A smaller `tn`
+        // would need its own inverse mapping, not a different constant.
+        assert_eq!(n_as, 8, "v4 assumes two 4-row chunks per thread for A");
+        assert_eq!(n_bs, 8, "v4 assumes two 4-row chunks per thread for B");
+    }
+    // Chunks (16 B = four rows at one k) per k-row, and the stride between a
+    // thread's two chunks: `bm*bk/4` chunks over 256 threads.
+    let (aq, bq) = (bm / 4, bn / 4);
+    let cstep = bm * BK / 4 / 2;
 
     let mut s = String::new();
     s.push_str(
@@ -41,10 +53,15 @@ fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool, permb: bool) 
     );
     s.push_str(&format!(
         "const BM: u32 = {bm}u;\nconst BN: u32 = {bn}u;\nconst BK: u32 = {BK}u;\n\
-         const PAD: u32 = {pad}u;\nconst TM: u32 = {tm}u;\nconst TN: u32 = {tn}u;\n"
+         const PAD: u32 = {pad}u;\nconst TM: u32 = {tm}u;\nconst TN: u32 = {tn}u;\nconst AQ: u32 = {aq}u;\nconst BQ: u32 = {bq}u;\nconst CSTEP: u32 = {cstep}u;\n"
     ));
-    s.push_str(&format!("var<workgroup> As: array<f32, {}>;\n", bm * pad));
-    s.push_str(&format!("var<workgroup> Bs: array<f32, {}>;\n", bn * pad));
+    if v4 {
+        s.push_str(&format!("var<workgroup> A4: array<vec4<f32>, {}>;\n", bm * BK / 4));
+        s.push_str(&format!("var<workgroup> B4: array<vec4<f32>, {}>;\n", bn * BK / 4));
+    } else {
+        s.push_str(&format!("var<workgroup> As: array<f32, {}>;\n", bm * pad));
+        s.push_str(&format!("var<workgroup> Bs: array<f32, {}>;\n", bn * pad));
+    }
     s.push_str(
         "fn halve(w: u32, odd: bool) -> f32 {\n\
          \x20 let p = unpack2x16float(w);\n\
@@ -65,8 +82,95 @@ fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool, permb: bool) 
         }
     }
 
+    // ---- the vec4 (chunk) tile -------------------------------------------
+    //
+    // A chunk is 16 B = four rows at one k, and the tile is k-major:
+    //
+    //   A4[q * AQ + r/4]              rows 4*(r/4) .. +3 at k = q
+    //   B4[q * BQ + pos(g, s)]        rows 8*g + 4*s .. +3 at k = q
+    //
+    // Thread `(tx, ty)` reads its eight A values as two chunks (rows 8*ty..+7)
+    // and its eight B values as two chunks (rows 8*tx..+7).  A's address depends
+    // only on `ty`, so a phase's eight lanes all want the same sixteen bytes --
+    // a broadcast, no permutation needed.  B's sixteen `tx` lanes would stride
+    // eight words and land on two bank groups per phase, which is what `pos`
+    // fixes: it maps the eight `tx` values of a phase onto the eight groups.
+    //
+    // The store side is the inverse.  Thread `(tx, ty)` owns chunks
+    // `c0 = ty*16 + tx` and `c0 + cstep`, i.e. `(k, rg) = (c0/AQ, c0%AQ)` and
+    // `(k+8, rg)`.  Both halves of that pair are the *same four rows at two k*,
+    // so one `odd` flag covers all eight of the thread's global words, and the
+    // store is two whole chunks.  Each of the thread's global reads is one word
+    // (two f16 k values) and the other k of each word is read by the thread that
+    // owns it: the tile's words are read twice, which is free here because this
+    // GEMM is compute-bound by two orders of magnitude on every shape it runs.
+    let v4_setup = || -> String {
+        format!(
+            " let c0 = ty * 16u + tx;\n\
+             \x20 let crg = c0 % {aq}u;\n let ck = c0 / {aq}u;\n\
+             \x20 let cvodd = ((ck & 1u) == 1u);\n\
+             \x20 let c2 = c0 + {cstep}u;\n",
+            aq = aq,
+            cstep = cstep
+        )
+    };
+    // The two global reads of one chunk: four rows at k = `kx + ck + (0|8)`.
+    let v4_read = |kx: &str, reg: usize, half: usize| -> String {
+        let kk = format!("({kx} + ck + {}u)", half * 8);
+        let mut t = String::new();
+        for e in 0..4 {
+            t.push_str(&format!(
+                "   pfa{} = A[(m0 + 4u * crg + {e}u) * kk + {kk} / 2u];\n",
+                reg + e
+            ));
+        }
+        t
+    };
+    // The B row a chunk component holds; shared by the single-buffer and
+    // prefetched store paths so they cannot drift apart.  (`v4_read_b` had
+    // `4u * bog` without the `bos` term and only the double-buffered path was
+    // wrong -- which is the one every variant but the control uses.)
+    let b_row = |e: usize| format!("8u * bog + 4u * bos + {e}u");
+    let v4_read_b = |kx: &str, reg: usize, half: usize| -> String {
+        let kw = format!("({kx} + ck + {}u)", half * 8);
+        let mut t = String::new();
+        for e in 0..4 {
+            t.push_str(&format!(
+                "   pfb{} = W[(n0 + {row}) * kk + {kw} / 2u];\n",
+                reg + e,
+                row = b_row(e)
+            ));
+        }
+        t
+    };
+    // B's chunk position `c2 % BQ = pos` inverts to (g, s) as
+    // `g = ((pos>>4)<<3) | (pos&7)`, `s = (pos>>3)&1`.
+    let bog_decl = format!(
+        "   let bop = c2 % {bq}u;\n\
+         \x20  let bog = ((bop >> 4u) << 3u) | (bop & 7u);\n\
+         \x20  let bos = (bop >> 3u) & 1u;\n",
+        bq = bq
+    );
+
     let load_as = |kx: &str, dst: &str| -> String {
         let mut t = String::new();
+        if v4 {
+            // Two whole chunks: the same four rows at k = ck and k = ck+8.
+            for half in 0..2 {
+                let kw = format!("({kx} + ck + {}u)", half * 8);
+                let mut comps = String::new();
+                for e in 0..4 {
+                    comps.push_str(&format!(
+                        "\x20 halve(A[(m0 + 4u * crg + {e}u) * kk + {kw} / 2u], cvodd),"
+                    ));
+                }
+                t.push_str(&format!(
+                    "  A4[c0{}] = vec4<f32>({comps});\n",
+                    if half == 0 { String::new() } else { " + CSTEP".into() }
+                ));
+            }
+            return t;
+        }
         for e in 0..n_as {
             t.push_str(&format!(
                 "  {dst}[(ty + {}u) * PAD + tx] = halve(A[(m0 + ty + {}u) * kk + ({kx} + tx) / 2u], (tx & 1u) == 1u);\n",
@@ -75,17 +179,40 @@ fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool, permb: bool) 
         }
         t
     };
-    // Row `ty + 16e` of the B tile goes to slot `(ty&7)*16 + (ty>>3) + 2e` when
-    // permuted -- the inverse of the compute read's `16*j + tx`.
+    // Row `ty + 16e` of the B tile goes to slot `16*(v % tn) + v / tn` when
+    // permuted -- the inverse of the compute read's `16*j + tx`.  Written in the
+    // general form (a power of two, so it folds to a mask and a shift), the same
+    // expression `shaders.rs` emits: a tn-hardcoded `(ty & 7)*16 + (ty >> 3)`
+    // silently covered only half the tile at tn = 16 and made that variant fail
+    // its own correctness check.
     let bslot = |e: usize| -> String {
         if permb {
-            format!("((ty & 7u) * 16u + (ty >> 3u) + {}u)", 2 * e)
+            let v = format!("(ty + {}u)", e * 16);
+            format!("(16u * ({v} % {tn}u) + {v} / {tn}u)")
         } else {
             format!("(ty + {}u)", e * 16)
         }
     };
     let load_bs = |kx: &str, dst: &str| -> String {
         let mut t = String::new();
+        if v4 {
+            // The same two chunks, but the rows come from the inverse of `pos`.
+            for half in 0..2 {
+                let kw = format!("({kx} + ck + {}u)", half * 8);
+                let mut comps = String::new();
+                for e in 0..4 {
+                    comps.push_str(&format!(
+                        "\x20 halve(W[(n0 + {row}) * kk + {kw} / 2u], cvodd),",
+                        row = b_row(e)
+                    ));
+                }
+                t.push_str(&format!(
+                    "  B4[c0{}] = vec4<f32>({comps});\n",
+                    if half == 0 { String::new() } else { " + CSTEP".into() }
+                ));
+            }
+            return t;
+        }
         for e in 0..n_bs {
             t.push_str(&format!(
                 "  {dst}[{} * PAD + tx] = halve(W[(n0 + ty + {}u) * kk + ({kx} + tx) / 2u], (tx & 1u) == 1u);\n",
@@ -95,6 +222,9 @@ fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool, permb: bool) 
         t
     };
     let pf_as = |kx: &str| -> String {
+        if v4 {
+            return v4_read(kx, 0, 0) + &v4_read(kx, 4, 1);
+        }
         let mut t = String::new();
         for e in 0..n_as {
             t.push_str(&format!(
@@ -104,6 +234,9 @@ fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool, permb: bool) 
         t
     };
     let pf_bs = |kx: &str| -> String {
+        if v4 {
+            return v4_read_b(kx, 0, 0) + &v4_read_b(kx, 4, 1);
+        }
         let mut t = String::new();
         for e in 0..n_bs {
             t.push_str(&format!(
@@ -124,6 +257,22 @@ fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool, permb: bool) 
     };
     let store_as = || {
         let mut t = String::new();
+        if v4 {
+            for half in 0..2 {
+                let mut comps = String::new();
+                for e in 0..4 {
+                    comps.push_str(&format!(
+                        "\x20 halve(pfa{}, cvodd),",
+                        half * 4 + e
+                    ));
+                }
+                t.push_str(&format!(
+                    "   A4[c0{}] = vec4<f32>({comps});\n",
+                    if half == 0 { String::new() } else { " + CSTEP".into() }
+                ));
+            }
+            return t;
+        }
         for e in 0..n_as {
             t.push_str(&format!(
                 "   As[(ty + {}u) * PAD + tx] = halve(pfa{e}, (tx & 1u) == 1u);\n", e * 16
@@ -133,6 +282,22 @@ fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool, permb: bool) 
     };
     let store_bs = || {
         let mut t = String::new();
+        if v4 {
+            for half in 0..2 {
+                let mut comps = String::new();
+                for e in 0..4 {
+                    comps.push_str(&format!(
+                        "\x20 halve(pfb{}, cvodd),",
+                        half * 4 + e
+                    ));
+                }
+                t.push_str(&format!(
+                    "   B4[c0{}] = vec4<f32>({comps});\n",
+                    if half == 0 { String::new() } else { " + CSTEP".into() }
+                ));
+            }
+            return t;
+        }
         for e in 0..n_bs {
             t.push_str(&format!(
                 "   Bs[{} * PAD + tx] = halve(pfb{e}, (tx & 1u) == 1u);\n", bslot(e)
@@ -142,7 +307,76 @@ fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool, permb: bool) 
     };
     let compute = || {
         let mut t = String::new();
-        if !unroll_q {
+        let step = |t: &mut String, q: &str, tag: &str| {
+            if v4 {
+                // Two chunks per operand: rows ty*8..+7 of A, tx*8..+7 of B.
+                t.push_str(&format!("   let av{tag} = A4[{q}u * AQ + ty * 2u];\n"));
+                t.push_str(&format!("   let aw{tag} = A4[{q}u * AQ + ty * 2u + 1u];\n"));
+                t.push_str(&format!(
+                    "   let bv{tag} = B4[{q}u * BQ + (tx & 7u) + 16u * (tx >> 3u)];\n"
+                ));
+                t.push_str(&format!(
+                    "   let bw{tag} = B4[{q}u * BQ + (tx & 7u) + 8u + 16u * (tx >> 3u)];\n"
+                ));
+                for i in 0..tm {
+                    let a = if i < 4 {
+                        format!("av{tag}[{i}]")
+                    } else {
+                        format!("aw{tag}[{}]", i - 4)
+                    };
+                    for j in 0..tn {
+                        let b = if j < 4 {
+                            format!("bv{tag}[{j}]")
+                        } else {
+                            format!("bw{tag}[{}]", j - 4)
+                        };
+                        t.push_str(&format!("   c{i}{j} = c{i}{j} + {a} * {b};\n"));
+                    }
+                }
+                return;
+            }
+            for i in 0..tm {
+                t.push_str(&format!("   let a{i}_{q} = As[(ty * {tm}u + {i}u) * PAD + {q}];\n"));
+            }
+            for j in 0..tn {
+                let idx = if permb {
+                    format!("(16u * {j}u + tx)")
+                } else {
+                    format!("(tx * {tn}u + {j}u)")
+                };
+                t.push_str(&format!("   let b{j}_{q} = Bs[{idx} * PAD + {q}];\n"));
+            }
+            for i in 0..tm {
+                for j in 0..tn {
+                    t.push_str(&format!("   c{i}{j} = c{i}{j} + a{i}_{q} * b{j}_{q};\n"));
+                }
+            }
+        };
+        if unroll_q == 0 {
+            if v4 {
+                t.push_str("  var q: u32 = 0u;\n  loop {\n   if (q >= BK) { break; }\n");
+                t.push_str("   let av = A4[q * AQ + ty * 2u];\n");
+                t.push_str("   let aw = A4[q * AQ + ty * 2u + 1u];\n");
+                t.push_str("   let bv = B4[q * BQ + (tx & 7u) + 16u * (tx >> 3u)];\n");
+                t.push_str("   let bw = B4[q * BQ + (tx & 7u) + 8u + 16u * (tx >> 3u)];\n");
+                for i in 0..tm {
+                    let a = if i < 4 {
+                        format!("av[{i}]")
+                    } else {
+                        format!("aw[{}]", i - 4)
+                    };
+                    for j in 0..tn {
+                        let b = if j < 4 {
+                            format!("bv[{j}]")
+                        } else {
+                            format!("bw[{}]", j - 4)
+                        };
+                        t.push_str(&format!("   c{i}{j} = c{i}{j} + {a} * {b};\n"));
+                    }
+                }
+                t.push_str("   q = q + 1u;\n  }\n");
+            } else {
+            // The original runtime q-loop: one step per iteration.
             t.push_str("  var q: u32 = 0u;\n  loop {\n   if (q >= BK) { break; }\n");
             for i in 0..tm {
                 t.push_str(&format!("   let a{i} = As[(ty * {tm}u + {i}u) * PAD + q];\n"));
@@ -161,11 +395,52 @@ fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool, permb: bool) 
                 }
             }
             t.push_str("   q = q + 1u;\n  }\n");
-        } else {
+            }
+        } else if unroll_q >= BK {
             for q in 0..BK {
+                if v4 {
+                    step(&mut t, &format!("{q}"), &format!("_{q}"));
+                } else {
+                    step(&mut t, &format!("{q}u"), &format!("_{q}"));
+                }
+            }
+        } else {
+            // Partial: `unroll_q` steps per iteration.
+            t.push_str(&format!(
+                "  var q0: u32 = 0u;\n  loop {{\n   if (q0 >= BK) {{ break; }}\n"
+            ));
+            for u in 0..unroll_q {
+                if v4 {
+                    let q = format!("(q0 + {u}u)");
+                    t.push_str(&format!("   let av{u} = A4[{q} * AQ + ty * 2u];\n"));
+                    t.push_str(&format!("   let aw{u} = A4[{q} * AQ + ty * 2u + 1u];\n"));
+                    t.push_str(&format!(
+                        "   let bv{u} = B4[{q} * BQ + (tx & 7u) + 16u * (tx >> 3u)];\n"
+                    ));
+                    t.push_str(&format!(
+                        "   let bw{u} = B4[{q} * BQ + (tx & 7u) + 8u + 16u * (tx >> 3u)];\n"
+                    ));
+                    for i in 0..tm {
+                        let a = if i < 4 {
+                            format!("av{u}[{i}]")
+                        } else {
+                            format!("aw{u}[{}]", i - 4)
+                        };
+                        for j in 0..tn {
+                            let b = if j < 4 {
+                                format!("bv{u}[{j}]")
+                            } else {
+                                format!("bw{u}[{}]", j - 4)
+                            };
+                            t.push_str(&format!("   c{i}{j} = c{i}{j} + {a} * {b};\n"));
+                        }
+                    }
+                    continue;
+                }
                 for i in 0..tm {
                     t.push_str(&format!(
-                        "   let a{i}_{q} = As[(ty * {tm}u + {i}u) * PAD + {q}u];\n"));
+                        "   let a{i}_{u} = As[(ty * {tm}u + {i}u) * PAD + (q0 + {u}u)];\n"
+                    ));
                 }
                 for j in 0..tn {
                     let idx = if permb {
@@ -174,18 +449,27 @@ fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool, permb: bool) 
                         format!("(tx * {tn}u + {j}u)")
                     };
                     t.push_str(&format!(
-                        "   let b{j}_{q} = Bs[{idx} * PAD + {q}u];\n"));
+                        "   let b{j}_{u} = Bs[{idx} * PAD + (q0 + {u}u)];\n"
+                    ));
                 }
                 for i in 0..tm {
                     for j in 0..tn {
                         t.push_str(&format!(
-                            "   c{i}{j} = c{i}{j} + a{i}_{q} * b{j}_{q};\n"));
+                            "   c{i}{j} = c{i}{j} + a{i}_{u} * b{j}_{u};\n"
+                        ));
                     }
                 }
             }
+            t.push_str(&format!("   q0 = q0 + {unroll_q}u;\n  }}\n"));
         }
         t
     };
+
+    // The chunk index/parity the whole store path is written in terms of.
+    if v4 {
+        s.push_str(&v4_setup());
+        s.push_str(&bog_decl);
+    }
 
     if !double {
         s.push_str(" var k0: u32 = 0u;\n loop {\n  if (k0 >= gd.k) { break; }\n");
@@ -269,8 +553,9 @@ fn setup<'a>(
     tm: usize,
     tn: usize,
     double: bool,
-    unroll_q: bool,
+    unroll_q: usize,
     permb: bool,
+    v4: bool,
     m: usize,
     n: usize,
     k: usize,
@@ -299,7 +584,7 @@ fn setup<'a>(
     up.upload(&dims, &db)?;
     up.finish()?;
 
-    let src = gemm_shader(tm, tn, double, unroll_q, permb);
+    let src = gemm_shader(tm, tn, double, unroll_q, permb, v4);
     let pipe = gpu.pipeline("gemm", &src, "gemm", None)?;
     let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("gemm"),
@@ -399,24 +684,35 @@ impl Bench<'_> {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let adapter = arg(&args, "--adapter");
+    if let Some(spec) = arg(&args, "--dump") {
+        // `--dump TMD,TND,UQ,PB` prints the generated WGSL instead of running.
+        let spec: Vec<&str> = spec.split(',').collect();
+        let tm: usize = spec[0].parse()?;
+        let tn: usize = spec[1].parse()?;
+        let uq: usize = spec[2].parse()?;
+        let pb: bool = spec[3] == "1";
+        let v4: bool = spec[4] == "1";
+        print!("{}", gemm_shader(tm, tn, true, uq, pb, v4));
+        return Ok(());
+    }
     let gpu = pollster::block_on(Gpu::new(adapter.as_deref()))?;
     println!("adapter: {}", gpu.describe());
 
-    let variants: [(usize, usize, bool, bool, bool); 8] = [
-        (8, 8, false, false, false),
-        (8, 8, true, false, false),
-        (8, 8, true, true, false),
-        (8, 8, false, true, false),
-        (8, 4, true, true, false),
-        (4, 4, true, true, false),
-        (8, 8, true, false, true),
-        (8, 8, false, true, true),
+    let variants: [(usize, usize, bool, usize, bool, bool); 8] = [
+        (8, 8, true, 0, true, false),
+        (8, 8, true, 4, true, false),
+        (8, 8, true, 4, false, false),
+        (8, 8, true, 0, true, true),
+        (8, 8, true, 4, true, true),
+        (8, 8, true, 8, true, true),
+        (8, 8, true, 16, true, true),
+        (8, 8, false, 4, true, true),
     ];
 
     println!("-- correctness (m=256, n=256, k=256) --");
     let mut seed = 42u32;
-    for (tm, tn, dbl, uq, pb) in variants {
-        let b = setup(&gpu, tm, tn, dbl, uq, pb, 256, 256, 256, &mut seed)?;
+    for (tm, tn, dbl, uq, pb, v4) in variants {
+        let b = setup(&gpu, tm, tn, dbl, uq, pb, v4, 256, 256, 256, &mut seed)?;
         let mut enc = gpu.device.create_command_encoder(&Default::default());
         b.dispatch_n(&mut enc, 1);
         gpu.queue.submit([enc.finish()]);
@@ -424,11 +720,11 @@ fn main() -> Result<()> {
         let (max_abs, max_rel) = b.verify()?;
         let ok = max_rel < 0.02 && max_abs < 0.2;
         println!(
-            "  {tm}x{tn} dbl={dbl} uq={uq} pb={pb}: max|Δ|={max_abs:.4} max_rel={max_rel:.4} {}",
+            "  {tm}x{tn} dbl={dbl} uq={uq} pb={pb} v4={v4}: max|Δ|={max_abs:.4} max_rel={max_rel:.4} {}",
             if ok { "OK" } else { "FAIL" }
         );
         if !ok {
-            bail!("variant {tm}x{tn} dbl={dbl} uq={uq} pb={pb} failed correctness");
+            bail!("variant {tm}x{tn} dbl={dbl} uq={uq} pb={pb} v4={v4} failed correctness");
         }
     }
 
@@ -437,7 +733,11 @@ fn main() -> Result<()> {
     // engine; the first five are the decoder prefill's, at ~1.9.  Same question
     // as `attn_bench`: is the encoder's rate a property of the shape, or of the
     // engine's dispatch of it?
-    let shapes: [(&str, usize, usize, usize); 9] = [
+    //
+    // `m2304 k1024 n4096` is a multiple of 256 in both m and n, so it is the one
+    // row where a BM/BN = 256 variant is not paying padding for its tile and the
+    // tile *shapes* can be compared without that confound.
+    let shapes: [(&str, usize, usize, usize); 10] = [
         ("gate m384 k1024 n4096", 384, 1024, 4096),
         ("gate m2304 k1024 n4096", 2304, 1024, 4096),
         ("gu   m384 k1024 n6144", 384, 1024, 6144),
@@ -447,28 +747,30 @@ fn main() -> Result<()> {
         ("enc o   m1170 k896 n896", 1170, 896, 896),
         ("enc fc1 m1170 k896 n3584", 1170, 896, 3584),
         ("enc fc2 m1170 k3584 n896", 1170, 3584, 896),
+        ("conv m512 k4320 n480", 512, 4320, 480),
     ];
     let iters = 20u32;
     println!("\n-- sweep, TFLOP/s (1-encoder timing) --");
     print!("{:<26}", "shape");
-    for (tm, tn, dbl, uq, pb) in variants {
+    for (tm, tn, dbl, uq, pb, v4) in variants {
         print!(
             " {:>10}",
             format!(
-                "{tm}x{tn}{}{}{}",
+                "{tm}x{tn}{}{}{}{}",
                 if dbl { "D" } else { "" },
-                if uq { "U" } else { "" },
-                if pb { "P" } else { "" }
+                if uq > 0 { format!("U{uq}") } else { String::new() },
+                if pb { "P" } else { "" },
+                if v4 { "V" } else { "" }
             )
         );
     }
     println!();
     for (name, m, k, n) in shapes {
         print!("{:<26}", name);
-        for (tm, tn, dbl, uq, pb) in variants {
+        for (tm, tn, dbl, uq, pb, v4) in variants {
             let mut s2 = seed.wrapping_add(1);
             seed = s2;
-            let b = setup(&gpu, tm, tn, dbl, uq, pb, m, n, k, &mut s2)?;
+            let b = setup(&gpu, tm, tn, dbl, uq, pb, v4, m, n, k, &mut s2)?;
             let ms = b.time(iters)?;
             let tf = 2.0 * m as f64 * n as f64 * k as f64 / 1e12 / (ms / 1000.0);
             print!(" {:>10.2}", tf);

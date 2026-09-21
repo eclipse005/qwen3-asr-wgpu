@@ -1956,6 +1956,27 @@ pub fn prefill_gemm_bias(transb: bool, beta: bool) -> String {
     prefill_gemm_impl(transb, beta, true, false, false)
 }
 
+/// `QASR_GEMM_V4` -- the prefill/encoder GEMM's shared-memory tile: the default
+/// (`1`) is the k-major 16-byte chunk tile, `0` restores the scalar per-(row, k)
+/// tile with its row permutation.  Generator-side, read once per pipeline, so it
+/// exists to re-run the A/B rather than to be set in production.  See the note in
+/// [`prefill_gemm_impl`] for the measurements.
+fn gemm_v4() -> bool {
+    std::env::var("QASR_GEMM_V4").map(|s| s != "0").unwrap_or(true)
+}
+
+/// `QASR_GEMM_UNROLL` -- the k-unroll factor for the prefill/encoder GEMM.
+/// `1` is the runtime q-loop (everything before `8x8DU*`), `4` is shipped;
+/// anything not dividing `BK` falls back to `1`.  A generator-side switch, read
+/// once per pipeline creation, so it exists to re-run the A/B, not to be set in
+/// production.  See the unrolling note in [`prefill_gemm_impl`].
+fn gemm_unroll() -> usize {
+    std::env::var("QASR_GEMM_UNROLL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4)
+}
+
 fn prefill_gemm_impl(
     transb: bool,
     beta: bool,
@@ -1972,6 +1993,49 @@ fn prefill_gemm_impl(
     let n_as = bm * bk / 256;
     let n_bs = bn * bk / 256;
 
+    // ---- the vec4 (chunk) tile -------------------------------------------
+    //
+    // `gemm_bench`'s `V` column: the tile is stored **k-major in 16-byte
+    // chunks** instead of one f32 per (row, k), so a thread's eight A values
+    // and eight B values each become two `vec4` shared loads instead of eight
+    // scalar ones.  `fma_probe` prices the difference with everything else held
+    // fixed -- 16 scalar loads per 64 FMAs and 4 `vec4` loads per 80, moving the
+    // same two kilobytes per warp per iteration -- at 2.66 against 3.80 TFLOP/s,
+    // and the real GEMM sat at the 2.66 arm before this.  Across `gemm_bench`'s
+    // ten shapes the change is **+26%** (mean 2.31 -> 2.91 TFLOP/s).
+    //
+    // A chunk is four rows at one k.  For A, chunk `q*AQ + r/4` holds rows
+    // `4*(r/4) .. +3` at k = `q`, and a thread wants rows `8*ty .. +7` -- chunks
+    // `q*AQ + 2*ty` and `+1`.  Its address depends only on `ty`, so the eight
+    // lanes of a phase all want the same sixteen bytes: a broadcast.
+    //
+    // For B the same layout would have the sixteen `tx` lanes stride eight
+    // words and land on two bank groups per phase, so the row *groups* are
+    // permuted: chunk `q*BQ + pos(g, s)` holds `8*g + 4*s .. +3` with
+    // `pos(g, s) = (g & 7) + 8*s + 16*(g >> 3)` -- the same job the scalar
+    // form's `16*j + tx` permutation does, for the same reason.
+    //
+    // A `f32` array cannot be read as `vec4`, so the tile is *declared*
+    // `array<vec4<f32>, ..>` and every store writes a whole chunk.  That forces
+    // the load stage to gather four rows at one k per thread, which reads each
+    // global word twice (both k of a word now have their own thread).  These
+    // GEMMs are compute-bound by two orders of magnitude on every shape this
+    // pipeline runs -- `m2304 k1024 n4096` is 1073 FLOP/byte -- so the trade is
+    // free here and would not be for a memory-bound shape.
+    //
+    // Values, accumulation order and FMA count are untouched: bit-identical,
+    // and `gemm_bench` checks that against a CPU matmul on every variant.
+    //
+    // Derived for `TM = TN = 8` (512 chunks over 256 threads is two per thread)
+    // and for a row-major B (`transb = 0`); `transb = 1` reads the other
+    // operand's half-word parity *per row*, which is a different store and is
+    // left on the scalar path.
+    let v4 = gemm_v4() && !transb;
+    let (aq, bq) = (bm / 4, bn / 4);
+    let cstep = bm * bk / 4 / 2;
+    assert_eq!(tm, 8, "the vec4 chunk store is derived for TM = 8");
+    assert_eq!(tn, 8, "the vec4 chunk store is derived for TN = 8");
+    assert_eq!(bk % 16, 0, "the vec4 chunk store assumes 8 k per chunk half");
     let mut s = String::new();
     s.push_str(
         "struct GDims { m: u32, n: u32, k: u32, ldc: u32, bsa: u32, bsb: u32, bsc: u32, beta: u32, row0: u32, lda: u32 };\n\
@@ -1986,6 +2050,7 @@ fn prefill_gemm_impl(
     s.push_str(&format!(
         "const BM: u32 = {bm}u;\nconst BN: u32 = {bn}u;\nconst BK: u32 = {bk}u;\n\
          const PAD: u32 = {pad}u;\nconst TM: u32 = {tm}u;\nconst TN: u32 = {tn}u;\n\
+         const AQ: u32 = {aq}u;\nconst BQ: u32 = {bq}u;\nconst CSTEP: u32 = {cstep}u;\n\
          const TRANSB: u32 = {}u;\nconst BETA: u32 = {}u;\nconst BIAS: u32 = {}u;\n\
          const CAUSAL: u32 = {}u;\nconst CAUSAL_K: u32 = {}u;\n",
         u32::from(transb),
@@ -1994,8 +2059,13 @@ fn prefill_gemm_impl(
         u32::from(causal_skip),
         u32::from(causal_k),
     ));
-    s.push_str(&format!("var<workgroup> As: array<f32, {}>;\n", bm * pad));
-    s.push_str(&format!("var<workgroup> Bs: array<f32, {}>;\n", bn * pad));
+    if v4 {
+        s.push_str(&format!("var<workgroup> A4: array<vec4<f32>, {}>;\n", bm * bk / 4));
+        s.push_str(&format!("var<workgroup> B4: array<vec4<f32>, {}>;\n", bn * bk / 4));
+    } else {
+        s.push_str(&format!("var<workgroup> As: array<f32, {}>;\n", bm * pad));
+        s.push_str(&format!("var<workgroup> Bs: array<f32, {}>;\n", bn * pad));
+    }
     s.push_str(
         "fn halve(w: u32, odd: bool) -> f32 {\n\
          \x20 let p = unpack2x16float(w);\n\
@@ -2015,6 +2085,21 @@ fn prefill_gemm_impl(
          if (CAUSAL == 1u && n0 + gd.row0 > m0 + BM - 1u) { return; }\n\
          let klim = select(gd.k, min(gd.k, max(m0 + BM, gd.row0) - gd.row0), CAUSAL_K == 1u);\n",
     );
+    if v4 {
+        // The chunk index and half-word parity every store path is written in
+        // terms of: thread (tx, ty) owns chunks `c0` and `c0 + CSTEP`, i.e.
+        // `(k, rg) = (c0/AQ, c0%AQ)` and `(k+8, rg)`.  Both are the same four
+        // rows at two `k`, so one parity flag covers all eight global words.
+        // `bop`/`bog`/`bos` invert the B tile's `pos(g, s)` for chunk `c0`.
+        s.push_str(
+            " let c0 = ty * 16u + tx;\n\
+             \x20 let crg = c0 % AQ;\n let ck = c0 / AQ;\n\
+             \x20 let cvodd = ((ck & 1u) == 1u);\n\
+             \x20 let bop = c0 % BQ;\n\
+             \x20 let bog = ((bop >> 4u) << 3u) | (bop & 7u);\n\
+             \x20 let bos = (bop >> 3u) & 1u;\n",
+        );
+    }
 
     for i in 0..tm {
         for j in 0..tn {
@@ -2024,6 +2109,22 @@ fn prefill_gemm_impl(
 
     let load_as = |kx: &str| -> String {
         let mut t = String::new();
+        if v4 {
+            for half in 0..2 {
+                let kw = format!("({kx} + ck + {}u)", half * 8);
+                let mut comps = String::new();
+                for e in 0..4 {
+                    comps.push_str(&format!(
+                        "\x20 halve(A[abase + (m0 + 4u * crg + {e}u) * alda + {kw} / 2u], cvodd),"
+                    ));
+                }
+                t.push_str(&format!(
+                    "  A4[c0{}] = vec4<f32>({comps});\n",
+                    if half == 0 { String::new() } else { " + CSTEP".into() }
+                ));
+            }
+            return t;
+        }
         for e in 0..n_as {
             t.push_str(&format!(
                 "  As[(ty + {}u) * PAD + tx] = halve(A[abase + (m0 + ty + {}u) * alda + ({kx} + tx) / 2u], (tx & 1u) == 1u);\n",
@@ -2062,6 +2163,22 @@ fn prefill_gemm_impl(
     };
     let load_bs = |kx: &str| -> String {
         let mut t = String::new();
+        if v4 {
+            for half in 0..2 {
+                let kw = format!("({kx} + ck + {}u)", half * 8);
+                let mut comps = String::new();
+                for e in 0..4 {
+                    comps.push_str(&format!(
+                        "\x20 halve(W[wb + (gd.row0 + n0 + 8u * bog + 4u * bos + {e}u) * kk + {kw} / 2u], cvodd),"
+                    ));
+                }
+                t.push_str(&format!(
+                    "  B4[c0{}] = vec4<f32>({comps});\n",
+                    if half == 0 { String::new() } else { " + CSTEP".into() }
+                ));
+            }
+            return t;
+        }
         if !transb {
             for e in 0..n_bs {
                 t.push_str(&format!(
@@ -2083,6 +2200,18 @@ fn prefill_gemm_impl(
     };
     let pf_as = |kx: &str| -> String {
         let mut t = String::new();
+        if v4 {
+            for half in 0..2 {
+                let kw = format!("({kx} + ck + {}u)", half * 8);
+                for e in 0..4 {
+                    t.push_str(&format!(
+                        "   pfa{} = A[abase + (m0 + 4u * crg + {e}u) * alda + {kw} / 2u];\n",
+                        half * 4 + e
+                    ));
+                }
+            }
+            return t;
+        }
         for e in 0..n_as {
             t.push_str(&format!(
                 "   pfa{e} = A[abase + (m0 + ty + {}u) * alda + ({kx} + tx) / 2u];\n", e * 16
@@ -2092,6 +2221,18 @@ fn prefill_gemm_impl(
     };
     let pf_bs = |kx: &str| -> String {
         let mut t = String::new();
+        if v4 {
+            for half in 0..2 {
+                let kw = format!("({kx} + ck + {}u)", half * 8);
+                for e in 0..4 {
+                    t.push_str(&format!(
+                        "   pfb{} = W[wb + (gd.row0 + n0 + 8u * bog + 4u * bos + {e}u) * kk + {kw} / 2u];\n",
+                        half * 4 + e
+                    ));
+                }
+            }
+            return t;
+        }
         if !transb {
             for e in 0..n_bs {
                 t.push_str(&format!(
@@ -2119,6 +2260,19 @@ fn prefill_gemm_impl(
     };
     let store_as = || {
         let mut t = String::new();
+        if v4 {
+            for half in 0..2 {
+                let mut comps = String::new();
+                for e in 0..4 {
+                    comps.push_str(&format!("\x20 halve(pfa{}, cvodd),", half * 4 + e));
+                }
+                t.push_str(&format!(
+                    "   A4[c0{}] = vec4<f32>({comps});\n",
+                    if half == 0 { String::new() } else { " + CSTEP".into() }
+                ));
+            }
+            return t;
+        }
         for e in 0..n_as {
             t.push_str(&format!(
                 "   As[(ty + {}u) * PAD + tx] = halve(pfa{e}, (tx & 1u) == 1u);\n", e * 16
@@ -2128,6 +2282,19 @@ fn prefill_gemm_impl(
     };
     let store_bs = || {
         let mut t = String::new();
+        if v4 {
+            for half in 0..2 {
+                let mut comps = String::new();
+                for e in 0..4 {
+                    comps.push_str(&format!("\x20 halve(pfb{}, cvodd),", half * 4 + e));
+                }
+                t.push_str(&format!(
+                    "   B4[c0{}] = vec4<f32>({comps});\n",
+                    if half == 0 { String::new() } else { " + CSTEP".into() }
+                ));
+            }
+            return t;
+        }
         for e in 0..n_bs {
             let sel = if transb {
                 format!("((n0 + ty + {}u) & 1u) == 1u", e * 16)
@@ -2141,23 +2308,113 @@ fn prefill_gemm_impl(
         }
         t
     };
+    // ---- k-step unrolling -------------------------------------------------
+    //
+    // The q-loop was a runtime `loop { if (q >= BK) break; ... q += 1 }`.  Four
+    // steps at a time is worth **5-10% per shape** over the runtime form -- and,
+    // measured separately, so is any other factor: `gemm_bench`'s U2/U4/U8/U16
+    // columns land at 2.29/2.33/2.30/2.36 mean TFLOP/s, i.e. inside each other's
+    // noise.  So the win is not "more unrolling", it is letting the compiler see
+    // past one k-step boundary at all: it can hoist the next step's shared loads
+    // above the current step's FMAs, which a loop that may exit at any iteration
+    // forbids.  Four is the smallest factor that buys it, so four it is.
+    //
+    // It is *only* worth anything together with the B permutation above: the
+    // same unroll on the unpermuted tile measured 1.89 against 2.02
+    // (`8x8DU16` vs `8x8D`), because with four lanes per bank there is nothing
+    // to overlap.  The accumulation order per output is untouched -- each
+    // `c{i}{j}` still takes its k contributions in ascending order -- so this is
+    // bit-identical.
+    let mut unroll_q = gemm_unroll();
+    if unroll_q < 2 {
+        unroll_q = 1;
+    } else if bk % unroll_q != 0 {
+        eprintln!("QASR_GEMM_UNROLL={unroll_q} does not divide BK={bk}; using 1");
+        unroll_q = 1;
+    }
     let compute = || {
         let mut t = String::new();
-        t.push_str("  var q: u32 = 0u;\n  loop {\n   if (q >= BK) { break; }\n");
-        for i in 0..tm {
-            t.push_str(&format!("   let a{i} = As[(ty * {tm}u + {i}u) * PAD + q];\n"));
-        }
-        for j in 0..tn {
+        // The v4 read: two chunks per operand -- rows `8*ty .. +7` of A and
+        // `8*tx .. +7` of B -- with the same values, the same FMA count and the
+        // same ascending-k accumulation order as the scalar form.
+        let v4_read = |t: &mut String, idx: &str, tag: &str| {
+            t.push_str(&format!("   let av{tag} = A4[{idx} * AQ + ty * 2u];\n"));
+            t.push_str(&format!("   let aw{tag} = A4[{idx} * AQ + ty * 2u + 1u];\n"));
             t.push_str(&format!(
-                "   let b{j} = Bs[(16u * {j}u + tx) * PAD + q];\n"
+                "   let bv{tag} = B4[{idx} * BQ + (tx & 7u) + 16u * (tx >> 3u)];\n"
             ));
+            t.push_str(&format!(
+                "   let bw{tag} = B4[{idx} * BQ + (tx & 7u) + 8u + 16u * (tx >> 3u)];\n"
+            ));
+        };
+        let v4_fma = |t: &mut String, tag: &str| {
+            for i in 0..tm {
+                let a = if i < 4 {
+                    format!("av{tag}[{i}]")
+                } else {
+                    format!("aw{tag}[{}]", i - 4)
+                };
+                for j in 0..tn {
+                    let b = if j < 4 {
+                        format!("bv{tag}[{j}]")
+                    } else {
+                        format!("bw{tag}[{}]", j - 4)
+                    };
+                    t.push_str(&format!("   c{i}{j} = c{i}{j} + {a} * {b};\n"));
+                }
+            }
+        };
+        if unroll_q == 1 {
+            t.push_str("  var q: u32 = 0u;\n  loop {\n   if (q >= BK) { break; }\n");
+            if v4 {
+                v4_read(&mut t, "q", "");
+                v4_fma(&mut t, "");
+            } else {
+                for i in 0..tm {
+                    t.push_str(&format!(
+                        "   let a{i} = As[(ty * {tm}u + {i}u) * PAD + q];\n"
+                    ));
+                }
+                for j in 0..tn {
+                    t.push_str(&format!(
+                        "   let b{j} = Bs[(16u * {j}u + tx) * PAD + q];\n"
+                    ));
+                }
+                for i in 0..tm {
+                    for j in 0..tn {
+                        t.push_str(&format!("   c{i}{j} = c{i}{j} + a{i} * b{j};\n"));
+                    }
+                }
+            }
+            t.push_str("   q = q + 1u;\n  }\n");
+            return t;
         }
-        for i in 0..tm {
+        t.push_str("  var q0: u32 = 0u;\n  loop {\n   if (q0 >= BK) { break; }\n");
+        for u in 0..unroll_q {
+            if v4 {
+                v4_read(&mut t, &format!("(q0 + {u}u)"), &format!("_{u}"));
+                v4_fma(&mut t, &format!("_{u}"));
+                continue;
+            }
+            for i in 0..tm {
+                t.push_str(&format!(
+                    "   let a{i}_{u} = As[(ty * {tm}u + {i}u) * PAD + (q0 + {u}u)];\n"
+                ));
+            }
             for j in 0..tn {
-                t.push_str(&format!("   c{i}{j} = c{i}{j} + a{i} * b{j};\n"));
+                t.push_str(&format!(
+                    "   let b{j}_{u} = Bs[(16u * {j}u + tx) * PAD + (q0 + {u}u)];\n"
+                ));
+            }
+            for i in 0..tm {
+                for j in 0..tn {
+                    t.push_str(&format!(
+                        "   c{i}{j} = c{i}{j} + a{i}_{u} * b{j}_{u};\n"
+                    ));
+                }
             }
         }
-        t.push_str("   q = q + 1u;\n  }\n");
+        t.push_str(&format!("   q0 = q0 + {unroll_q}u;\n  }}\n"));
         t
     };
 
