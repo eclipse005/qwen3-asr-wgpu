@@ -2,6 +2,11 @@ use anyhow::Result;
 use rustfft::{num_complex::Complex, FftPlanner};
 
 pub(crate) const MEL_SAMPLE_RATE: u32 = 16000;
+
+/// Input samples handed to `soxr_process` per call.  Large enough that the
+/// per-call overhead is irrelevant, small enough that soxr's DFT stage working
+/// set stays in cache -- see `resample_soxr` for what an unbounded call costs.
+const SOXR_BLOCK: usize = 16384;
 pub(crate) const N_FFT: usize = 400;
 pub(crate) const HOP_LENGTH: usize = 160;
 
@@ -334,38 +339,65 @@ pub fn load_audio_wav(
 }
 
 fn load_audio_wav_impl(path: &std::path::Path, target_sr: u32) -> anyhow::Result<Vec<f32>> {
+    // The frontend is inside the RTFx clock, so it gets its own attribution when
+    // `QASR_FRONTEND_TRACE=1`: reading, mixing and resampling are three different
+    // problems and only one of them is a policy decision (see `resample_soxr`).
+    let trace = || std::env::var("QASR_FRONTEND_TRACE").is_ok_and(|v| v != "0");
+    let t_all = std::time::Instant::now();
     let reader = hound::WavReader::open(path)?;
     let spec = reader.spec();
     let sr = spec.sample_rate;
     let channels = spec.channels as usize;
     let max_val = (1i64 << (spec.bits_per_sample - 1)) as f32;
+    let t_open = t_all.elapsed();
 
     let mut truncated = false;
     let mut samples_f32: Vec<f32> = Vec::new();
-    match spec.sample_format {
-        hound::SampleFormat::Float => {
-            for s in reader.into_samples::<f32>() {
-                match s {
-                    Ok(v) => samples_f32.push(v),
-                    Err(_) => {
-                        truncated = true;
-                        break;
+    if spec.sample_format == hound::SampleFormat::Int && spec.bits_per_sample == 16 {
+        // 16-bit PCM is what the fixtures and virtually every ASR corpus are, and
+        // hound's per-sample iterator costs ~13 ns/sample on the 176 s fixture --
+        // more than the resampler now does.  The block is read in one syscall
+        // batch and widened with the same arithmetic (`i16 as f32 / max_val`),
+        // which is the whole of what the iterator does per sample.
+        use std::io::Read;
+        let want = reader.len() as usize;
+        let mut inner = reader.into_inner();
+        let mut bytes: Vec<u8> = Vec::with_capacity(want * 2);
+        (&mut inner).take((want * 2) as u64).read_to_end(&mut bytes)?;
+        truncated = bytes.len() < want * 2;
+        samples_f32.reserve(bytes.len() / 2);
+        samples_f32.extend(
+            bytes
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / max_val),
+        );
+    } else {
+        match spec.sample_format {
+            hound::SampleFormat::Float => {
+                for s in reader.into_samples::<f32>() {
+                    match s {
+                        Ok(v) => samples_f32.push(v),
+                        Err(_) => {
+                            truncated = true;
+                            break;
+                        }
                     }
                 }
             }
-        }
-        hound::SampleFormat::Int => {
-            for s in reader.into_samples::<i32>() {
-                match s {
-                    Ok(v) => samples_f32.push(v as f32 / max_val),
-                    Err(_) => {
-                        truncated = true;
-                        break;
+            hound::SampleFormat::Int => {
+                for s in reader.into_samples::<i32>() {
+                    match s {
+                        Ok(v) => samples_f32.push(v as f32 / max_val),
+                        Err(_) => {
+                            truncated = true;
+                            break;
+                        }
                     }
                 }
             }
         }
     }
+    let t_read = t_all.elapsed();
     anyhow::ensure!(!samples_f32.is_empty(), "WAV read error: no samples in {}", path.display());
     if truncated {
         eprintln!(
@@ -383,11 +415,34 @@ fn load_audio_wav_impl(path: &std::path::Path, target_sr: u32) -> anyhow::Result
             .map(|chunk| chunk.iter().sum::<f32>() / channels as f32)
             .collect()
     };
+    let t_mono = t_all.elapsed();
 
     if sr == target_sr {
+        if trace() {
+            eprintln!(
+                "[frontend] {} {sr} Hz x{channels} -> no resample: open {:.1} ms / read {:.1} ms / mono {:.1} ms",
+                path.display(),
+                t_open.as_secs_f64() * 1e3,
+                (t_read - t_open).as_secs_f64() * 1e3,
+                (t_mono - t_read).as_secs_f64() * 1e3,
+            );
+        }
         return Ok(mono);
     }
-    resample_soxr(&mono, sr, target_sr)
+    let out = resample_soxr(&mono, sr, target_sr)?;
+    if trace() {
+        eprintln!(
+            "[frontend] {} {sr} Hz x{channels} -> {target_sr}: open {:.1} ms / read {:.1} ms / mono {:.1} ms / soxr {:.1} ms ({} -> {} samples)",
+            path.display(),
+            t_open.as_secs_f64() * 1e3,
+            (t_read - t_open).as_secs_f64() * 1e3,
+            (t_mono - t_read).as_secs_f64() * 1e3,
+            (t_all.elapsed() - t_mono).as_secs_f64() * 1e3,
+            mono.len(),
+            out.len(),
+        );
+    }
+    Ok(out)
 }
 
 fn resample_soxr(mono: &[f32], sr: u32, target_sr: u32) -> anyhow::Result<Vec<f32>> {
@@ -469,7 +524,21 @@ fn resample_soxr(mono: &[f32], sr: u32, target_sr: u32) -> anyhow::Result<Vec<f3
     soxr_err(err)?;
     anyhow::ensure!(!soxr.is_null(), "soxr_create returned null");
 
-    let mut out = vec![0.0f32; expected + 8192];
+    // soxr's `soxr_i_for_o` turns the requested *output* length back into an
+    // input length, so handing it `expected + 8192` ask-for-everything makes it
+    // absorb the whole clip into its stage fifos before producing anything: the
+    // DFT stage's working set then blows out of cache and the same arithmetic
+    // runs ~80x slower (measured 1598 ms vs 19 ms on the 176 s fixture, and
+    // `soxr_process` is a streaming API, so the split is not supposed to -- and
+    // does not -- change the bytes).  Feeding it bounded blocks keeps the stage
+    // working set resident.  Verified byte-identical against the one-shot path on
+    // all three resampled fixtures (`--dump` wave16k.f32, MD5).
+    let block = std::env::var("QASR_SOXR_BLOCK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(SOXR_BLOCK);
+    let mut out = vec![0.0f32; expected + 8192 + block.min(1 << 20)];
     let mut in_off = 0usize;
     let mut written = 0usize;
     let result = (|| -> anyhow::Result<Vec<f32>> {
@@ -478,11 +547,12 @@ fn resample_soxr(mono: &[f32], sr: u32, target_sr: u32) -> anyhow::Result<Vec<f3
             let mut odone = 0usize;
             let remain_out = out.len() - written;
             anyhow::ensure!(remain_out > 0, "soxr output overflow");
+            let want_in = (mono.len() - in_off).min(block);
             let err = unsafe {
                 soxr_process(
                     soxr,
                     mono[in_off..].as_ptr().cast(),
-                    mono.len() - in_off,
+                    want_in,
                     &mut idone,
                     out[written..].as_mut_ptr().cast(),
                     remain_out,
