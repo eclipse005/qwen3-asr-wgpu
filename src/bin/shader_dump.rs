@@ -40,6 +40,9 @@ fn main() -> anyhow::Result<()> {
         "gqa_merge" => shaders::gqa_split_merge(num(2)?),
         "extract" => shaders::qkv_extract(num(2)?, num(3)?, num(4)?),
         "gemv" => shaders::gemv(num(2)?, num(3)?, num(4)? != 0, sg(), num(5)?),
+        "gemv_rpwr" => {
+            shaders::gemv_rpwr(num(2)?, num(3)?, num(4)? != 0, sg(), num(5)?, num(6)?)
+        }
         "repeat_kv" => shaders::repeat_kv(num(2)?),
         "list" => {
             println!(

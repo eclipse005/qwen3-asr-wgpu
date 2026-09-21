@@ -56,6 +56,46 @@ pub fn gemv_rpw() -> usize {
     })
 }
 
+/// Warps this part holds at once: 15 SMs x 64.  Not queryable -- `wgpu::Limits`
+/// has no SM count -- so it is a documented constant, like the tile shapes.
+const WARP_SLOTS: usize = 960;
+
+/// Rows per *warp* for `o_proj` and `down_proj`, which are the two shapes
+/// `rows_per_warp` is worth anything on.
+///
+/// The dispatch needs `rows / rpwr` warps and the machine holds `WARP_SLOTS`, so
+/// the question is only whether the shape crosses one wave.  `gemv_bench` prices
+/// both sides of that line: at 1024 rows, **two rows per warp is +5.7% for
+/// `o_proj` and +6.1% for `down_proj`** (512 warps, one wave, instead of 1024
+/// warps that are 1.07 waves with a 64-warp DRAM-starved tail); at 2048 rows
+/// (1.7B) two rows per warp is *worse* -- 1024 warps is still over the line, and
+/// all it does is halve the resident warp count.  The corpus says the same thing
+/// from the other end: r29 shipped `rpwr = 2` unconditionally and the six 0.6B
+/// rows improved (decode -1.4% .. -0.1%) while the six 1.7B rows regressed
+/// (+1.9% .. +4.6%), which is exactly this rule read backwards.
+///
+/// So: use two rows per warp *only when that is what takes the dispatch from two
+/// waves to one*.  `QASR_GEMV_RPWR=1|2` forces a value so the two can be priced
+/// interleaved; unset = the rule.
+fn gemv_rpwr_o_dp(rows: usize) -> usize {
+    static R: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let forced = *R.get_or_init(|| {
+        std::env::var("QASR_GEMV_RPWR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v| matches!(v, 1 | 2))
+            .unwrap_or(0)
+    });
+    if forced != 0 {
+        return forced;
+    }
+    if rows > WARP_SLOTS && rows / 2 <= WARP_SLOTS {
+        2
+    } else {
+        1
+    }
+}
+
 /// Rows per workgroup for the [`shaders::gemv_norm`] pipelines -- fixed at 8.
 ///
 /// Its prologue is `rms_norm`'s own 256-virtual-thread reduction tree, so the
@@ -379,6 +419,12 @@ struct Layer {
     dp_w: wgpu::Buffer,
     bg_gemv_qkv: wgpu::BindGroup,
     bg_gemv_o: wgpu::BindGroup,
+    /// The same buffers as `bg_gemv_o` / `bg_gemv_dp`, bound against the
+    /// `_rpwr2` pipelines: those were built with `None`, so wgpu gave each
+    /// pipeline its own layout object and a bind group made from one is rejected
+    /// by the other ("Exclusive pipelines don't match").
+    bg_gemv_o_rpwr2: wgpu::BindGroup,
+    bg_gemv_dp_rpwr2: wgpu::BindGroup,
     bg_gemv_gu: wgpu::BindGroup,
     bg_gemv_dp: wgpu::BindGroup,
     bg_gemv_qkv_norm: wgpu::BindGroup,
@@ -396,6 +442,9 @@ struct Pipes {
     gemv_o: wgpu::ComputePipeline,
     gemv_gu: wgpu::ComputePipeline,
     gemv_dp: wgpu::ComputePipeline,
+    /// `gemv_o` / `gemv_dp` with two rows per warp; see [`gemv_rpwr_o_dp`].
+    gemv_o_rpwr2: wgpu::ComputePipeline,
+    gemv_dp_rpwr2: wgpu::ComputePipeline,
     gemv_lm: wgpu::ComputePipeline,
     gemv_qkv_norm: wgpu::ComputePipeline,
     gemv_gu_norm: wgpu::ComputePipeline,
@@ -803,8 +852,10 @@ impl WgpuTextDecoder {
         let pipes = Pipes {
             gemv_qkv: build("gemv_qkv", &shaders::gemv(cfg.fused_qkv_cols(), hs, false, subgroup, gemv_rpw()), "gemv", None)?,
             gemv_o: build("gemv_o", &shaders::gemv(hs, q_dim, true, subgroup, gemv_rpw()), "gemv", None)?,
+            gemv_o_rpwr2: build("gemv_o_rpwr2", &shaders::gemv_rpwr(hs, q_dim, true, subgroup, gemv_rpw(), 2), "gemv", None)?,
             gemv_gu: build("gemv_gu", &shaders::gemv(2 * inter, hs, false, subgroup, gemv_rpw()), "gemv", None)?,
             gemv_dp: build("gemv_dp", &shaders::gemv(hs, inter, true, subgroup, gemv_rpw()), "gemv", None)?,
+            gemv_dp_rpwr2: build("gemv_dp_rpwr2", &shaders::gemv_rpwr(hs, inter, true, subgroup, gemv_rpw(), 2), "gemv", None)?,
             gemv_lm: build("gemv_lm", &shaders::gemv(vocab, hs, false, subgroup, gemv_rpw()), "gemv", None)?,
             gemv_qkv_norm: build(
                 "gemv_qkv_norm",
@@ -1043,9 +1094,13 @@ impl WgpuTextDecoder {
             let bg_gemv_qkv = gemv_bg(&pipes.gemv_qkv, &qkv, &scratch.norm1, &scratch.qkv);
             let bg_gemv_qkv_norm = gemv_norm_bg(&pipes.gemv_qkv_norm, &qkv, &scratch.h, &scratch.qkv, &iln);
             let bg_gemv_o = gemv_bg(&pipes.gemv_o, &o, &scratch.attn_out, &scratch.h);
+            let bg_gemv_o_rpwr2 =
+                gemv_bg(&pipes.gemv_o_rpwr2, &o, &scratch.attn_out, &scratch.h);
             let bg_gemv_gu = gemv_bg(&pipes.gemv_gu, &gu, &scratch.norm2, &scratch.gate_up);
             let bg_gemv_gu_norm = gemv_norm_bg(&pipes.gemv_gu_norm, &gu, &scratch.h, &scratch.gate_up, &pln);
             let bg_gemv_dp = gemv_bg(&pipes.gemv_dp, &dp, &scratch.activated, &scratch.h);
+            let bg_gemv_dp_rpwr2 =
+                gemv_bg(&pipes.gemv_dp_rpwr2, &dp, &scratch.activated, &scratch.h);
             let bg_rms1 = rms_bg(&scratch.h, &iln, &scratch.norm1);
             let bg_rms2 = rms_bg(&scratch.h, &pln, &scratch.norm2);
 
@@ -1077,6 +1132,8 @@ impl WgpuTextDecoder {
                 bg_gemv_qkv,
                 bg_gemv_qkv_norm,
                 bg_gemv_o,
+        bg_gemv_o_rpwr2,
+        bg_gemv_dp_rpwr2,
                 bg_gemv_gu,
                 bg_gemv_gu_norm,
                 bg_gemv_dp,
@@ -1334,10 +1391,16 @@ impl WgpuTextDecoder {
             }
             }
 
+            let rpwr = gemv_rpwr_o_dp(cfg.hidden_size);
             if !k("o") {
-                cp.set_pipeline(&self.pipes.gemv_o);
-                cp.set_bind_group(0, &l.bg_gemv_o, &[]);
-                cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
+                if rpwr == 2 {
+                    cp.set_pipeline(&self.pipes.gemv_o_rpwr2);
+                    cp.set_bind_group(0, &l.bg_gemv_o_rpwr2, &[]);
+                } else {
+                    cp.set_pipeline(&self.pipes.gemv_o);
+                    cp.set_bind_group(0, &l.bg_gemv_o, &[]);
+                }
+                cp.dispatch_workgroups(gemv_grid(cfg.hidden_size) / rpwr as u32, 1, 1);
             }
             if d("o") {
                 cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
@@ -1362,9 +1425,14 @@ impl WgpuTextDecoder {
             }
 
             if !k("dp") {
-                cp.set_pipeline(&self.pipes.gemv_dp);
-                cp.set_bind_group(0, &l.bg_gemv_dp, &[]);
-                cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
+                if rpwr == 2 {
+                    cp.set_pipeline(&self.pipes.gemv_dp_rpwr2);
+                    cp.set_bind_group(0, &l.bg_gemv_dp_rpwr2, &[]);
+                } else {
+                    cp.set_pipeline(&self.pipes.gemv_dp);
+                    cp.set_bind_group(0, &l.bg_gemv_dp, &[]);
+                }
+                cp.dispatch_workgroups(gemv_grid(cfg.hidden_size) / rpwr as u32, 1, 1);
             }
             if d("dp") {
                 cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);

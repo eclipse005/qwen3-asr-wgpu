@@ -745,6 +745,33 @@ fn main() -> Result<()> {
             print!("  {rpw}: {:>6.1}{}", bw(ms_r), if rpw == 8 { "*" } else { "" });
         }
         println!("   (* = production rpw, {:.1} GB/s)", bw(chain_prod));
+
+        // Rows *per warp*, at the production workgroup shape.  The warp count per
+        // dispatch is `rows / rows_per_warp` and this part holds 960 of them, so
+        // `o_proj` / `down_proj` (1024 rows) are 1.07 waves at one row per warp
+        // and exactly one wave at two.  Same kernel, same add order, same
+        // butterfly -- only how many rows one warp walks.
+        {
+            let src_w = shaders::gemv_rpwr(rows, cols, false, false, 8, 2);
+            let pipe_w = gpu.pipeline("rpwr2", &src_w, "gemv", None)?;
+            let bg_w = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rpwr2"),
+                layout: &pipe_w.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: w.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: y.as_entire_binding() },
+                ],
+            });
+            let ms_w = chain_of(&pipe_w, &bg_w, (rows / 16) as u32, 32)? / 1e3;
+            println!(
+                "  {name:<9} warps: prod {:>5}  rpwr2 {:>5}   rpwr2 {:>6.1} GB/s  ({:+.1}%)",
+                rows / 8,
+                rows / 16,
+                bw(ms_w),
+                (bw(ms_w) / bw(chain_prod) - 1.0) * 100.0
+            );
+        }
         println!(
             "{:<11} {:>10.1} {:>14.1} {:>12.1} {:>12.1} {:>12.1} {:>12.1} {:>9.2}",
             name,

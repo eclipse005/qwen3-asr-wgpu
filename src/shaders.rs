@@ -208,6 +208,43 @@ fn gemv_merge(@builtin(global_invocation_id) gid: vec3<u32>) {{
 /// `n` must be a multiple of 8 (all model shapes are) so no partial workgroup
 /// exists; `k/8` must be a multiple of 32 so the granule loop divides evenly.
 pub fn gemv(n: usize, k: usize, accum: bool, subgroup: bool, rows_per_wg: usize) -> String {
+    gemv_impl(n, k, accum, subgroup, rows_per_wg, 1)
+}
+
+/// [`gemv`] with `rows_per_warp` rows per warp instead of one.
+///
+/// One warp per row is fixed by the alignment contract -- each lane owns words
+/// `lane, lane+32, ...` of its row and the xor butterfly combines the 32 lanes in
+/// a fixed tree -- but *how many rows a warp walks* is not: a warp that walks each
+/// of its rows in turn produces every row with the same lane mapping, the same
+/// add order and the same butterfly, so this is bit-identical at any value.
+///
+/// Why it is worth a knob: the warp count per dispatch is `rows / rows_per_warp`,
+/// and this part holds 64 warps per SM (960 across 15).  `o_proj` and `down_proj`
+/// are 1024 rows, so at one row per warp they need 1024 warps -- 1.07 waves, and
+/// the leaked 0.07 is a *latency*-bound tail of 64 warps that cannot saturate
+/// DRAM.  Two rows per warp is 512 warps in one wave.  Whether that is what the
+/// 204 GB/s is, or whether it is a fixed per-dispatch ramp, is what
+/// `gemv_bench`'s `rpw2` column answers.
+pub fn gemv_rpwr(
+    n: usize,
+    k: usize,
+    accum: bool,
+    subgroup: bool,
+    rows_per_wg: usize,
+    rows_per_warp: usize,
+) -> String {
+    gemv_impl(n, k, accum, subgroup, rows_per_wg, rows_per_warp)
+}
+
+fn gemv_impl(
+    n: usize,
+    k: usize,
+    accum: bool,
+    subgroup: bool,
+    rows_per_wg: usize,
+    rows_per_warp: usize,
+) -> String {
     assert_eq!(n % 8, 0, "gemv: rows must be a multiple of 8");
     let kg = k / 8;
     assert_eq!(kg % 32, 0, "gemv: k/8 must be a multiple of 32");
@@ -225,6 +262,12 @@ pub fn gemv(n: usize, k: usize, accum: bool, subgroup: bool, rows_per_wg: usize)
         "gemv: rows_per_wg must be 2/4/8/16/32"
     );
     assert_eq!(n % rows_per_wg, 0, "gemv: rows must be a multiple of rows_per_wg");
+    assert!(
+        rows_per_warp.is_power_of_two() && (1..=4).contains(&rows_per_warp),
+        "gemv: rows_per_warp must be 1/2/4"
+    );
+    assert_eq!(n % rows_per_warp, 0, "gemv: rows must be a multiple of rows_per_warp");
+    let rows_per_wg_tot = rows_per_wg * rows_per_warp;
     let threads = rows_per_wg * 32;
     let accum_lit = if accum { 1u32 } else { 0u32 };
     let subgroup_lit = if subgroup { 1u32 } else { 0u32 };
@@ -273,9 +316,10 @@ const ACCUM: u32 = {accum_lit}u;
 const SUBGROUP: u32 = {subgroup_lit}u;
 const THREADS: u32 = {threads}u;
 const RPW: u32 = {rpw}u;
+const RPWR: u32 = {rpwr}u;
 const ROWSW: u32 = {rowsw}u;
 
-{bfly_scratch}var<workgroup> rows_out: array<f32, {rpw}>;
+{bfly_scratch}var<workgroup> rows_out: array<f32, {rowsn}>;
 
 /// 5-round xor butterfly over the 32 lanes of one warp -- the exact tree
 /// `__shfl_xor_sync(acc, [16,8,4,2,1])` produces.
@@ -298,7 +342,12 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {{
     let lane = lid.x & 31u;
     let warp = lid.x >> 5u;
-    let row = wgid.x * RPW + warp;
+    // `RPWR` rows per warp, walked in turn.  Each row keeps its own
+    // accumulators, its own `bfly` and its own slot, so nothing about a row's
+    // arithmetic depends on how many other rows the warp also walked.
+    let rbase = (wgid.x * RPW + warp) * RPWR;
+    for (var rr = 0u; rr < RPWR; rr = rr + 1u) {{
+    let row = rbase + rr;
 
     let wbase = row * KG;
     var a0 = 0.0; var a1 = 0.0; var a2 = 0.0; var a3 = 0.0;
@@ -352,10 +401,11 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
     }}
     let acc = (a0 + a1) + (a2 + a3);
     let r = bfly(acc, lid.x, lane);
-    if (lane == 0u) {{ rows_out[warp] = r; }}
+    if (lane == 0u) {{ rows_out[warp * RPWR + rr] = r; }}
+    }}
     workgroupBarrier();
     if (lid.x == 0u) {{
-        let wordbase = (wgid.x * RPW) >> 1u;
+        let wordbase = (wgid.x * RPW * RPWR) >> 1u;
         for (var w = 0u; w < ROWSW; w = w + 1u) {{
             var va = rows_out[2u * w];
             var vb = rows_out[2u * w + 1u];
@@ -376,7 +426,9 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
         subgroup_body = subgroup_body,
         bfly_scratch = bfly_scratch,
         rpw = rows_per_wg,
-        rowsw = rows_per_wg / 2,
+        rowsw = rows_per_wg_tot / 2,
+        rowsn = rows_per_wg_tot,
+        rpwr = rows_per_warp,
         threads = threads,
     )
 }
