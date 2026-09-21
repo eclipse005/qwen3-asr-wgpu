@@ -2026,16 +2026,24 @@ fn prefill_gemm_impl(
     // Values, accumulation order and FMA count are untouched: bit-identical,
     // and `gemm_bench` checks that against a CPU matmul on every variant.
     //
-    // Derived for `TM = TN = 8` (512 chunks over 256 threads is two per thread)
-    // and for a row-major B (`transb = 0`); `transb = 1` reads the other
-    // operand's half-word parity *per row*, which is a different store and is
-    // left on the scalar path.
-    let v4 = gemm_v4() && !transb;
+    // The other operand of a `transb = 1` GEMM (the attention `A@V`, and the
+    // encoder conv stem's im2col operand) is stored `[k][n]`, so four
+    // consecutive `n` at one k is *two* words whose half-word parity alternates
+    // per row instead of being one flag per thread.  That makes its chunk build a
+    // different expression -- two registers and four `halve`s -- rather than a
+    // different constant, and it reads half the words the row-major path does.
+    //
+    // Derived for `TM = TN = 8` (512 chunks over 256 threads is two per thread).
+    let v4 = gemm_v4();
     let (aq, bq) = (bm / 4, bn / 4);
     let cstep = bm * bk / 4 / 2;
     assert_eq!(tm, 8, "the vec4 chunk store is derived for TM = 8");
     assert_eq!(tn, 8, "the vec4 chunk store is derived for TN = 8");
     assert_eq!(bk % 16, 0, "the vec4 chunk store assumes 8 k per chunk half");
+    assert_eq!(n_as, 8, "the v4 A store assumes two chunks per thread");
+    // Both B layouts move eight rows per thread; the k-major one needs four
+    // words to do it (two per chunk) and the row-major one eight.
+    assert_eq!(n_bs, 8, "the v4 B store assumes two chunks per thread");
     let mut s = String::new();
     s.push_str(
         "struct GDims { m: u32, n: u32, k: u32, ldc: u32, bsa: u32, bsb: u32, bsc: u32, beta: u32, row0: u32, lda: u32 };\n\
@@ -2164,6 +2172,25 @@ fn prefill_gemm_impl(
     let load_bs = |kx: &str| -> String {
         let mut t = String::new();
         if v4 {
+            if transb {
+                // The k-major operand: four consecutive `n` at one k is *two*
+                // words, and their half-word parity alternates per row rather
+                // than being one flag per thread.  So this chunk is built from
+                // two registers with the parity spelled out, and it reads half
+                // the words the row-major path does.
+                for half in 0..2 {
+                    let base = format!(
+                        "wb + (gd.row0 + {kx} + ck{}) * (gd.n / 2u)",
+                        if half == 0 { String::new() } else { " + 8u".into() }
+                    );
+                    t.push_str(&format!(
+                        "  B4[c0{cs}] = vec4<f32>(halve(W[{base} + {wo}], false), halve(W[{base} + {wo}], true), halve(W[{base} + {wo} + 1u], false), halve(W[{base} + {wo} + 1u], true));\n",
+                        cs = if half == 0 { String::new() } else { " + CSTEP".into() },
+                        wo = "(n0 + 8u * bog + 4u * bos) / 2u"
+                    ));
+                }
+                return t;
+            }
             for half in 0..2 {
                 let kw = format!("({kx} + ck + {}u)", half * 8);
                 let mut comps = String::new();
@@ -2222,6 +2249,22 @@ fn prefill_gemm_impl(
     let pf_bs = |kx: &str| -> String {
         let mut t = String::new();
         if v4 {
+            if transb {
+                // Two words per chunk, four registers total.
+                for half in 0..2 {
+                    let base = format!(
+                        "wb + (gd.row0 + {kx} + ck{}) * (gd.n / 2u)",
+                        if half == 0 { String::new() } else { " + 8u".into() }
+                    );
+                    t.push_str(&format!(
+                        "   pfb{} = W[{base} + {wo}];\n   pfb{} = W[{base} + {wo} + 1u];\n",
+                        half * 2,
+                        half * 2 + 1,
+                        wo = "(n0 + 8u * bog + 4u * bos) / 2u"
+                    ));
+                }
+                return t;
+            }
             for half in 0..2 {
                 let kw = format!("({kx} + ck + {}u)", half * 8);
                 for e in 0..4 {
@@ -2283,6 +2326,17 @@ fn prefill_gemm_impl(
     let store_bs = || {
         let mut t = String::new();
         if v4 {
+            if transb {
+                for half in 0..2 {
+                    t.push_str(&format!(
+                        "   B4[c0{cs}] = vec4<f32>(halve(pfb{r}, false), halve(pfb{r}, true), halve(pfb{r2}, false), halve(pfb{r2}, true));\n",
+                        cs = if half == 0 { String::new() } else { " + CSTEP".into() },
+                        r = half * 2,
+                        r2 = half * 2 + 1
+                    ));
+                }
+                return t;
+            }
             for half in 0..2 {
                 let mut comps = String::new();
                 for e in 0..4 {
