@@ -26,12 +26,26 @@ fn main() -> anyhow::Result<()> {
         "gemm_causal" => shaders::prefill_gemm_causal(),
         "gemm_av" => shaders::prefill_gemm_causal_av(),
         "slab_stats" => shaders::slab_stats(num(2)?, num(3)?),
-        "gqa_split" => shaders::gqa_decode_split_p1(14, 2, 64, 256),
-        "gqa_merge" => shaders::gqa_split_merge(64),
+        // The shipped geometry unless told otherwise: Qwen3-ASR is
+        // nqh 16 / nkvh 8 / hd 128 at both sizes.
+        "gqa_split" => shaders::gqa_decode_split_p1(num(2)?, num(3)?, num(4)?, 256),
+        "gqa_pair" => {
+            shaders::gqa_decode_split_p1_pair(num(2)?, 256, 2, false, false, true, false, 1)
+        }
+        "gqa_pair_diag" => {
+            // row0 / coal, the two access-pattern diagnostics
+            shaders::gqa_decode_split_p1_pair(num(2)?, 256, 2, num(3)? == 1, false, false, num(4)? == 1, 1)
+        }
+        "gqa_single" => shaders::gqa_decode_single(num(2)?, num(3)?, num(4)?, num(5)?, 1024),
+        "gqa_merge" => shaders::gqa_split_merge(num(2)?),
+        "extract" => shaders::qkv_extract(num(2)?, num(3)?, num(4)?),
+        "repeat_kv" => shaders::repeat_kv(num(2)?),
         "list" => {
             println!(
                 "softmax <bs>\nsoftmax_tree <bp> <bt>\ngemm\ngemm_causal\ngemm_av\n\
-                 slab_stats <bs> <t>\ngqa_split\ngqa_merge"
+                 slab_stats <bs> <t>\ngqa_split <nqh> <nkvh> <hd>\ngqa_pair <hd>\n\
+                 gqa_pair_diag <hd> <row0> <coal>\ngqa_single <nqh> <nkvh> <hd> <bs>\n\
+                 gqa_merge <hd>\nextract <nqh> <nkvh> <hd>\nrepeat_kv <nrep>"
             );
             return Ok(());
         }
@@ -42,7 +56,24 @@ fn main() -> anyhow::Result<()> {
         // creating the pipeline here surfaces wgpu\'s own parse/validation detail.
         let gpu = pollster::block_on(qwen3_asr_wgpu::gpu::Gpu::new(Some("vulkan")))?;
         println!("adapter: {}", gpu.describe());
-        match gpu.pipeline("probe", &src, "softmax", None) {
+        let entry = if name.starts_with("gqa") {
+            if name == "gqa_merge" {
+                "gqa_merge"
+            } else if name == "gqa_single" {
+                "gqa"
+            } else if name == "gqa_pair" || name == "gqa_pair_diag" {
+                "gqa_split_p1_pair"
+            } else {
+                "gqa_split_p1"
+            }
+        } else if name == "extract" {
+            "qkv_extract"
+        } else if name == "repeat_kv" {
+            "repeat_kv"
+        } else {
+            "softmax"
+        };
+        match gpu.pipeline("probe", &src, entry, None) {
             Ok(_) => println!("pipeline OK"),
             Err(e) => println!("pipeline FAILED: {e}"),
         }

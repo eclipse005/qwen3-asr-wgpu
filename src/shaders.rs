@@ -273,6 +273,7 @@ const ACCUM: u32 = {accum_lit}u;
 const SUBGROUP: u32 = {subgroup_lit}u;
 const THREADS: u32 = {threads}u;
 const RPW: u32 = {rpw}u;
+const ROWSW: u32 = {rowsw}u;
 
 {bfly_scratch}var<workgroup> rows_out: array<f32, {rpw}>;
 
@@ -354,8 +355,8 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
     if (lane == 0u) {{ rows_out[warp] = r; }}
     workgroupBarrier();
     if (lid.x == 0u) {{
-        let wordbase = (wgid.x * 8u) >> 1u;
-        for (var w = 0u; w < 4u; w = w + 1u) {{
+        let wordbase = (wgid.x * RPW) >> 1u;
+        for (var w = 0u; w < ROWSW; w = w + 1u) {{
             var va = rows_out[2u * w];
             var vb = rows_out[2u * w + 1u];
             if (ACCUM == 1u) {{
@@ -375,6 +376,7 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
         subgroup_body = subgroup_body,
         bfly_scratch = bfly_scratch,
         rpw = rows_per_wg,
+        rowsw = rows_per_wg / 2,
         threads = threads,
     )
 }

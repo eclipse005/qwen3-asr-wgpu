@@ -13,12 +13,36 @@ use crate::weights::{self, PackedWeight};
 ///
 /// One warp per row is fixed by the alignment contract (each lane owns words
 /// `lane, lane+32, …` of its row and the xor butterfly combines the 32 lanes in
-/// a fixed tree).  How many rows *share a workgroup* is not: it only decides how
-/// many workgroups the dispatch gets, and `o_proj` / `down_proj` are the two
-/// shapes small enough that the machine is unfilled at 8 rows (measured in
-/// `gemv_bench`: 82 and 105 GB/s at 128 workgroups vs 289 GB/s for `lm_head` at
-/// 18 992).  Every row is still produced by the same warp with the same lane
-/// mapping, so the output is bit-identical at any value.
+/// a fixed tree).  How many rows *share a workgroup* is not: it only moves the
+/// workgroup boundary, so the output is bit-identical at any value and the only
+/// thing it can change is how many workgroups the dispatch gets.
+///
+/// That turns out to change nothing.  `gemv_bench`'s chained sweep (32 dispatches
+/// per reading, 0.6B shapes) is flat across 2 / 4 / 8 for every shape and only
+/// degrades at 16 / 32:
+///
+/// | shape | 2 | 4 | **8** | 16 | 32 |
+/// |---|---|---|---|---|---|
+/// | qkv | 240.3 | 240.4 | **239.6** | 228.8 | 197.7 |
+/// | o_proj | 203.6 | 205.2 | **203.3** | 190.1 | 169.1 |
+/// | gate_up | 251.7 | 251.6 | **248.8** | 244.9 | 217.4 |
+/// | down_proj | 216.8 | 217.7 | **217.3** | 207.4 | 187.1 |
+/// | lm_head | n/a | 297.8 | **297.7** | 297.2 | 296.0 |
+///
+/// The spread that *does* exist is between shapes, not between values: 204 GB/s
+/// for `o_proj` against 298 for `lm_head`, i.e. a 1024-row matrix against a
+/// 151 936-row one.  It is not the resident warp count either -- 2 rows per
+/// workgroup gives 4x the workgroups at the same total warp count -- which is why
+/// this is a constant and not a tuning knob.
+///
+/// **The 82 and 105 GB/s this comment used to quote for `o_proj` / `down_proj`
+/// were the submit floor, not the kernels**: they came from the `gemv_bench`
+/// helper that submitted once per dispatch (~30-50 us of host time), the same
+/// artifact the `rows_per_wg` sweep had.  And the shader's tail hard-coded 8 rows
+/// / 4 words instead of reading `RPW`, so every non-8 value wrote `rows/2`
+/// workgroups' worth of output for `rows/rpw` computed -- the sweep was timing a
+/// kernel with a 4x store overrun at rpw 2.  Both are fixed; the table above is
+/// what the kernel actually does.
 ///
 /// `QASR_GEMV_RPW` overrides it so A/B runs on one binary.
 pub fn gemv_rpw() -> usize {
