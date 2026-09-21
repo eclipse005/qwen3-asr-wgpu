@@ -264,7 +264,8 @@ impl TextBackend {
 pub(crate) struct Inner {
     pub(crate) config: AsrConfig,
     pub(crate) tokenizer: Tokenizer,
-    pub(crate) encoder: CpuAudioEncoder,
+    /// The host audio tower, loaded on demand — see [`Inner::cpu_tower`].
+    pub(crate) encoder: Option<CpuAudioEncoder>,
     pub(crate) gpu_encoder: Option<GpuAudioEncoder>,
     pub(crate) mel: MelExtractor,
     pub(crate) tensors: std::collections::HashMap<String, weights::RawTensor>,
@@ -532,18 +533,18 @@ impl Inner {
         selector: DeviceSelector,
         backend: EncoderBackend,
     ) -> Result<Self> {
+        let t = Instant::now();
         let config = AsrConfig::from_file(&model_dir.join("config.json"))
             .with_context(|| format!("config {}", model_dir.display()))?;
         let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+        crate::load_trace::note("config + tokenizer", t);
+        let t = Instant::now();
         let tensors = weights::load_tensors(model_dir)?;
-        let encoder = CpuAudioEncoder::load(
-            &tensors,
-            "thinker.audio_tower",
-            &config.thinker_config.audio_config,
-        )?;
+        crate::load_trace::note("safetensors (mmap + header)", t);
         let n_mels = config.thinker_config.audio_config.num_mel_bins;
         let want_cpu = selector == DeviceSelector::Cpu;
+        let t = Instant::now();
         let gpu = if want_cpu {
             None
         } else {
@@ -556,6 +557,9 @@ impl Inner {
                 Err(e) => return Err(e),
             }
         };
+        crate::load_trace::note("adapter + device", t);
+        let t = std::time::Instant::now();
+        crate::load_trace::transfer::reset();
         let gpu_encoder = match (&gpu, backend) {
             (None, _) | (_, EncoderBackend::Cpu) => None,
             (Some(gpu), EncoderBackend::Gpu) => {
@@ -570,8 +574,27 @@ impl Inner {
                 }
             }
         };
+        crate::load_trace::note("gpu audio tower", t);
+        crate::load_trace::transfer::note("gpu audio tower: transfer");
+        // The host tower is built now only when it is what will actually run;
+        // otherwise it stays `None` and `cpu_tower()` fills it in if a probe
+        // (`--cpu-enc`, `--compare-enc`, `--diag-enc`) asks for it.
+        let t = Instant::now();
+        let encoder = match backend == EncoderBackend::Cpu || gpu_encoder.is_none() {
+            true => Some(CpuAudioEncoder::load(
+                &tensors,
+                "thinker.audio_tower",
+                &config.thinker_config.audio_config,
+            )?),
+            false => None,
+        };
+        if encoder.is_some() {
+            crate::load_trace::note("cpu audio tower (f16->f32)", t);
+        }
         let text_cfg = TextConfig::from_model_dir(model_dir)?;
         crate::cpu_decoder::check_config(&text_cfg)?;
+        let t = Instant::now();
+        crate::load_trace::transfer::reset();
         let mut decoder = match gpu {
             Some(gpu) => TextBackend::Gpu(WgpuTextDecoder::load(
                 gpu,
@@ -592,6 +615,9 @@ impl Inner {
                 )?)
             }
         };
+        crate::load_trace::note("text decoder (incl. pipelines)", t);
+        crate::load_trace::transfer::note("text decoder: transfer");
+        let t = Instant::now();
         let text = &config.thinker_config.text_config;
         let (cos, sin) = compute_mrope_cos_sin(
             &text_positions(DECODER_MAX_SEQ),
@@ -603,6 +629,7 @@ impl Inner {
         let cos_f16: Vec<f16> = cos.iter().copied().map(f16::from_f32).collect();
         let sin_f16: Vec<f16> = sin.iter().copied().map(f16::from_f32).collect();
         decoder.set_rope_tables(&cos_f16, &sin_f16);
+        crate::load_trace::note("rope tables", t);
         Ok(Self {
             config,
             tokenizer,
@@ -612,6 +639,27 @@ impl Inner {
             tensors,
             decoder,
         })
+    }
+
+    /// The host audio tower, loading it on first demand.
+    ///
+    /// It is the `--cpu-enc` / `--compare-enc` / `--diag-enc` reference, so a run
+    /// that has the GPU tower never needs it — and at 0.6 B it is ~570 ms and
+    /// ~0.7 GiB of f32 host RAM to build (1.7 B: ~2 GiB), which is a large slice
+    /// of both the load time and the resident footprint for a tower that is
+    /// about to not be used at all.
+    fn cpu_tower(&mut self) -> Result<&mut CpuAudioEncoder> {
+        if self.encoder.is_none() {
+            let t = Instant::now();
+            let e = CpuAudioEncoder::load(
+                &self.tensors,
+                "thinker.audio_tower",
+                &self.config.thinker_config.audio_config,
+            )?;
+            crate::load_trace::note("cpu audio tower (deferred)", t);
+            self.encoder = Some(e);
+        }
+        Ok(self.encoder.as_mut().expect("just loaded"))
     }
 
     /// Every adapter wgpu can see on this machine, in the order
@@ -774,38 +822,40 @@ impl Inner {
 
     /// Audio encoder only (probe hook — no GPU work).
     pub fn encode_mel(&mut self, mel: &[f32], n_mels: usize, n_frames: usize) -> Result<Vec<f32>> {
-        self.encoder.forward(mel, n_mels, n_frames)
+        self.cpu_tower()?.forward(mel, n_mels, n_frames)
     }
 
     /// CPU conv-stem geometry `(c,h,w)` per conv layer (probe hook).
-    pub fn conv_geometry(&self, n_mels: usize) -> Result<[usize; 9]> {
-        self.encoder.conv_geometry(n_mels)
+    pub fn conv_geometry(&mut self, n_mels: usize) -> Result<[usize; 9]> {
+        self.cpu_tower()?.conv_geometry(n_mels)
     }
 
     /// `conv_out` input width (probe hook).
-    pub fn conv_out_in_features(&self) -> usize {
-        self.encoder.conv_out_in_features()
+    pub fn conv_out_in_features(&mut self) -> usize {
+        self.cpu_tower()
+            .map(|e| e.conv_out_in_features())
+            .unwrap_or(0)
     }
 
     /// `conv2d1` bias (probe hook).
-    pub fn conv_bias_c1(&self) -> Result<Vec<f32>> {
-        self.encoder.conv_bias_c1()
+    pub fn conv_bias_c1(&mut self) -> Result<Vec<f32>> {
+        self.cpu_tower()?.conv_bias_c1()
     }
 
     /// `conv2d1` weight as `(data, c_out, taps)`, row-major `[c_out, kh*3+kw]`
     /// (probe hook for hand-checking the GEMM).
-    pub fn conv_weight_c1(&self) -> Result<(Vec<f32>, usize, usize)> {
-        self.encoder.conv_weight_c1()
+    pub fn conv_weight_c1(&mut self) -> Result<(Vec<f32>, usize, usize)> {
+        self.cpu_tower()?.conv_weight_c1()
     }
 
     /// Raw c1 conv output `[chunk][c_out][pos]` (probe hook).
     pub fn conv_reference_c1(
-        &self,
+        &mut self,
         mel: &[f32],
         n_mels: usize,
         n_frames: usize,
     ) -> Result<(Vec<f32>, usize, usize, usize)> {
-        self.encoder.conv_reference_c1(mel, n_mels, n_frames)
+        self.cpu_tower()?.conv_reference_c1(mel, n_mels, n_frames)
     }
 
     /// Stage-by-stage GPU-vs-CPU comparison of the audio tower (diagnostic).
@@ -822,7 +872,11 @@ impl Inner {
         n_mels: usize,
         n_frames: usize,
     ) -> Result<()> {
-        let cs = self.encoder.config().n_window * 2;
+        self.cpu_tower()?;
+        // Field-level borrows from here on: the GPU tower is held mutably, so
+        // the host tower has to be reached without going through `&mut self`.
+        let host = self.encoder.as_ref().expect("cpu tower just loaded");
+        let cs = host.config().n_window * 2;
         let TextBackend::Gpu(dec) = &self.decoder else {
             anyhow::bail!("--diag-enc needs the GPU text decoder and audio tower");
         };
@@ -860,7 +914,7 @@ impl Inner {
 
         for level in 0..3 {
             let v = enc.level(level);
-            let cpu = self.encoder.conv_stages_from(level, &input, n_chunks, c_in, h, w)?;
+            let cpu = host.conv_stages_from(level, &input, n_chunks, c_in, h, w)?;
             anyhow::ensure!(
                 (cpu.plane, cpu.c_out, cpu.k) == (v.plane, v.c_out, v.k),
                 "conv{}: CPU geometry {}x{}x{} != GPU {}x{}x{}",
@@ -928,9 +982,9 @@ impl Inner {
             w = v.w_out;
         }
 
-        let tower = self.encoder.conv_tower(mel, n_mels, n_frames)?;
+        let tower = host.conv_tower(mel, n_mels, n_frames)?;
         let cf = tower.packed.len().checked_div(tower.n_total).unwrap_or(0);
-        let dm = self.encoder.config().d_model;
+        let dm = host.config().d_model;
         if let Some(a) = cap.attn.as_ref() {
             let (hd, wlen, wpad) = (a.hd, a.wlen, a.wpad);
             let hd_pad = a.attn_out.len() / (a.nh * a.n_win * a.wpad);
@@ -1037,13 +1091,13 @@ impl Inner {
                 let mut dn = Diff::default();
                 let mut dq = Diff::default();
                 let mut da = Diff::default();
-                let want_normed = self.encoder.dbg_layer_norm(0, &h0, tower.n_total)?;
+                let want_normed = host.dbg_layer_norm(0, &h0, tower.n_total)?;
                 for t in 0..tower.n_total {
                     for j in 0..dm {
                         dn.add(t, j, a.normed[t * dm + j].to_f32(), want_normed[t * dm + j], 3e-3);
                     }
                 }
-                let want_qkv = self.encoder.dbg_qkv(0, &want_normed, tower.n_total)?;
+                let want_qkv = host.dbg_qkv(0, &want_normed, tower.n_total)?;
                 for t in 0..tower.n_total {
                     for j in 0..3 * dm {
                         let gi = t * (n3 / tower.n_total) + j;
@@ -1052,14 +1106,14 @@ impl Inner {
                         }
                     }
                 }
-                let want_attn = self.encoder.dbg_attn_flat(0, &want_normed, tower.n_total)?;
+                let want_attn = host.dbg_attn_flat(0, &want_normed, tower.n_total)?;
                 for t in 0..tower.n_total {
                     for j in 0..dm {
                         da.add(t, j, a.attn_flat[t * a.acols + j].to_f32(), want_attn[t * dm + j], 3e-2);
                     }
                 }
                 if !a.mid.is_empty() {
-                    let attn_out = self.encoder.dbg_attn(0, &want_normed, tower.n_total)?;
+                    let attn_out = host.dbg_attn(0, &want_normed, tower.n_total)?;
                     let mut dmid = Diff::default();
                     for t in 0..tower.n_total {
                         for j in 0..dm {
@@ -1083,7 +1137,7 @@ impl Inner {
         if !cap.layers.is_empty() {
             let mut prev: Vec<f32> = cap.h.iter().take(tower.n_total * dm).map(|v| v.to_f32()).collect();
             for (li, got) in cap.layers.iter().enumerate() {
-                let want = self.encoder.layer_forward(li, &prev, tower.n_total)?;
+                let want = host.layer_forward(li, &prev, tower.n_total)?;
                 let mut d = Diff::default();
                 for t in 0..tower.n_total {
                     for j in 0..dm {
@@ -1140,7 +1194,7 @@ impl Inner {
                 .iter()
                 .map(|v| v.to_f32())
                 .collect();
-            let tight = self.encoder.conv_out_from(&gpu_packed, tower.n_total)?;
+            let tight = host.conv_out_from(&gpu_packed, tower.n_total)?;
             let mut dt = Diff::default();
             for t in 0..tower.n_total {
                 for j in 0..dm {
@@ -1158,7 +1212,7 @@ impl Inner {
             );
             eprintln!(
                 "    pe[0..6]    {:?}",
-                self.encoder.pe_row(0).into_iter().take(6).collect::<Vec<_>>()
+                host.pe_row(0).into_iter().take(6).collect::<Vec<_>>()
             );
         }
         eprintln!(
@@ -1181,19 +1235,20 @@ impl Inner {
         n_frames: usize,
         compare: bool,
     ) -> Result<Vec<f32>> {
+        if !matches!(self.decoder, TextBackend::Gpu(_)) || self.gpu_encoder.is_none() {
+            return self.cpu_tower()?.forward(mel, n_mels, n_frames);
+        }
         let TextBackend::Gpu(dec) = &self.decoder else {
-            return self.encoder.forward(mel, n_mels, n_frames);
+            unreachable!("checked above")
         };
-        let Some(enc) = self.gpu_encoder.as_mut() else {
-            return self.encoder.forward(mel, n_mels, n_frames);
-        };
+        let enc = self.gpu_encoder.as_mut().expect("checked above");
         let t = Instant::now();
         let out16 = enc.encode(&dec.gpu, mel, n_mels, n_frames)?;
         let gpu_ms = t.elapsed().as_secs_f64() * 1000.0;
         let embeds: Vec<f32> = out16.iter().map(|v| v.to_f32()).collect();
         if compare {
             let t = Instant::now();
-            let cpu = self.encoder.forward(mel, n_mels, n_frames)?;
+            let cpu = self.cpu_tower()?.forward(mel, n_mels, n_frames)?;
             let cpu_ms = t.elapsed().as_secs_f64() * 1000.0;
             print_embed_diff(&cpu, &embeds, n_frames);
             eprintln!(

@@ -102,7 +102,9 @@ pub fn conv_geometry(asr: &AsrInference, n_mels: usize) -> Result<[usize; 9]> {
 
 /// `conv_out`'s input width (see `audio_encoder.rs`'s permute).
 pub fn conv_out_in_features(asr: &AsrInference) -> usize {
-    asr.lock().map(|g| g.conv_out_in_features()).unwrap_or(0)
+    asr.lock()
+        .map(|mut g| g.conv_out_in_features())
+        .unwrap_or(0)
 }
 
 /// `conv2d1` bias.

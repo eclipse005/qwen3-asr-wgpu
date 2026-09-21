@@ -440,7 +440,9 @@ impl WgpuTextDecoder {
         max_seq: usize,
         rope_positions: usize,
     ) -> Result<Self> {
+        let t = std::time::Instant::now();
         let w = weights::load_tensors(model_dir)?;
+        crate::load_trace::note("decoder: tensors", t);
         let hs = cfg.hidden_size;
         let q_dim = cfg.q_dim();
         let nqh = cfg.num_attention_heads;
@@ -456,6 +458,7 @@ impl WgpuTextDecoder {
                     .with_context(|| format!("build pipeline {label}"))
             };
 
+        let t_pipes = std::time::Instant::now();
         let gqa_pl = family_layout(
             &gpu,
             "gqa_single",
@@ -549,8 +552,10 @@ impl WgpuTextDecoder {
                 Some(&family_layout(&gpu, "slab_merge", &[(0, true), (1, true), (2, false)], 3)),
             )?,
         };
+        crate::load_trace::note("decoder: pipelines", t_pipes);
 
         let max_chunks = max_seq.div_ceil(256);
+        let t_weights = std::time::Instant::now();
         let mut up = gpu.uploader();
         let scratch = Scratch {
             h: up.storage("h", (hs / 2 * 4) as u64),
@@ -661,24 +666,31 @@ impl WgpuTextDecoder {
         };
 
         let mut layers = Vec::with_capacity(nl);
+        let mut t_conv = std::time::Duration::ZERO;
+        let mut t_up = std::time::Duration::ZERO;
         for i in 0..nl {
             let p = format!("{prefix}.layers.{i}");
-            let qkv = upload_weight(&mut up, "qkv_w", &fused_qkv(&w, &format!("{p}.self_attn"))?)?;
-            let o = upload_weight(
-                &mut up,
-                "o_w",
-                &weights::get_matrix(&w, &format!("{p}.self_attn.o_proj.weight"))?,
-            )?;
-            let gu = upload_weight(&mut up, "gu_w", &fused_gate_up(&w, &format!("{p}.mlp"))?)?;
-            let dp = upload_weight(
-                &mut up,
-                "dp_w",
-                &weights::get_matrix(&w, &format!("{p}.mlp.down_proj.weight"))?,
-            )?;
-            let iln = upload_vec(&mut up, "iln_w", &weights::get_vector(&w, &format!("{p}.input_layernorm.weight"))?)?;
-            let pln = upload_vec(&mut up, "pln_w", &weights::get_vector(&w, &format!("{p}.post_attention_layernorm.weight"))?)?;
-            let qn = upload_vec(&mut up, "qn_w", &weights::get_vector(&w, &format!("{p}.self_attn.q_norm.weight"))?)?;
-            let kn = upload_vec(&mut up, "kn_w", &weights::get_vector(&w, &format!("{p}.self_attn.k_norm.weight"))?)?;
+            let t = std::time::Instant::now();
+            let qkv_w = fused_qkv(&w, &format!("{p}.self_attn"))?;
+            let o_w = weights::get_matrix(&w, &format!("{p}.self_attn.o_proj.weight"))?;
+            let gu_w = fused_gate_up(&w, &format!("{p}.mlp"))?;
+            let dp_w = weights::get_matrix(&w, &format!("{p}.mlp.down_proj.weight"))?;
+            let iln_v = weights::get_vector(&w, &format!("{p}.input_layernorm.weight"))?;
+            let pln_v = weights::get_vector(&w, &format!("{p}.post_attention_layernorm.weight"))?;
+            let qn_v = weights::get_vector(&w, &format!("{p}.self_attn.q_norm.weight"))?;
+            let kn_v = weights::get_vector(&w, &format!("{p}.self_attn.k_norm.weight"))?;
+            t_conv += t.elapsed();
+
+            let t = std::time::Instant::now();
+            let qkv = upload_weight(&mut up, "qkv_w", &qkv_w)?;
+            let o = upload_weight(&mut up, "o_w", &o_w)?;
+            let gu = upload_weight(&mut up, "gu_w", &gu_w)?;
+            let dp = upload_weight(&mut up, "dp_w", &dp_w)?;
+            let iln = upload_vec(&mut up, "iln_w", &iln_v)?;
+            let pln = upload_vec(&mut up, "pln_w", &pln_v)?;
+            let qn = upload_vec(&mut up, "qn_w", &qn_v)?;
+            let kn = upload_vec(&mut up, "kn_w", &kn_v)?;
+            t_up += t.elapsed();
 
             let k_cache = gpu.storage("k_cache", (kv_words * 4) as u64);
             let v_cache = gpu.storage("v_cache", (kv_words * 4) as u64);
@@ -765,6 +777,9 @@ impl WgpuTextDecoder {
         });
 
         up.finish()?;
+        crate::load_trace::note_dur("decoder: host convert", t_conv);
+        crate::load_trace::note_dur("decoder: gpu upload", t_up);
+        crate::load_trace::note("decoder: weights + upload", t_weights);
 
         Ok(Self {
             gpu,
