@@ -207,13 +207,25 @@ fn gemv_merge(@builtin(global_invocation_id) gid: vec3<u32>) {{
 ///
 /// `n` must be a multiple of 8 (all model shapes are) so no partial workgroup
 /// exists; `k/8` must be a multiple of 32 so the granule loop divides evenly.
-pub fn gemv(n: usize, k: usize, accum: bool, subgroup: bool) -> String {
+pub fn gemv(n: usize, k: usize, accum: bool, subgroup: bool, rows_per_wg: usize) -> String {
     assert_eq!(n % 8, 0, "gemv: rows must be a multiple of 8");
     let kg = k / 8;
     assert_eq!(kg % 32, 0, "gemv: k/8 must be a multiple of 32");
     assert_eq!(k % 8, 0, "gemv: k must be a multiple of 8");
     let tiles = kg / 32;
     assert_eq!(tiles % 4, 0, "gemv: k/256 must be a multiple of 4 (unrolled x4)");
+    // One warp per row is what fixes the reduction tree, so `rows_per_wg` only
+    // chooses how many rows share a workgroup -- and therefore how many
+    // workgroups the dispatch has.  Every warp still walks its own row with the
+    // same lane->word mapping and the same xor butterfly; only the
+    // workgroup-level bookkeeping moves.  Row `r` is written by the warp that
+    // owns it either way, so the arithmetic (and the bits) are unchanged.
+    assert!(
+        rows_per_wg.is_power_of_two() && (2..=32).contains(&rows_per_wg),
+        "gemv: rows_per_wg must be 2/4/8/16/32"
+    );
+    assert_eq!(n % rows_per_wg, 0, "gemv: rows must be a multiple of rows_per_wg");
+    let threads = rows_per_wg * 32;
     let accum_lit = if accum { 1u32 } else { 0u32 };
     let subgroup_lit = if subgroup { 1u32 } else { 0u32 };
     let subgroup_body = if subgroup {
@@ -246,8 +258,8 @@ pub fn gemv(n: usize, k: usize, accum: bool, subgroup: bool) -> String {
     let bfly_scratch = if subgroup {
         ""
     } else {
-        "var<workgroup> bt0: array<f32, 256>;
-var<workgroup> bt1: array<f32, 256>;
+        "var<workgroup> bt0: array<f32, THREADS>;
+var<workgroup> bt1: array<f32, THREADS>;
 "
     };
     format!(
@@ -259,8 +271,10 @@ const KG: u32 = {kg}u;
 const TILES: u32 = {tiles}u;
 const ACCUM: u32 = {accum_lit}u;
 const SUBGROUP: u32 = {subgroup_lit}u;
+const THREADS: u32 = {threads}u;
+const RPW: u32 = {rpw}u;
 
-{bfly_scratch}var<workgroup> rows_out: array<f32, 8>;
+{bfly_scratch}var<workgroup> rows_out: array<f32, {rpw}>;
 
 /// 5-round xor butterfly over the 32 lanes of one warp -- the exact tree
 /// `__shfl_xor_sync(acc, [16,8,4,2,1])` produces.
@@ -278,12 +292,12 @@ fn bfly(v: f32, lid: u32, lane: u32) -> f32 {{
 {subgroup_body}
 }}
 
-@compute @workgroup_size(256)
+@compute @workgroup_size({threads})
 fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {{
     let lane = lid.x & 31u;
     let warp = lid.x >> 5u;
-    let row = wgid.x * 8u + warp;
+    let row = wgid.x * RPW + warp;
 
     let wbase = row * KG;
     var a0 = 0.0; var a1 = 0.0; var a2 = 0.0; var a3 = 0.0;
@@ -360,6 +374,8 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
         subgroup_lit = subgroup_lit,
         subgroup_body = subgroup_body,
         bfly_scratch = bfly_scratch,
+        rpw = rows_per_wg,
+        threads = threads,
     )
 }
 

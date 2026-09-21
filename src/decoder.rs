@@ -9,6 +9,36 @@ use crate::gpu::{BulkUpload, Gpu};
 use crate::shaders;
 use crate::weights::{self, PackedWeight};
 
+/// Rows per workgroup for the plain-[`shaders::gemv`] pipelines.
+///
+/// One warp per row is fixed by the alignment contract (each lane owns words
+/// `lane, lane+32, …` of its row and the xor butterfly combines the 32 lanes in
+/// a fixed tree).  How many rows *share a workgroup* is not: it only decides how
+/// many workgroups the dispatch gets, and `o_proj` / `down_proj` are the two
+/// shapes small enough that the machine is unfilled at 8 rows (measured in
+/// `gemv_bench`: 82 and 105 GB/s at 128 workgroups vs 289 GB/s for `lm_head` at
+/// 18 992).  Every row is still produced by the same warp with the same lane
+/// mapping, so the output is bit-identical at any value.
+///
+/// `QASR_GEMV_RPW` overrides it so A/B runs on one binary.
+pub fn gemv_rpw() -> usize {
+    static RPW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RPW.get_or_init(|| {
+        std::env::var("QASR_GEMV_RPW")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| matches!(v, 2 | 4 | 8 | 16 | 32))
+            .unwrap_or(8)
+    })
+}
+
+/// Rows per workgroup for the [`shaders::gemv_norm`] pipelines -- fixed at 8.
+///
+/// Its prologue is `rms_norm`'s own 256-virtual-thread reduction tree, so the
+/// workgroup must stay 256 threads: shrinking it would have to re-split the
+/// partials and that is a different sum.
+pub const GEMV_NORM_RPW: usize = 8;
+
 /// Text decoder hyper-parameters (mirrors `TextDecoderConfig`).
 #[derive(Debug, Clone)]
 pub struct TextConfig {
@@ -487,11 +517,11 @@ impl WgpuTextDecoder {
             && gpu.info.subgroup_min_size == 32
             && gpu.info.subgroup_max_size == 32;
         let pipes = Pipes {
-            gemv_qkv: build("gemv_qkv", &shaders::gemv(cfg.fused_qkv_cols(), hs, false, subgroup), "gemv", None)?,
-            gemv_o: build("gemv_o", &shaders::gemv(hs, q_dim, true, subgroup), "gemv", None)?,
-            gemv_gu: build("gemv_gu", &shaders::gemv(2 * inter, hs, false, subgroup), "gemv", None)?,
-            gemv_dp: build("gemv_dp", &shaders::gemv(hs, inter, true, subgroup), "gemv", None)?,
-            gemv_lm: build("gemv_lm", &shaders::gemv(vocab, hs, false, subgroup), "gemv", None)?,
+            gemv_qkv: build("gemv_qkv", &shaders::gemv(cfg.fused_qkv_cols(), hs, false, subgroup, gemv_rpw()), "gemv", None)?,
+            gemv_o: build("gemv_o", &shaders::gemv(hs, q_dim, true, subgroup, gemv_rpw()), "gemv", None)?,
+            gemv_gu: build("gemv_gu", &shaders::gemv(2 * inter, hs, false, subgroup, gemv_rpw()), "gemv", None)?,
+            gemv_dp: build("gemv_dp", &shaders::gemv(hs, inter, true, subgroup, gemv_rpw()), "gemv", None)?,
+            gemv_lm: build("gemv_lm", &shaders::gemv(vocab, hs, false, subgroup, gemv_rpw()), "gemv", None)?,
             gemv_qkv_norm: build(
                 "gemv_qkv_norm",
                 &shaders::gemv_norm(cfg.fused_qkv_cols(), hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
@@ -956,11 +986,17 @@ impl WgpuTextDecoder {
     pub fn encode_step(&self, enc: &mut wgpu::CommandEncoder, pos: usize) {
         let cfg = &self.cfg;
         let cur_len = pos + 1;
-        let gemv_grid = |rows: usize| (rows / 8) as u32;
+        let gemv_grid = |rows: usize| (rows / gemv_rpw()) as u32;
+        let norm_grid = |rows: usize| (rows / GEMV_NORM_RPW) as u32;
         let silu_grid = grid_xy((cfg.intermediate_size / 2).div_ceil(256));
 
         let dup = std::env::var("QASR_DUP").unwrap_or_default();
         let d = |name: &str| dup == name;
+        // `QASR_SKIP` drops one dispatch per layer instead of duplicating it.
+        // Skipping changes the numbers and therefore the tokens, so the figure to
+        // read is `decode ms / token`, not the absolute decode time.
+        let skip = std::env::var("QASR_SKIP").unwrap_or_default();
+        let k = |name: &str| skip == name;
 
         let mut cp = enc.begin_compute_pass(&Default::default());
 
@@ -969,64 +1005,84 @@ impl WgpuTextDecoder {
         cp.dispatch_workgroups(1, 1, 1);
 
         for l in &self.layers {
-            cp.set_pipeline(&self.pipes.gemv_qkv_norm);
-            cp.set_bind_group(0, &l.bg_gemv_qkv_norm, &[]);
-            cp.dispatch_workgroups(gemv_grid(cfg.fused_qkv_cols()), 1, 1);
+            if !k("qkv") {
+                cp.set_pipeline(&self.pipes.gemv_qkv_norm);
+                cp.set_bind_group(0, &l.bg_gemv_qkv_norm, &[]);
+                cp.dispatch_workgroups(norm_grid(cfg.fused_qkv_cols()), 1, 1);
+            }
             if d("qkv") {
-                cp.dispatch_workgroups(gemv_grid(cfg.fused_qkv_cols()), 1, 1);
+                cp.dispatch_workgroups(norm_grid(cfg.fused_qkv_cols()), 1, 1);
             }
 
-            cp.set_pipeline(&self.pipes.extract);
-            cp.set_bind_group(0, &l.bg_extract, &[]);
-            cp.dispatch_workgroups(1, (cfg.num_attention_heads + cfg.num_key_value_heads) as u32, 1);
+            if !k("extract") {
+                cp.set_pipeline(&self.pipes.extract);
+                cp.set_bind_group(0, &l.bg_extract, &[]);
+                cp.dispatch_workgroups(1, (cfg.num_attention_heads + cfg.num_key_value_heads) as u32, 1);
+            }
             if d("extract") {
                 cp.dispatch_workgroups(1, (cfg.num_attention_heads + cfg.num_key_value_heads) as u32, 1);
             }
 
-            self.encode_gqa(&mut cp, l, cur_len);
-            if d("gqa") {
+            if !k("gqa") {
                 self.encode_gqa(&mut cp, l, cur_len);
             }
+            if d("gqa") {
+                if !k("gqa") {
+                self.encode_gqa(&mut cp, l, cur_len);
+            }
+            }
 
-            cp.set_pipeline(&self.pipes.gemv_o);
-            cp.set_bind_group(0, &l.bg_gemv_o, &[]);
-            cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
+            if !k("o") {
+                cp.set_pipeline(&self.pipes.gemv_o);
+                cp.set_bind_group(0, &l.bg_gemv_o, &[]);
+                cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
+            }
             if d("o") {
                 cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
             }
 
-            cp.set_pipeline(&self.pipes.gemv_gu_norm);
-            cp.set_bind_group(0, &l.bg_gemv_gu_norm, &[]);
-            cp.dispatch_workgroups(gemv_grid(2 * cfg.intermediate_size), 1, 1);
+            if !k("gu") {
+                cp.set_pipeline(&self.pipes.gemv_gu_norm);
+                cp.set_bind_group(0, &l.bg_gemv_gu_norm, &[]);
+                cp.dispatch_workgroups(norm_grid(2 * cfg.intermediate_size), 1, 1);
+            }
             if d("gu") {
-                cp.dispatch_workgroups(gemv_grid(2 * cfg.intermediate_size), 1, 1);
+                cp.dispatch_workgroups(norm_grid(2 * cfg.intermediate_size), 1, 1);
             }
 
-            cp.set_pipeline(&self.pipes.silu);
-            cp.set_bind_group(0, &self.bg_silu, &[]);
-            cp.dispatch_workgroups(silu_grid.0, silu_grid.1, 1);
+            if !k("silu") {
+                cp.set_pipeline(&self.pipes.silu);
+                cp.set_bind_group(0, &self.bg_silu, &[]);
+                cp.dispatch_workgroups(silu_grid.0, silu_grid.1, 1);
+            }
             if d("silu") {
                 cp.dispatch_workgroups(silu_grid.0, silu_grid.1, 1);
             }
 
-            cp.set_pipeline(&self.pipes.gemv_dp);
-            cp.set_bind_group(0, &l.bg_gemv_dp, &[]);
-            cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
+            if !k("dp") {
+                cp.set_pipeline(&self.pipes.gemv_dp);
+                cp.set_bind_group(0, &l.bg_gemv_dp, &[]);
+                cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
+            }
             if d("dp") {
                 cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
             }
         }
 
+        if !k("lm") {
         cp.set_pipeline(&self.pipes.gemv_lm_norm);
         cp.set_bind_group(0, &self.bg_gemv_lm_norm, &[]);
-        cp.dispatch_workgroups(gemv_grid(cfg.vocab_size), 1, 1);
+        cp.dispatch_workgroups(norm_grid(cfg.vocab_size), 1, 1);
+        }
         if d("lm") {
-            cp.dispatch_workgroups(gemv_grid(cfg.vocab_size), 1, 1);
+            cp.dispatch_workgroups(norm_grid(cfg.vocab_size), 1, 1);
         }
 
+        if !k("argmax") {
         cp.set_pipeline(&self.pipes.argmax);
         cp.set_bind_group(0, &self.bg_argmax, &[]);
         cp.dispatch_workgroups(1, 1, 1);
+        }
 
         drop(cp);
         enc.copy_buffer_to_buffer(&self.scratch.token, 0, &self.scratch.token_staging, 0, 4);
@@ -1099,7 +1155,7 @@ impl WgpuTextDecoder {
         self.write_step_uniforms(pos);
         let cfg = &self.cfg;
         let cur_len = pos + 1;
-        let gemv_grid = |rows: usize| (rows / 8) as u32;
+        let gemv_grid = |rows: usize| (rows / gemv_rpw()) as u32;
         let silu_grid = grid_xy((cfg.intermediate_size / 2).div_ceil(256));
         let layer = &self.layers[l];
         let mut cp = enc.begin_compute_pass(&Default::default());
@@ -1166,7 +1222,7 @@ impl WgpuTextDecoder {
     /// Single layer-op dispatch into an already-open compute pass.
     pub fn debug_dispatch_op(&self, cp: &mut wgpu::ComputePass, l: usize, pos: usize, op: usize) {
         let cfg = &self.cfg;
-        let gemv_grid = |rows: usize| (rows / 8) as u32;
+        let gemv_grid = |rows: usize| (rows / gemv_rpw()) as u32;
         let layer = &self.layers[l];
         match op {
             0 => { cp.set_pipeline(&self.pipes.rms_norm); cp.set_bind_group(0, &layer.bg_rms1, &[]); cp.dispatch_workgroups(1, 1, 1); }

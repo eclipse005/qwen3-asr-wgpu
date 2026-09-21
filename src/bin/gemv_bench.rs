@@ -441,7 +441,32 @@ fn main() -> Result<()> {
             Ok(t0.elapsed().as_secs_f64() * 1000.0 / iters as f64)
         };
 
-        let src = shaders::gemv(rows, cols, false, false);
+        let run_grid = |pipe: &wgpu::ComputePipeline, bg: &wgpu::BindGroup, g: u32| -> Result<f64> {
+            for _ in 0..3 {
+                let mut enc = gpu.device.create_command_encoder(&Default::default());
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(pipe);
+                cp.set_bind_group(0, bg, &[]);
+                cp.dispatch_workgroups(g, 1, 1);
+                drop(cp);
+                gpu.queue.submit([enc.finish()]);
+            }
+            gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                let mut enc = gpu.device.create_command_encoder(&Default::default());
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(pipe);
+                cp.set_bind_group(0, bg, &[]);
+                cp.dispatch_workgroups(g, 1, 1);
+                drop(cp);
+                gpu.queue.submit([enc.finish()]);
+            }
+            gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
+            Ok(t0.elapsed().as_secs_f64() * 1000.0 / iters as f64)
+        };
+
+        let src = shaders::gemv(rows, cols, false, false, 8);
         let pipe_p = gpu.pipeline("prod", &src, "gemv", None)?;
         let bg_p = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("prod"),
@@ -568,6 +593,119 @@ fn main() -> Result<()> {
         let ms_sp = run_split(&pipe_sp, &bg_sp, &pipe_mg, &bg_mg)?;
 
         let bw = |ms: f64| bytes as f64 / 1e9 / (ms / 1000.0);
+        // ── is the cost per *dispatch* or per *submit*? ──
+        // One command buffer, N back-to-back dispatches of the same shape (the
+        // barriers wgpu inserts between them are what the decode chain pays).
+        // If per-dispatch time is flat in N, the price is the barrier/dispatch
+        // itself and the only lever on the decode step is the dispatch *count*.
+        let chain = |n: u32| -> Result<f64> {
+            let reps = 5u32;
+            for _ in 0..2 {
+                let mut enc = gpu.device.create_command_encoder(&Default::default());
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&pipe_p);
+                cp.set_bind_group(0, &bg_p, &[]);
+                for _ in 0..n {
+                    cp.dispatch_workgroups(grid, 1, 1);
+                }
+                drop(cp);
+                gpu.queue.submit([enc.finish()]);
+            }
+            gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                let mut enc = gpu.device.create_command_encoder(&Default::default());
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&pipe_p);
+                cp.set_bind_group(0, &bg_p, &[]);
+                for _ in 0..n {
+                    cp.dispatch_workgroups(grid, 1, 1);
+                }
+                drop(cp);
+                gpu.queue.submit([enc.finish()]);
+            }
+            gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
+            Ok(t0.elapsed().as_secs_f64() * 1e6 / (reps * n) as f64)
+        };
+        print!("  {name:<9} per-dispatch us: 1x {:>6.1}", chain(1)?);
+        for n in [8u32, 32] {
+            print!("  {n}x {:>6.1}", chain(n)?);
+        }
+        println!();
+
+        // ── does alternating pipelines cost more than chaining one? ──
+        // The decode step runs 7 different pipelines per layer, so if a
+        // `VkCmdBindPipeline` between dispatches costs anything the step pays it
+        // 200+ times.  `unroll4` shares the production bind group layout, so this
+        // alternates the *pipeline* with the buffers held fixed.
+        let chain_alt = |n: u32| -> Result<f64> {
+            let reps = 5u32;
+            for _ in 0..2 {
+                let mut enc = gpu.device.create_command_encoder(&Default::default());
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&pipe_p);
+                cp.set_bind_group(0, &bg_p, &[]);
+                for i in 0..n {
+                    cp.set_pipeline(if i % 2 == 0 { &pipe_p } else { &pipe_u });
+                    cp.dispatch_workgroups(grid, 1, 1);
+                }
+                drop(cp);
+                gpu.queue.submit([enc.finish()]);
+            }
+            gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                let mut enc = gpu.device.create_command_encoder(&Default::default());
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&pipe_p);
+                cp.set_bind_group(0, &bg_p, &[]);
+                for i in 0..n {
+                    cp.set_pipeline(if i % 2 == 0 { &pipe_p } else { &pipe_u });
+                    cp.dispatch_workgroups(grid, 1, 1);
+                }
+                drop(cp);
+                gpu.queue.submit([enc.finish()]);
+            }
+            gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
+            Ok(t0.elapsed().as_secs_f64() * 1e6 / (reps * n) as f64)
+        };
+        println!("  {name:<9} alternate 2 pipelines: 32x {:>6.1} us/dispatch", chain_alt(32)?);
+
+        // ── workgroup-shape sweep, production kernel ──
+        // `rows_per_wg` only moves the workgroup boundary: one warp per row and
+        // the lane->word mapping are fixed by the alignment contract, so this is
+        // a pure scheduling knob and the output is bit-identical at every value.
+        // It sets how many workgroups the dispatch gets, which is what separates
+        // `lm_head` (18 992 wg, 289 GB/s) from `o_proj` (128 wg, 82 GB/s).
+        print!("  {name:<9} rpw:");
+        for rpw in [2usize, 4, 8, 16, 32] {
+            if rpw == 8 {
+                print!("  8: {:>6.1} (prod)", bw(ms_p));
+                continue;
+            }
+            if rows / rpw > 65535 {
+                // One grid dimension is capped at 65535; `lm_head` needs a 2D
+                // grid for the small row counts, which is not what this sweep is
+                // asking about.
+                print!("  {rpw}:  n/a  ");
+                continue;
+            }
+            let src_r = shaders::gemv(rows, cols, false, false, rpw);
+            let pipe_r = gpu.pipeline(&format!("rpw{rpw}"), &src_r, "gemv", None)?;
+            let bg_r = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rpw"),
+                layout: &pipe_r.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: w.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: y.as_entire_binding() },
+                ],
+            });
+            let grid_r = (rows / rpw) as u32;
+            let ms_r = run_grid(&pipe_r, &bg_r, grid_r)?;
+            print!("  {rpw}: {:>6.1}", bw(ms_r));
+        }
+        println!();
         println!(
             "{:<11} {:>10.1} {:>14.1} {:>12.1} {:>12.1} {:>12.1} {:>12.1} {:>9.2}",
             name,

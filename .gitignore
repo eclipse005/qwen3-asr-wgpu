@@ -13,3 +13,7 @@ exp_probe/*.bin
 
 # Command Code session state (taste memory, session logs)
 /.commandcode/
+
+# bench harness output (regenerate with scripts/bench.ps1)
+/scripts/bench-*.tsv
+/scripts/*.log
