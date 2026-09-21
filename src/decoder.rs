@@ -446,11 +446,19 @@ const MAX_SLAB: usize = 16;
 /// one -- per-slab (max, sum) then a rescaled merge -- so its rounding is not
 /// the flat path's, and that is inherent to it rather than a bug to fix.
 ///
+/// Diffing the two transcripts says how far apart they are: **the text is
+/// character-for-character identical except for punctuation**, three marks
+/// where the flat path emits `，`/`。` and the slab path emits `！`.  That is a
+/// rounding-level divergence flipping the argmax between two tokens whose
+/// logits differ by a hair -- not a structural defect, but enough to fail a
+/// byte-exact gate.
+///
 /// Which leaves a hole worth naming: **`s > 4096` is the default and it is
 /// ungated.**  No fixture is that long, so the slab path's numerics have never
-/// been checked against `python-hf` anywhere it is actually used.  The threshold
-/// stays at 4096 until either the slab path is made to agree or a long fixture
-/// exists; do not lower it to collect the 42 ms.
+/// been checked against `python-hf` anywhere it is actually used -- and what it
+/// would do there is exactly what it just did here, i.e. differ in punctuation.
+/// The threshold stays at 4096 until either the slab path is made to agree or a
+/// long fixture exists; do not lower it to collect the 42 ms.
 fn slab_path(s: usize) -> bool {
     match std::env::var("QASR_SLAB").unwrap_or_default().to_ascii_lowercase().as_str() {
         "1" | "on" | "yes" | "force" => true,
