@@ -164,16 +164,25 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let ms = run(20)?;
     let fmas = gx as f64 * 256.0 * 256.0 * 64.0;
     let loads = gx as f64 * 256.0 * 256.0 * 8.0;
+    // NOTE: the number this prints is **not** an FFMA throughput ceiling, and it
+    // was read as one.  The inner-loop address is
+    //   ((idx*3 + (bitcast<u32>(c0) & 15)) & 255) * PAD + tx
+    // i.e. it depends on accumulator `c0`, so every iteration is serialised on an
+    // LDS -> FMA -> address chain and the loop measures *latency*.  It reports
+    // 2.25 TFLOP/s, which is close to the real GEMM's 2.4 -- and both are 25-33%
+    // of what the card can do (nvidia-smi: 1911 MHz SM clock, 1920 FP32 lanes ->
+    // 7.34 TFLOP/s).  Keep it as a lesson about instruments, not as a roof: a
+    // probe that shares its loop with the effect it is pricing is not pricing it.
     println!(
         "\nshape: 8 shared loads + 64 FMA per iteration\n  {ms:.4} ms/dispatch  ->  {:.0} GFLOP/s  ({:.2} TFLOP/s)",
         fmas * 2.0 / (ms / 1e3) / 1e9,
         fmas * 2.0 / (ms / 1e3) / 1e12
     );
     println!(
-        "  shared loads/s = {:.2e} ({:.1} per SM per cycle at 1.6 GHz, 20 SM)",
+        "  shared loads/s = {:.2e} ({:.1} per SM per cycle at 1.9 GHz, 15 SM)",
         loads / (ms / 1e3),
-        loads / (ms / 1e3) / 20.0 / 1.6e9
+        loads / (ms / 1e3) / 15.0 / 1.91e9
     );
-    println!("\n(compare: real prefill_gemm = 2.07 TFLOP/s)");
+    println!("\n(this is LOAD-LATENCY bound, not a ceiling -- see the note in the source)");
     Ok(())
 }

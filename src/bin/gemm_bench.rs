@@ -6,7 +6,23 @@ use qwen3_asr_wgpu::gpu::Gpu;
 
 const BK: usize = 16;
 
-fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool) -> String {
+/// `permb` stores the `BN`-row B tile with its local rows permuted: row
+/// `r = 8*tx + j` lands in slot `16*j + tx` instead of slot `r`.
+///
+/// The compute read is `Bs[(slot) * PAD + q]`, and with PAD = 17 the per-lane
+/// address of a warp's B load is `slot*17 + q`.  Unpermuted, `slot = 8*tx + j`,
+/// so the 16 `tx` lanes stride `8*17 = 136` words, and `136 mod 32 = 8` means
+/// every lane lands on one of four banks -- a 4-way conflict that costs four
+/// LDS cycles per load.  The k-step issues 8 B loads and 64 FMAs, i.e. 32 LDS
+/// cycles against 16 issue cycles for the FMAs at 4 warps/SM/clock: the shared
+/// memory, not the FLOPs, sets the rate.
+///
+/// Permuted, the address is `(16*j + tx)*17 + q`, and `17*16 = 272 mod 32 = 16`
+/// only shifts a whole 16-word block, so the 16 lanes land on banks
+/// `17*tx mod 32` -- all 16 distinct -- while `j` moves in whole blocks.  The
+/// values each thread reads, the order it accumulates them in and the FMA count
+/// are all unchanged, so this is bit-identical by construction.
+fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool, permb: bool) -> String {
     let bm = 16 * tm;
     let bn = 16 * tn;
     let pad = BK + 1;
@@ -59,12 +75,21 @@ fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool) -> String {
         }
         t
     };
+    // Row `ty + 16e` of the B tile goes to slot `(ty&7)*16 + (ty>>3) + 2e` when
+    // permuted -- the inverse of the compute read's `16*j + tx`.
+    let bslot = |e: usize| -> String {
+        if permb {
+            format!("((ty & 7u) * 16u + (ty >> 3u) + {}u)", 2 * e)
+        } else {
+            format!("(ty + {}u)", e * 16)
+        }
+    };
     let load_bs = |kx: &str, dst: &str| -> String {
         let mut t = String::new();
         for e in 0..n_bs {
             t.push_str(&format!(
-                "  {dst}[(ty + {}u) * PAD + tx] = halve(W[(n0 + ty + {}u) * kk + ({kx} + tx) / 2u], (tx & 1u) == 1u);\n",
-                e * 16, e * 16
+                "  {dst}[{} * PAD + tx] = halve(W[(n0 + ty + {}u) * kk + ({kx} + tx) / 2u], (tx & 1u) == 1u);\n",
+                bslot(e), e * 16
             ));
         }
         t
@@ -110,7 +135,7 @@ fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool) -> String {
         let mut t = String::new();
         for e in 0..n_bs {
             t.push_str(&format!(
-                "   Bs[(ty + {}u) * PAD + tx] = halve(pfb{e}, (tx & 1u) == 1u);\n", e * 16
+                "   Bs[{} * PAD + tx] = halve(pfb{e}, (tx & 1u) == 1u);\n", bslot(e)
             ));
         }
         t
@@ -123,7 +148,12 @@ fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool) -> String {
                 t.push_str(&format!("   let a{i} = As[(ty * {tm}u + {i}u) * PAD + q];\n"));
             }
             for j in 0..tn {
-                t.push_str(&format!("   let b{j} = Bs[(tx * {tn}u + {j}u) * PAD + q];\n"));
+                let idx = if permb {
+                    format!("(16u * {j}u + tx)")
+                } else {
+                    format!("(tx * {tn}u + {j}u)")
+                };
+                t.push_str(&format!("   let b{j} = Bs[{idx} * PAD + q];\n"));
             }
             for i in 0..tm {
                 for j in 0..tn {
@@ -138,8 +168,13 @@ fn gemm_shader(tm: usize, tn: usize, double: bool, unroll_q: bool) -> String {
                         "   let a{i}_{q} = As[(ty * {tm}u + {i}u) * PAD + {q}u];\n"));
                 }
                 for j in 0..tn {
+                    let idx = if permb {
+                        format!("(16u * {j}u + tx)")
+                    } else {
+                        format!("(tx * {tn}u + {j}u)")
+                    };
                     t.push_str(&format!(
-                        "   let b{j}_{q} = Bs[(tx * {tn}u + {j}u) * PAD + {q}u];\n"));
+                        "   let b{j}_{q} = Bs[{idx} * PAD + {q}u];\n"));
                 }
                 for i in 0..tm {
                     for j in 0..tn {
@@ -235,6 +270,7 @@ fn setup<'a>(
     tn: usize,
     double: bool,
     unroll_q: bool,
+    permb: bool,
     m: usize,
     n: usize,
     k: usize,
@@ -263,7 +299,7 @@ fn setup<'a>(
     up.upload(&dims, &db)?;
     up.finish()?;
 
-    let src = gemm_shader(tm, tn, double, unroll_q);
+    let src = gemm_shader(tm, tn, double, unroll_q, permb);
     let pipe = gpu.pipeline("gemm", &src, "gemm", None)?;
     let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("gemm"),
@@ -366,19 +402,21 @@ fn main() -> Result<()> {
     let gpu = pollster::block_on(Gpu::new(adapter.as_deref()))?;
     println!("adapter: {}", gpu.describe());
 
-    let variants: [(usize, usize, bool, bool); 6] = [
-        (8, 8, false, false),
-        (8, 8, true, false),
-        (8, 8, true, true),
-        (8, 8, false, true),
-        (8, 4, true, true),
-        (4, 4, true, true),
+    let variants: [(usize, usize, bool, bool, bool); 8] = [
+        (8, 8, false, false, false),
+        (8, 8, true, false, false),
+        (8, 8, true, true, false),
+        (8, 8, false, true, false),
+        (8, 4, true, true, false),
+        (4, 4, true, true, false),
+        (8, 8, true, false, true),
+        (8, 8, false, true, true),
     ];
 
     println!("-- correctness (m=256, n=256, k=256) --");
     let mut seed = 42u32;
-    for (tm, tn, dbl, uq) in variants {
-        let b = setup(&gpu, tm, tn, dbl, uq, 256, 256, 256, &mut seed)?;
+    for (tm, tn, dbl, uq, pb) in variants {
+        let b = setup(&gpu, tm, tn, dbl, uq, pb, 256, 256, 256, &mut seed)?;
         let mut enc = gpu.device.create_command_encoder(&Default::default());
         b.dispatch_n(&mut enc, 1);
         gpu.queue.submit([enc.finish()]);
@@ -386,11 +424,11 @@ fn main() -> Result<()> {
         let (max_abs, max_rel) = b.verify()?;
         let ok = max_rel < 0.02 && max_abs < 0.2;
         println!(
-            "  {tm}x{tn} dbl={dbl} uq={uq}: max|Δ|={max_abs:.4} max_rel={max_rel:.4} {}",
+            "  {tm}x{tn} dbl={dbl} uq={uq} pb={pb}: max|Δ|={max_abs:.4} max_rel={max_rel:.4} {}",
             if ok { "OK" } else { "FAIL" }
         );
         if !ok {
-            bail!("variant {tm}x{tn} dbl={dbl} failed correctness");
+            bail!("variant {tm}x{tn} dbl={dbl} uq={uq} pb={pb} failed correctness");
         }
     }
 
@@ -413,23 +451,24 @@ fn main() -> Result<()> {
     let iters = 20u32;
     println!("\n-- sweep, TFLOP/s (1-encoder timing) --");
     print!("{:<26}", "shape");
-    for (tm, tn, dbl, uq) in variants {
+    for (tm, tn, dbl, uq, pb) in variants {
         print!(
             " {:>10}",
             format!(
-                "{tm}x{tn}{}{}",
+                "{tm}x{tn}{}{}{}",
                 if dbl { "D" } else { "" },
-                if uq { "U" } else { "" }
+                if uq { "U" } else { "" },
+                if pb { "P" } else { "" }
             )
         );
     }
     println!();
     for (name, m, k, n) in shapes {
         print!("{:<26}", name);
-        for (tm, tn, dbl, uq) in variants {
+        for (tm, tn, dbl, uq, pb) in variants {
             let mut s2 = seed.wrapping_add(1);
             seed = s2;
-            let b = setup(&gpu, tm, tn, dbl, uq, m, n, k, &mut s2)?;
+            let b = setup(&gpu, tm, tn, dbl, uq, pb, m, n, k, &mut s2)?;
             let ms = b.time(iters)?;
             let tf = 2.0 * m as f64 * n as f64 * k as f64 / 1e12 / (ms / 1000.0);
             print!(" {:>10.2}", tf);

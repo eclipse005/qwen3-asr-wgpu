@@ -2032,20 +2032,50 @@ fn prefill_gemm_impl(
         }
         t
     };
+    // ---- B tile row permutation -------------------------------------------
+    //
+    // The compute loop reads `Bs[(tx * TN + j) * PAD + q]`, so for a fixed `j`
+    // the sixteen `tx` lanes of a warp stride `TN * PAD = 8 * 17 = 136` words.
+    // `136 mod 32 = 8`, so those lanes land on banks `{0, 8, 16, 24}` -- four
+    // banks for sixteen lanes, a **4-way shared-memory conflict** costing four
+    // LDS cycles per load.  A k-step issues 8 B loads and 64 FMAs, i.e. 32
+    // banks-cycles of shared traffic against 16 issue cycles for the FMAs
+    // (4 warps/SM/clock): shared memory, not FLOPs, set the rate.
+    //
+    // No padding fixes it: `8 * PAD mod 32` is always a multiple of 8, so the
+    // sixteen lanes can never reach more than four banks.  Permuting the tile
+    // does.  Value `B[n0 + 8*tx + j]` is stored in slot `16*j + tx` instead of
+    // slot `8*tx + j`, and the compute read becomes
+    // `Bs[(16*j + tx) * PAD + q]`.  `16 * 17 = 272 mod 32 = 16` moves `j` in
+    // whole sixteen-word blocks while `tx` walks `17*tx mod 32` -- sixteen
+    // distinct banks.  The store's row `v = ty + 16e` therefore goes to slot
+    // `16*(v % tn) + v / tn` -- powers of two, so it folds to a mask and a shift.
+    //
+    // Each thread still reads the same eight values, still accumulates them in
+    // the same order, and issues the same FMAs: bit-identical by construction.
+    // `gemm_bench`'s `P` column prices it at +10% to +29% per shape.
+    let bslot = |e: usize| -> String {
+        format!(
+            "(16u * ((ty + {off}u) % {tn}u) + (ty + {off}u) / {tn}u)",
+            off = e * 16
+        )
+    };
     let load_bs = |kx: &str| -> String {
         let mut t = String::new();
         if !transb {
             for e in 0..n_bs {
                 t.push_str(&format!(
-                    "  Bs[(ty + {}u) * PAD + tx] = halve(W[wb + (gd.row0 + n0 + ty + {}u) * kk + ({kx} + tx) / 2u], (tx & 1u) == 1u);\n",
-                    e * 16, e * 16
+                    "  Bs[{slot} * PAD + tx] = halve(W[wb + (gd.row0 + n0 + ty + {row}u) * kk + ({kx} + tx) / 2u], (tx & 1u) == 1u);\n",
+                    slot = bslot(e),
+                    row = e * 16
                 ));
             }
         } else {
             for e in 0..n_bs {
                 t.push_str(&format!(
-                    "  Bs[(ty + {}u) * PAD + tx] = halve(W[wb + (gd.row0 + {kx} + tx) * (gd.n / 2u) + (n0 + ty + {}u) / 2u], ((n0 + ty + {}u) & 1u) == 1u);\n",
-                    e * 16, e * 16, e * 16
+                    "  Bs[{slot} * PAD + tx] = halve(W[wb + (gd.row0 + {kx} + tx) * (gd.n / 2u) + (n0 + ty + {row}u) / 2u], ((n0 + ty + {row}u) & 1u) == 1u);\n",
+                    slot = bslot(e),
+                    row = e * 16
                 ));
             }
         }
@@ -2105,8 +2135,8 @@ fn prefill_gemm_impl(
                 "(tx & 1u) == 1u".to_string()
             };
             t.push_str(&format!(
-                "   Bs[(ty + {}u) * PAD + tx] = halve(pfb{e}, {sel});\n",
-                e * 16
+                "   Bs[{slot} * PAD + tx] = halve(pfb{e}, {sel});\n",
+                slot = bslot(e)
             ));
         }
         t
@@ -2118,7 +2148,9 @@ fn prefill_gemm_impl(
             t.push_str(&format!("   let a{i} = As[(ty * {tm}u + {i}u) * PAD + q];\n"));
         }
         for j in 0..tn {
-            t.push_str(&format!("   let b{j} = Bs[(tx * {tn}u + {j}u) * PAD + q];\n"));
+            t.push_str(&format!(
+                "   let b{j} = Bs[(16u * {j}u + tx) * PAD + q];\n"
+            ));
         }
         for i in 0..tm {
             for j in 0..tn {
