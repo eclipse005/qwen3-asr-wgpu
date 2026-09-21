@@ -1325,6 +1325,210 @@ fn gqa_split_p1(@builtin(workgroup_id) wgid: vec3<u32>,
     )
 }
 
+/// [`gqa_decode_split_p1`] with the `REP` q heads that share a kv head computed
+/// together, so each K/V element is read once instead of once per q head.
+///
+/// The KV read is the whole cost of this stage — its measured marginal price
+/// scales linearly with `cur_len` (0 us/layer at a 250-token context, 66 at
+/// 1340, 122 at 2600) — and GQA makes `REP` of those reads redundant: with
+/// `nqh = 16`, `nkvh = 8`, every kv head is fetched twice.  Here one workgroup
+/// covers a `(kv_head, chunk)` pair and thread `lid` computes *both* q heads'
+/// dot products from the one K row it loaded, then both weighted-V sums from the
+/// one V element it loaded.
+///
+/// Bit-identical to the per-q-head kernel: each head keeps its own score array,
+/// its own 256-wide reduction tree (the two trees run side by side in one pass,
+/// indices `0..256` for the first head and `256..512` for the second, so each
+/// half sees exactly the same sequence of ops), and the same per-head key and
+/// dim strides.  Only the number of workgroups changes: `nkvh` instead of `nqh`
+/// per chunk, each doing `REP` heads' worth of work.
+pub fn gqa_decode_split_p1_pair(d: usize, chunk: usize, rep: usize) -> String {
+    assert_eq!(d % 2, 0);
+    assert_eq!(rep, 2, "paired split handles exactly the 2 q heads of a kv head");
+    let t_split = 256 / d;
+    assert!(t_split >= 1);
+    format!(
+        "{HALF_AT}
+{EXP_BT}
+struct Cfg {{ cur_len: u32, max_seq: u32, scale: f32, n_chunks: u32 }};
+
+@group(0) @binding(0) var<storage, read>       Q4:   array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read>       KC4:  array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read>       VC:   array<u32>;
+@group(0) @binding(3) var<storage, read_write> POut: array<f32>;
+@group(0) @binding(4) var<storage, read_write> PMax: array<f32>;
+@group(0) @binding(5) var<storage, read_write> PSum: array<f32>;
+@group(0) @binding(6) var<uniform>             cfg:  Cfg;
+
+const D: u32 = {d}u;
+const D2: u32 = {d2}u;
+const D4: u32 = {d4}u;
+const CHUNK: u32 = {chunk}u;
+const BS: u32 = 256u;
+const T_SPLIT: u32 = {t_split}u;
+
+var<workgroup> sc_a:    array<f32, {chunk}u>;
+var<workgroup> sc_b:    array<f32, {chunk}u>;
+var<workgroup> pa:      array<f32, {d} * {t_split}u>;
+var<workgroup> pb:      array<f32, {d} * {t_split}u>;
+var<workgroup> red_max: array<f32, 512u>;
+var<workgroup> red_sum: array<f32, 512u>;
+
+@compute @workgroup_size(256)
+fn gqa_split_p1_pair(@builtin(workgroup_id) wgid: vec3<u32>,
+                     @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let kh = wgid.x;
+    let by = wgid.y;
+    let qa4 = (kh * 2u) * D2 >> 2u;
+    let qb4 = (kh * 2u + 1u) * D2 >> 2u;
+    let kbase = kh * cfg.max_seq * D2;
+    let t_start = by * CHUNK;
+    let mi_a = (kh * 2u) * cfg.n_chunks + by;
+    let mi_b = (kh * 2u + 1u) * cfg.n_chunks + by;
+
+    if (t_start >= cfg.cur_len) {{
+        if (lid.x == 0u) {{
+            PMax[mi_a] = bitcast<f32>(0xFF800000u);
+            PSum[mi_a] = 0.0;
+            PMax[mi_b] = bitcast<f32>(0xFF800000u);
+            PSum[mi_b] = 0.0;
+        }}
+        if (lid.x < D) {{
+            POut[mi_a * D + lid.x] = 0.0;
+            POut[mi_b * D + lid.x] = 0.0;
+        }}
+        return;
+    }}
+    let chunk_len = min(CHUNK, cfg.cur_len - t_start);
+
+    // Stage 1 — both heads' scores from one K row read per key.
+    for (var t = lid.x; t < chunk_len; t = t + BS) {{
+        var da = 0.0;
+        var db = 0.0;
+        let row4 = (kbase + (t_start + t) * D2) >> 2u;
+        for (var j4 = 0u; j4 < D4; j4 = j4 + 1u) {{
+            let kv = KC4[row4 + j4];
+            let k0 = unpack2x16float(kv.x);
+            let k1 = unpack2x16float(kv.y);
+            let k2 = unpack2x16float(kv.z);
+            let k3 = unpack2x16float(kv.w);
+            let qa = Q4[qa4 + j4];
+            let a0 = unpack2x16float(qa.x);
+            let a1 = unpack2x16float(qa.y);
+            let a2 = unpack2x16float(qa.z);
+            let a3 = unpack2x16float(qa.w);
+            da = da + (a0.x * k0.x + a0.y * k0.y);
+            da = da + (a1.x * k1.x + a1.y * k1.y);
+            da = da + (a2.x * k2.x + a2.y * k2.y);
+            da = da + (a3.x * k3.x + a3.y * k3.y);
+            let qb = Q4[qb4 + j4];
+            let b0 = unpack2x16float(qb.x);
+            let b1 = unpack2x16float(qb.y);
+            let b2 = unpack2x16float(qb.z);
+            let b3 = unpack2x16float(qb.w);
+            db = db + (b0.x * k0.x + b0.y * k0.y);
+            db = db + (b1.x * k1.x + b1.y * k1.y);
+            db = db + (b2.x * k2.x + b2.y * k2.y);
+            db = db + (b3.x * k3.x + b3.y * k3.y);
+        }}
+        sc_a[t] = da * cfg.scale;
+        sc_b[t] = db * cfg.scale;
+    }}
+    workgroupBarrier();
+
+    // Stage 2 — both chunk maxima, two independent 256-wide trees in one pass.
+    var lmax_a = bitcast<f32>(0xFF800000u);
+    var lmax_b = bitcast<f32>(0xFF800000u);
+    for (var t = lid.x; t < chunk_len; t = t + BS) {{
+        if (sc_a[t] > lmax_a) {{ lmax_a = sc_a[t]; }}
+        if (sc_b[t] > lmax_b) {{ lmax_b = sc_b[t]; }}
+    }}
+    red_max[lid.x] = lmax_a;
+    red_max[256u + lid.x] = lmax_b;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {{
+        if (lid.x < s) {{
+            red_max[lid.x] = max(red_max[lid.x], red_max[lid.x + s]);
+            red_max[256u + lid.x] = max(red_max[256u + lid.x], red_max[256u + lid.x + s]);
+        }}
+        workgroupBarrier();
+    }}
+    let max_a = red_max[0];
+    let max_b = red_max[256u];
+    workgroupBarrier();
+
+    // Stage 3 — exp + sum, same per-head tree shape.
+    var lsum_a = 0.0;
+    var lsum_b = 0.0;
+    for (var t = lid.x; t < chunk_len; t = t + BS) {{
+        let ea = expf_bt(sc_a[t] - max_a);
+        let eb = expf_bt(sc_b[t] - max_b);
+        sc_a[t] = ea;
+        sc_b[t] = eb;
+        lsum_a = lsum_a + ea;
+        lsum_b = lsum_b + eb;
+    }}
+    red_sum[lid.x] = lsum_a;
+    red_sum[256u + lid.x] = lsum_b;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {{
+        if (lid.x < s) {{
+            red_sum[lid.x] = red_sum[lid.x] + red_sum[lid.x + s];
+            red_sum[256u + lid.x] = red_sum[256u + lid.x] + red_sum[256u + lid.x + s];
+        }}
+        workgroupBarrier();
+    }}
+    let sum_a = red_sum[0];
+    let sum_b = red_sum[256u];
+    workgroupBarrier();
+
+    // Stage 4 — both numerators from one V element read per (key, dim pair).
+    let jp = lid.x % D2;
+    let t_idx = lid.x / D2;
+    if (t_idx < T_SPLIT) {{
+        var a0 = 0.0;
+        var a1 = 0.0;
+        var b0 = 0.0;
+        var b1 = 0.0;
+        for (var t = t_idx; t < chunk_len; t = t + T_SPLIT) {{
+            let row = kbase + (t_start + t) * D2;
+            let v = unpack2x16float(VC[row + jp]);
+            a0 = a0 + sc_a[t] * v.x;
+            a1 = a1 + sc_a[t] * v.y;
+            b0 = b0 + sc_b[t] * v.x;
+            b1 = b1 + sc_b[t] * v.y;
+        }}
+        pa[t_idx * D + jp * 2u] = a0;
+        pa[t_idx * D + jp * 2u + 1u] = a1;
+        pb[t_idx * D + jp * 2u] = b0;
+        pb[t_idx * D + jp * 2u + 1u] = b1;
+    }}
+    workgroupBarrier();
+
+    if (lid.x < D) {{
+        var acc_a = 0.0;
+        var acc_b = 0.0;
+        for (var ti = 0u; ti < T_SPLIT; ti = ti + 1u) {{
+            acc_a = acc_a + pa[ti * D + lid.x];
+            acc_b = acc_b + pb[ti * D + lid.x];
+        }}
+        POut[mi_a * D + lid.x] = acc_a;
+        POut[mi_b * D + lid.x] = acc_b;
+    }}
+    if (lid.x == 0u) {{
+        PMax[mi_a] = max_a;
+        PSum[mi_a] = sum_a;
+        PMax[mi_b] = max_b;
+        PSum[mi_b] = sum_b;
+    }}
+}}
+",
+        d2 = d / 2,
+        d4 = d / 8,
+        t_split = t_split,
+    )
+}
+
 /// `fused_gqa_decode_split_p2_f16` — merge phase: online-softmax correction
 /// across chunks.  One workgroup per q_head, one thread per f16 word.
 pub fn gqa_split_merge(d: usize) -> String {

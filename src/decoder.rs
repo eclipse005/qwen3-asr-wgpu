@@ -312,6 +312,9 @@ struct Pipes {
     gqa256: wgpu::ComputePipeline,
     gqa512: wgpu::ComputePipeline,
      gqa_split128: wgpu::ComputePipeline,
+    /// Same phase with the REP q heads that share a kv head done in one pass.
+    gqa_split_pair256: wgpu::ComputePipeline,
+    gqa_split_pair512: wgpu::ComputePipeline,
     gqa_split256: wgpu::ComputePipeline,
     gqa_split512: wgpu::ComputePipeline,
     gqa_merge: wgpu::ComputePipeline,
@@ -427,6 +430,27 @@ fn slab_path(s: usize) -> bool {
 /// `nh x ceil(cur_len/chunk)`) and how many partials the merge dispatch has to
 /// combine.  `QASR_GQA_CHUNK` pins it to one of the two built kernels so the
 /// granularity can be A/B'd from a single binary.
+/// Source for the paired split kernel, falling back to the per-q-head one when
+/// the config does not have exactly two q heads per kv head.  The paired kernel
+/// assumes `REP == 2`; anything else keeps the old (correct, just 2x the KV
+/// traffic) path so a different checkpoint cannot silently break.
+fn pair_split_src(nqh: usize, nkvh: usize, hd: usize, chunk: usize) -> String {
+    if nqh / nkvh == 2 {
+        shaders::gqa_decode_split_p1_pair(hd, chunk, 2)
+    } else {
+        shaders::gqa_decode_split_p1(nqh, nkvh, hd, chunk)
+    }
+}
+
+/// Entry point matching [`pair_split_src`].
+fn pair_split_entry(nqh: usize, nkvh: usize) -> &'static str {
+    if nqh / nkvh == 2 {
+        "gqa_split_p1_pair"
+    } else {
+        "gqa_split_p1"
+    }
+}
+
 fn gqa_split_chunk(cur_len: usize) -> usize {
     static FORCED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let forced = *FORCED.get_or_init(|| {
@@ -570,6 +594,8 @@ impl WgpuTextDecoder {
             gqa256: build("gqa256", &shaders::gqa_decode_single(nqh, nkvh, hd, 256, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl))?,
             gqa512: build("gqa512", &shaders::gqa_decode_single(nqh, nkvh, hd, 512, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl))?,
             gqa_split128: build("gqa_split128", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 128), "gqa_split_p1", Some(&split_pl))?,
+            gqa_split_pair256: build("gqa_split_pair256", &pair_split_src(nqh, nkvh, hd, 256), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
+            gqa_split_pair512: build("gqa_split_pair512", &pair_split_src(nqh, nkvh, hd, 512), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
             gqa_split256: build("gqa_split256", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 256), "gqa_split_p1", Some(&split_pl))?,
             gqa_split512: build("gqa_split512", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 512), "gqa_split_p1", Some(&split_pl))?,
             gqa_merge: build("gqa_merge", &shaders::gqa_split_merge(hd), "gqa_merge", None)?,
@@ -1122,19 +1148,42 @@ impl WgpuTextDecoder {
             cp.dispatch_workgroups(self.cfg.num_attention_heads as u32, 1, 1);
             return;
         }
-        let chunk = gqa_split_chunk(cur_len) as u32;
+        // The paired kernel covers both q heads of a kv head per workgroup, so
+        // its grid is `nkvh` wide and it has no 128-wide build.
+        // `QASR_GQA_PAIR=0` forces the per-q-head kernel so the two can be A/B'd
+        // from one binary.
+        // `REP == 2` is what makes the pair-named pipeline the paired kernel (see
+        // `pair_split_src`); `QASR_GQA_PAIR=0` forces the per-q-head kernel so
+        // the two can be A/B'd from one binary.
+        let paired = self.cfg.num_attention_heads == 2 * self.cfg.num_key_value_heads
+            && !matches!(
+                std::env::var("QASR_GQA_PAIR").unwrap_or_default().to_ascii_lowercase().as_str(),
+                "0" | "off" | "no"
+            );
+        let chunk = if paired {
+            gqa_split_chunk(cur_len).max(256)
+        } else {
+            gqa_split_chunk(cur_len)
+        } as u32;
         let n_chunks = (cur_len as u32).div_ceil(chunk);
-        let split = match chunk {
-            128 => &self.pipes.gqa_split128,
-            512 => &self.pipes.gqa_split512,
-            _ => &self.pipes.gqa_split256,
+        let split = match (paired, chunk) {
+            (true, 512) => &self.pipes.gqa_split_pair512,
+            (true, _) => &self.pipes.gqa_split_pair256,
+            (false, 128) => &self.pipes.gqa_split128,
+            (false, 512) => &self.pipes.gqa_split512,
+            (false, _) => &self.pipes.gqa_split256,
         };
+        let split_x = if paired {
+            self.cfg.num_key_value_heads
+        } else {
+            self.cfg.num_attention_heads
+        } as u32;
         let dup = std::env::var("QASR_DUP").unwrap_or_default();
         cp.set_pipeline(split);
         cp.set_bind_group(0, &l.bg_gqa_split, &[]);
-        cp.dispatch_workgroups(self.cfg.num_attention_heads as u32, n_chunks, 1);
+        cp.dispatch_workgroups(split_x, n_chunks, 1);
         if dup == "gqa_p1" {
-            cp.dispatch_workgroups(self.cfg.num_attention_heads as u32, n_chunks, 1);
+            cp.dispatch_workgroups(split_x, n_chunks, 1);
         }
         cp.set_pipeline(&self.pipes.gqa_merge);
         cp.set_bind_group(0, &l.bg_gqa_merge, &[]);
