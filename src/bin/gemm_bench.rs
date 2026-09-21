@@ -716,7 +716,7 @@ fn main() -> Result<()> {
     // `m2304 k1024 n4096` is a multiple of 256 in both m and n, so it is the one
     // row where a BM/BN = 256 variant is not paying padding for its tile and the
     // tile *shapes* can be compared without that confound.
-    let shapes: [(&str, usize, usize, usize); 10] = [
+    let shapes: [(&str, usize, usize, usize); 11] = [
         ("gate m384 k1024 n4096", 384, 1024, 4096),
         ("gate m2304 k1024 n4096", 2304, 1024, 4096),
         ("gu   m384 k1024 n6144", 384, 1024, 6144),
@@ -727,6 +727,11 @@ fn main() -> Result<()> {
         ("enc fc1 m1170 k896 n3584", 1170, 896, 3584),
         ("enc fc2 m1170 k3584 n896", 1170, 3584, 896),
         ("conv m512 k4320 n480", 512, 4320, 480),
+        // The conv stem's *real* dispatch: A is the weight, so m = c_out = 512,
+        // and B is the im2col operand [k][n_all] with n_all = 6400, i.e. a 50x4
+        // grid.  The row above models n = 480, which is the transposed view and
+        // a different amount of grid.
+        ("conv real m512 k4320 n6400", 512, 4320, 6400),
     ];
     let iters = 20u32;
     println!("\n-- sweep, TFLOP/s (1-encoder timing) --");
