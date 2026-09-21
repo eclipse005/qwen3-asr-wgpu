@@ -1747,6 +1747,13 @@ impl GpuAudioEncoder {
         rows: usize,
         name: &str,
     ) {
+        // `QASR_ENC_SKIP=ln` had no effect until this guard existed: the skip
+        // instrument returned "0.0%, MATCH" for a dispatch it never dropped,
+        // which reads exactly like a free op.  Every `dup_dispatch` name that is
+        // supposed to be priceable needs one of these beside it.
+        if enc_skip(name) {
+            return;
+        }
         let mut u: [u8; 32] = [0; 32];
         u[0..4].copy_from_slice(&(self.d_model as u32).to_le_bytes());
         u[4..8].copy_from_slice(&ln.eps.to_le_bytes());
