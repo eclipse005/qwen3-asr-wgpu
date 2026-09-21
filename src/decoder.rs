@@ -438,12 +438,32 @@ fn slab_path(s: usize) -> bool {
 /// the config does not have exactly two q heads per kv head.  The paired kernel
 /// assumes `REP == 2`; anything else keeps the old (correct, just 2x the KV
 /// traffic) path so a different checkpoint cannot silently break.
-fn pair_split_src(nqh: usize, nkvh: usize, hd: usize, chunk: usize) -> String {
+fn pair_split_src(nqh: usize, nkvh: usize, hd: usize, chunk: usize, row0: bool, coop: bool) -> String {
     if nqh / nkvh == 2 {
-        shaders::gqa_decode_split_p1_pair(hd, chunk, 2, false)
+        shaders::gqa_decode_split_p1_pair(hd, chunk, 2, row0, coop)
     } else {
         shaders::gqa_decode_split_p1(nqh, nkvh, hd, chunk)
     }
+}
+
+/// Builds the warp-cooperative stage 1 instead of the per-lane-row one.
+///
+/// **Off by default, and it must stay that way.**  It is correct arithmetic and
+/// MATCHes all six 0.6 B fixtures, but it re-associates the dot product (an
+/// 8-lane xor tree instead of the serial chain) and that flips a token on
+/// `1.7B / 90s_en` — so it fails the transcript gate and is not a legal default.
+/// It is kept behind the switch because it is half of the measurement that
+/// located attention's cost: it buys +1.3% where removing the K traffic entirely
+/// buys 69%, which is what rules out traffic and lines and points at load
+/// latency.  `QASR_GQA_COOP=1` opts in.
+fn gqa_coop() -> bool {
+    static COOP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *COOP.get_or_init(|| {
+        matches!(
+            std::env::var("QASR_GQA_COOP").unwrap_or_default().to_ascii_lowercase().as_str(),
+            "1" | "on" | "yes"
+        )
+    })
 }
 
 /// Entry point matching [`pair_split_src`].
@@ -598,9 +618,9 @@ impl WgpuTextDecoder {
             gqa256: build("gqa256", &shaders::gqa_decode_single(nqh, nkvh, hd, 256, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl))?,
             gqa512: build("gqa512", &shaders::gqa_decode_single(nqh, nkvh, hd, 512, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl))?,
             gqa_split128: build("gqa_split128", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 128), "gqa_split_p1", Some(&split_pl))?,
-            gqa_split_pair256: build("gqa_split_pair256", &pair_split_src(nqh, nkvh, hd, 256), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
-            gqa_split_pair512: build("gqa_split_pair512", &pair_split_src(nqh, nkvh, hd, 512), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
-            gqa_split_pair256_row0: build("gqa_split_pair256_row0", &shaders::gqa_decode_split_p1_pair(hd, 256, 2, true), "gqa_split_p1_pair", Some(&split_pl))?,
+            gqa_split_pair256: build("gqa_split_pair256", &pair_split_src(nqh, nkvh, hd, 256, false, subgroup && gqa_coop()), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
+            gqa_split_pair512: build("gqa_split_pair512", &pair_split_src(nqh, nkvh, hd, 512, false, subgroup && gqa_coop()), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
+            gqa_split_pair256_row0: build("gqa_split_pair256_row0", &shaders::gqa_decode_split_p1_pair(hd, 256, 2, true, false), "gqa_split_p1_pair", Some(&split_pl))?,
             gqa_split256: build("gqa_split256", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 256), "gqa_split_p1", Some(&split_pl))?,
             gqa_split512: build("gqa_split512", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 512), "gqa_split_p1", Some(&split_pl))?,
             gqa_merge: build("gqa_merge", &shaders::gqa_split_merge(hd), "gqa_merge", None)?,

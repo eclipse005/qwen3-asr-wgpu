@@ -1344,7 +1344,7 @@ fn gqa_split_p1(@builtin(workgroup_id) wgid: vec3<u32>,
 /// half sees exactly the same sequence of ops), and the same per-head key and
 /// dim strides.  Only the number of workgroups changes: `nkvh` instead of `nqh`
 /// per chunk, each doing `REP` heads' worth of work.
-pub fn gqa_decode_split_p1_pair(d: usize, chunk: usize, rep: usize, row0: bool) -> String {
+pub fn gqa_decode_split_p1_pair(d: usize, chunk: usize, rep: usize, row0: bool, coop: bool) -> String {
     assert_eq!(d % 2, 0);
     assert_eq!(rep, 2, "paired split handles exactly the 2 q heads of a kv head");
     let t_split = 256 / d;
@@ -1355,6 +1355,120 @@ pub fn gqa_decode_split_p1_pair(d: usize, chunk: usize, rep: usize, row0: bool) 
     // "the loads cost", the question the paired kernel (+1.0%) and the
     // accumulator depth (flat) between them could not settle.
     let krow_expr = if row0 { "0u" } else { "row4" };
+    // `coop` is the fix that probe implies: a group of 8 lanes walks one key's
+    // 256 B row together, each lane taking two `vec4`, then a 3-round xor tree
+    // folds the eight partial dots.  A warp then covers four *contiguous* rows
+    // per instruction instead of 32 scattered ones -- 4 cache lines instead of
+    // 32 -- and the warp-instruction count per key is unchanged (`16.5` either
+    // way: the serial form spends its extra lanes re-loading the same Q vector
+    // 32 times over, which is what the cooperative form saves).  Requires
+    // `subgroupShuffleXor`, i.e. `Features::SUBGROUP`.
+    assert!(!(row0 && coop), "row0 is the serial diagnostic");
+    let s1: String = if coop {
+        let mut t = String::new();
+        t.push_str(
+            "        let lg = lid.x / 8u;\n\
+             \x20       let li = lid.x % 8u;\n\
+             \x20       let j0 = li * 2u;\n\
+             \x20       let niter = (chunk_len + 31u) / 32u;\n\
+             \x20       for (var it = 0u; it < niter; it = it + 1u) {\n\
+             \x20           let t = lg + it * 32u;\n\
+             \x20           let live = t < chunk_len;\n\
+             \x20           let tt = select(0u, t, live);\n\
+             \x20           let row4 = (kbase + (t_start + tt) * D2) >> 2u;\n\
+             \x20           let kv0 = KC4[row4 + j0];\n\
+             \x20           let kv1 = KC4[row4 + j0 + 1u];\n\
+             \x20           let qa0 = Q4[qa4 + j0];\n\
+             \x20           let qa1 = Q4[qa4 + j0 + 1u];\n\
+             \x20           let qb0 = Q4[qb4 + j0];\n\
+             \x20           let qb1 = Q4[qb4 + j0 + 1u];\n\
+             \x20           var sa = 0.0;\n\
+             \x20           var sb = 0.0;\n",
+        );
+        for (w, kv, qv, acc) in [("0", "kv0", "qa0", "sa"), ("1", "kv1", "qa1", "sa")] {
+            for j in 0..4 {
+                let f = ['x', 'y', 'z', 'w'][j];
+                t.push_str(&format!(
+                    "            let k{w}_{j} = unpack2x16float({kv}.{f});\n"
+                ));
+                t.push_str(&format!(
+                    "            let a{w}_{j} = unpack2x16float({qv}.{f});\n"
+                ));
+                t.push_str(&format!(
+                    "            {acc} = {acc} + (a{w}_{j}.x * k{w}_{j}.x + a{w}_{j}.y * k{w}_{j}.y);\n"
+                ));
+            }
+        }
+        // head B reuses the K values loaded for head A
+        for (w, qv) in [("0", "qb0"), ("1", "qb1")] {
+            for j in 0..4 {
+                let f = ['x', 'y', 'z', 'w'][j];
+                t.push_str(&format!(
+                    "            let b{w}_{j} = unpack2x16float({qv}.{f});\n"
+                ));
+                t.push_str(&format!(
+                    "            sb = sb + (b{w}_{j}.x * k{w}_{j}.x + b{w}_{j}.y * k{w}_{j}.y);\n"
+                ));
+            }
+        }
+        t.push_str(
+            "            sa = sa + subgroupShuffleXor(sa, 1u);\n\
+             \x20           sa = sa + subgroupShuffleXor(sa, 2u);\n\
+             \x20           sa = sa + subgroupShuffleXor(sa, 4u);\n\
+             \x20           sb = sb + subgroupShuffleXor(sb, 1u);\n\
+             \x20           sb = sb + subgroupShuffleXor(sb, 2u);\n\
+             \x20           sb = sb + subgroupShuffleXor(sb, 4u);\n\
+             \x20           if (live && li == 0u) {\n\
+             \x20               sc_a[t] = sa * cfg.scale;\n\
+             \x20               sc_b[t] = sb * cfg.scale;\n\
+             \x20           }\n\
+             \x20       }\n",
+        );
+        t
+    } else {
+        let mut t = String::new();
+        t.push_str(
+            "        for (var t = lid.x; t < chunk_len; t = t + BS) {\n\
+             \x20       var da = 0.0;\n\
+             \x20       var db = 0.0;\n\
+             \x20       let row4 = (kbase + (t_start + t) * D2) >> 2u;\n\
+             \x20       for (var j4 = 0u; j4 < D4; j4 = j4 + 1u) {\n",
+        );
+        t.push_str(&format!("            let kv = KC4[{krow_expr} + j4];\n"));
+        for j in 0..4 {
+            t.push_str(&format!(
+                "            let k{j} = unpack2x16float(kv.{});\n",
+                ['x', 'y', 'z', 'w'][j]
+            ));
+        }
+        t.push_str("            let qa = Q4[qa4 + j4];\n");
+        for j in 0..4 {
+            t.push_str(&format!(
+                "            let a{j} = unpack2x16float(qa.{});\n",
+                ['x', 'y', 'z', 'w'][j]
+            ));
+        }
+        for j in 0..4 {
+            t.push_str(&format!("            da = da + (a{j}.x * k{j}.x + a{j}.y * k{j}.y);\n"));
+        }
+        t.push_str("            let qb = Q4[qb4 + j4];\n");
+        for j in 0..4 {
+            t.push_str(&format!(
+                "            let b{j} = unpack2x16float(qb.{});\n",
+                ['x', 'y', 'z', 'w'][j]
+            ));
+        }
+        for j in 0..4 {
+            t.push_str(&format!("            db = db + (b{j}.x * k{j}.x + b{j}.y * k{j}.y);\n"));
+        }
+        t.push_str(
+            "        }\n\
+             \x20       sc_a[t] = da * cfg.scale;\n\
+             \x20       sc_b[t] = db * cfg.scale;\n\
+             \x20       }\n",
+        );
+        t
+    };
     format!(
         "{HALF_AT}
 {EXP_BT}
@@ -1409,40 +1523,10 @@ fn gqa_split_p1_pair(@builtin(workgroup_id) wgid: vec3<u32>,
     }}
     let chunk_len = min(CHUNK, cfg.cur_len - t_start);
 
-    // Stage 1 — both heads' scores from one K row read per key.
-    for (var t = lid.x; t < chunk_len; t = t + BS) {{
-        var da = 0.0;
-        var db = 0.0;
-        let row4 = (kbase + (t_start + t) * D2) >> 2u;
-        for (var j4 = 0u; j4 < D4; j4 = j4 + 1u) {{
-            let kv = KC4[{krow} + j4];
-            let k0 = unpack2x16float(kv.x);
-            let k1 = unpack2x16float(kv.y);
-            let k2 = unpack2x16float(kv.z);
-            let k3 = unpack2x16float(kv.w);
-            let qa = Q4[qa4 + j4];
-            let a0 = unpack2x16float(qa.x);
-            let a1 = unpack2x16float(qa.y);
-            let a2 = unpack2x16float(qa.z);
-            let a3 = unpack2x16float(qa.w);
-            da = da + (a0.x * k0.x + a0.y * k0.y);
-            da = da + (a1.x * k1.x + a1.y * k1.y);
-            da = da + (a2.x * k2.x + a2.y * k2.y);
-            da = da + (a3.x * k3.x + a3.y * k3.y);
-            let qb = Q4[qb4 + j4];
-            let b0 = unpack2x16float(qb.x);
-            let b1 = unpack2x16float(qb.y);
-            let b2 = unpack2x16float(qb.z);
-            let b3 = unpack2x16float(qb.w);
-            db = db + (b0.x * k0.x + b0.y * k0.y);
-            db = db + (b1.x * k1.x + b1.y * k1.y);
-            db = db + (b2.x * k2.x + b2.y * k2.y);
-            db = db + (b3.x * k3.x + b3.y * k3.y);
-        }}
-        sc_a[t] = da * cfg.scale;
-        sc_b[t] = db * cfg.scale;
-    }}
-    workgroupBarrier();
+    // Stage 1 — both heads' scores from one K row read per key.  The body is
+    // generated: the serial form walks one key per lane, the cooperative form
+    // walks one key per 8-lane group (see `s1` above).
+{s1}    workgroupBarrier();
 
     // Stage 2 — both chunk maxima, two independent 256-wide trees in one pass.
     var lmax_a = bitcast<f32>(0xFF800000u);
@@ -1534,7 +1618,7 @@ fn gqa_split_p1_pair(@builtin(workgroup_id) wgid: vec3<u32>,
         d2 = d / 2,
         d4 = d / 8,
         t_split = t_split,
-        krow = krow_expr,
+        s1 = s1,
     )
 }
 
