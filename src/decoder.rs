@@ -424,6 +424,33 @@ const SLAB_BS: usize = 256;
 
 const MAX_SLAB: usize = 16;
 
+/// Slab (bounded-row) tiled prefill attention, or the flat one.
+///
+/// The two differ in the row width the causal softmax walks: the flat path's is
+/// `np/2` words and grows with the prefill, the slab path's is fixed at
+/// `slab_t/2 = 512`.  So the crossover is structural at `np/2 = 512`, i.e.
+/// `s ~ 900`, and the slab path is the *faster* one above it.  Interleaved A/B,
+/// 0.6B, 3 reps, every arm MATCH, prefill ms:
+///
+/// | s | flat | slab | |
+/// |---|---|---|---|
+/// | 195 | 145 | 158 | +9.0% |
+/// | 407 | 266 | 287 | +7.9% |
+/// | 1185 | 720 | **678** | -5.8% |
+/// | 2307 | 1541 | **1510** | -2.0% |
+///
+/// **And it is not a legal default.**  Lowering this threshold to match the
+/// crossover was measured on the full gate and the gate rejected it:
+/// `1.7B / 180s_zh` MISMATCH (every 0.6B fixture and `1.7B / 180s_en` MATCH, so
+/// it is the same signature as `QASR_GQA_COOP`).  The slab softmax is an online
+/// one -- per-slab (max, sum) then a rescaled merge -- so its rounding is not
+/// the flat path's, and that is inherent to it rather than a bug to fix.
+///
+/// Which leaves a hole worth naming: **`s > 4096` is the default and it is
+/// ungated.**  No fixture is that long, so the slab path's numerics have never
+/// been checked against `python-hf` anywhere it is actually used.  The threshold
+/// stays at 4096 until either the slab path is made to agree or a long fixture
+/// exists; do not lower it to collect the 42 ms.
 fn slab_path(s: usize) -> bool {
     match std::env::var("QASR_SLAB").unwrap_or_default().to_ascii_lowercase().as_str() {
         "1" | "on" | "yes" | "force" => true,
