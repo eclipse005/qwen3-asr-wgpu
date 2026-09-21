@@ -442,12 +442,48 @@ fn slab_path(s: usize) -> bool {
 /// the config does not have exactly two q heads per kv head.  The paired kernel
 /// assumes `REP == 2`; anything else keeps the old (correct, just 2x the KV
 /// traffic) path so a different checkpoint cannot silently break.
-fn pair_split_src(nqh: usize, nkvh: usize, hd: usize, chunk: usize, row0: bool, coop: bool, pf: bool, coal: bool) -> String {
+fn pair_split_src(nqh: usize, nkvh: usize, hd: usize, chunk: usize, row0: bool, coop: bool, pf: bool, coal: bool, depth: usize) -> String {
     if nqh / nkvh == 2 {
-        shaders::gqa_decode_split_p1_pair(hd, chunk, 2, row0, coop, pf, coal)
+        shaders::gqa_decode_split_p1_pair(hd, chunk, 2, row0, coop, pf, coal, depth)
     } else {
         shaders::gqa_decode_split_p1(nqh, nkvh, hd, chunk)
     }
+}
+
+/// How many K-row words stage 1 issues before consuming any of them.
+///
+/// **Default 1, i.e. the shipped `QASR_GQA_PF` form, and that is the engine's
+/// verdict, not a placeholder.**  `attn_bench` said unrolling the window was
+/// worth a great deal in isolation -- at a 2560-token context, chunk 512,
+/// stage 1 measured 96.4 us/layer with one word of slack, 54.8 with four and
+/// 55.4 with eight, and the L1-resident and coalesced arms of the same probe
+/// bracket that as most of the kernel's cost.  Built into the engine and
+/// A/B'd interleaved on 0.6B / 180 s_en (3 reps, all arms MATCH), it is a
+/// consistent *loss*:
+///
+/// | depth | decode ms | vs depth 1 |
+/// |---|---|---|
+/// | 1 (shipped) | 5692 / 5698 / 5708 | -- |
+/// | 2 | 5793 | +1.5% |
+/// | 4 | 5783 | +1.6% |
+/// | 8 | 5799 | +1.8% |
+///
+/// Flat in the window width and never positive, so it is a fixed cost (register
+/// pressure / scheduling), not a missing-MLP effect: the probe's absolute
+/// calibration does not survive the trip into the real kernel, where stage 1
+/// sits next to stages 2-4 and the whole layer's state.  The switch is kept so
+/// the negative result can be re-checked rather than re-derived, and the probe
+/// is kept as an instrument -- but the probe's stage-1 numbers must not be
+/// quoted as engine costs.
+fn gqa_depth() -> usize {
+    static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        std::env::var("QASR_GQA_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| (1..=16).contains(v))
+            .unwrap_or(1)
+    })
 }
 
 /// Builds the warp-cooperative stage 1 instead of the per-lane-row one.
@@ -638,10 +674,10 @@ impl WgpuTextDecoder {
             gqa256: build("gqa256", &shaders::gqa_decode_single(nqh, nkvh, hd, 256, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl))?,
             gqa512: build("gqa512", &shaders::gqa_decode_single(nqh, nkvh, hd, 512, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl))?,
             gqa_split128: build("gqa_split128", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 128), "gqa_split_p1", Some(&split_pl))?,
-            gqa_split_pair256: build("gqa_split_pair256", &pair_split_src(nqh, nkvh, hd, 256, false, subgroup && gqa_coop(), gqa_pf(), false), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
-            gqa_split_pair512: build("gqa_split_pair512", &pair_split_src(nqh, nkvh, hd, 512, false, subgroup && gqa_coop(), gqa_pf(), false), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
-            gqa_split_pair256_row0: build("gqa_split_pair256_row0", &shaders::gqa_decode_split_p1_pair(hd, 256, 2, true, false, false, false), "gqa_split_p1_pair", Some(&split_pl))?,
-            gqa_split_pair256_coal: build("gqa_split_pair256_coal", &shaders::gqa_decode_split_p1_pair(hd, 256, 2, false, false, false, true), "gqa_split_p1_pair", Some(&split_pl))?,
+            gqa_split_pair256: build("gqa_split_pair256", &pair_split_src(nqh, nkvh, hd, 256, false, subgroup && gqa_coop(), gqa_pf(), false, gqa_depth()), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
+            gqa_split_pair512: build("gqa_split_pair512", &pair_split_src(nqh, nkvh, hd, 512, false, subgroup && gqa_coop(), gqa_pf(), false, gqa_depth()), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
+            gqa_split_pair256_row0: build("gqa_split_pair256_row0", &shaders::gqa_decode_split_p1_pair(hd, 256, 2, true, false, false, false, 1), "gqa_split_p1_pair", Some(&split_pl))?,
+            gqa_split_pair256_coal: build("gqa_split_pair256_coal", &shaders::gqa_decode_split_p1_pair(hd, 256, 2, false, false, false, true, 1), "gqa_split_p1_pair", Some(&split_pl))?,
             gqa_split256: build("gqa_split256", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 256), "gqa_split_p1", Some(&split_pl))?,
             gqa_split512: build("gqa_split512", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 512), "gqa_split_p1", Some(&split_pl))?,
             gqa_merge: build("gqa_merge", &shaders::gqa_split_merge(hd), "gqa_merge", None)?,

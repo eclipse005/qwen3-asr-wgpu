@@ -1352,6 +1352,7 @@ pub fn gqa_decode_split_p1_pair(
     coop: bool,
     pf: bool,
     coal: bool,
+    depth: usize,
 ) -> String {
     assert_eq!(d % 2, 0);
     assert_eq!(rep, 2, "paired split handles exactly the 2 q heads of a kv head");
@@ -1377,6 +1378,17 @@ pub fn gqa_decode_split_p1_pair(
         "((row4 >> 4u) << 4u) + j4 * 32u + (lid.x & 31u)".to_string()
     } else {
         "row4 + j4".to_string()
+    };
+    // The same three address forms with the loop index baked in, for the
+    // unrolled window below.
+    let kv_at = |j: usize| -> String {
+        if row0 {
+            format!("{j}u")
+        } else if coal {
+            format!("((row4 >> 4u) << 4u) + {j}u * 32u + (lid.x & 31u)")
+        } else {
+            format!("row4 + {j}u")
+        }
     };
     // `coop` is the fix that probe implies: a group of 8 lanes walks one key's
     // 256 B row together, each lane taking two `vec4`, then a 3-round xor tree
@@ -1450,6 +1462,70 @@ pub fn gqa_decode_split_p1_pair(
         t
     } else {
         let mut t = String::new();
+        if depth > 1 {
+            // The load window.  `depth` K-row words are issued *before* any of
+            // them is consumed, then the identical add sequence replays in the
+            // original order -- same operands, same association, only when the
+            // fetch happens moves.  The `pf` form below leaves one word of
+            // slack; measured on `attn_bench` at a 2560-token context that is
+            // nowhere near enough (chunk 512: 96.4 us/layer with one word of
+            // slack, 54.8 with four, 55.4 with eight, 110 with sixteen -- the
+            // last one spills).
+            t.push_str(
+                "        for (var t = lid.x; t < chunk_len; t = t + BS) {\n\
+                 \x20       var da = 0.0;\n\
+                 \x20       var db = 0.0;\n\
+                 \x20       let row4 = (kbase + (t_start + t) * D2) >> 2u;\n",
+            );
+            let mut j0 = 0usize;
+            while j0 < 16 {
+                let n = depth.min(16 - j0);
+                t.push_str("        {\n");
+                for k in 0..n {
+                    let j = j0 + k;
+                    t.push_str(&format!("            let kv{j} = KC4[{}];\n", kv_at(j)));
+                }
+                for k in 0..n {
+                    let j = j0 + k;
+                    t.push_str("            {\n");
+                    t.push_str(&format!("            let qa = Q4[qa4 + {j}u];\n"));
+                    t.push_str(&format!("            let qb = Q4[qb4 + {j}u];\n"));
+                    for s in 0..4 {
+                        let f = ['x', 'y', 'z', 'w'][s];
+                        t.push_str(&format!(
+                            "            let k{j}_{s} = unpack2x16float(kv{j}.{f});\n"
+                        ));
+                        t.push_str(&format!(
+                            "            let a{j}_{s} = unpack2x16float(qa.{f});\n"
+                        ));
+                    }
+                    for s in 0..4 {
+                        t.push_str(&format!(
+                            "            da = da + (a{j}_{s}.x * k{j}_{s}.x + a{j}_{s}.y * k{j}_{s}.y);\n"
+                        ));
+                    }
+                    for s in 0..4 {
+                        let f = ['x', 'y', 'z', 'w'][s];
+                        t.push_str(&format!(
+                            "            let b{j}_{s} = unpack2x16float(qb.{f});\n"
+                        ));
+                    }
+                    for s in 0..4 {
+                        t.push_str(&format!(
+                            "            db = db + (b{j}_{s}.x * k{j}_{s}.x + b{j}_{s}.y * k{j}_{s}.y);\n"
+                        ));
+                    }
+                    t.push_str("            }\n");
+                }
+                t.push_str("        }\n");
+                j0 += n;
+            }
+            t.push_str(
+                "        sc_a[t] = da * cfg.scale;\n\
+                 \x20       sc_b[t] = db * cfg.scale;\n\
+                 \x20       }\n",
+            );
+        } else {
         if pf {
             // Same arithmetic, loads issued one word early: the FMA sequence and
             // every operand are untouched, only when the next `KC4`/`Q4` word is
@@ -1514,6 +1590,7 @@ pub fn gqa_decode_split_p1_pair(
              \x20       sc_b[t] = db * cfg.scale;\n\
              \x20       }\n",
         );
+        }
         t
     };
     format!(

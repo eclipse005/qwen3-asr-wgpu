@@ -25,6 +25,21 @@ pub fn conv_tile() -> usize {
 
 const TAP_OOB: u32 = shaders::TAP_OOB;
 
+/// `QASR_ENC_TRACE`: split the encoder into its conv stem, its transformer and
+/// its host-side mel packing, and print the conv geometry.
+///
+/// The phase line in `transcribe` reports the encoder as one number, which hid
+/// the fact that the *conv stem* is 42% of it (0.6B / 90 s_en: conv 221 ms,
+/// transformer 303 ms for 1170 tokens).  Both halves are compute-bound and they
+/// run at very different rates: the conv does ~397 GFLOP (level 2 alone is 299
+/// -- its GEMM has k = 4320) at **1.80 TFLOP/s**, the same as the decoder's
+/// prefill, while the transformer's ~314 GFLOP at **1.04 TFLOP/s** would need
+/// only 167 ms at that rate.  So the encoder's headroom is not in the conv.
+fn enc_trace() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var("QASR_ENC_TRACE").is_ok())
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GDims {
@@ -682,6 +697,20 @@ impl GpuAudioEncoder {
              ffn {inter}, out {out_dim}, chunk {cs} -> {tpc} tok, wlen {wlen}",
             planes.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("/"),
         );
+        if enc_trace() {
+            // Geometry, because the conv stem's cost is not the transformer's and
+            // its GEMMs have very different shapes from the decoder's.
+            for (i, c) in conv.iter().enumerate() {
+                eprintln!(
+                    "enc geom c{}: plane {}x{} c_in {} c_out {} k {} k_pad {} m_pad {}",
+                    i + 1, c.h_in, c.w_in, c.c_in, c.c_out, c.k, c.k_pad, c.m_pad
+                );
+            }
+            eprintln!(
+                "enc geom conv_out: k {} n {} | s_pad would be align(n_total, {GEMM_BM})",
+                conv_out.k, conv_out.n
+            );
+        }
 
         let gemm_layout = gemm_layout(gpu, "enc_gemm", 3, &[2]);
         let gemm_bias_layout = gemm_bias_layout(gpu, "enc_gemm_bias", &[2]);
@@ -911,6 +940,7 @@ impl GpuAudioEncoder {
         }
 
         let mut out = Capture::default();
+        let t_conv = std::time::Instant::now();
 
         let mut ch0 = 0usize;
         while ch0 < n_chunks {
@@ -953,6 +983,12 @@ impl GpuAudioEncoder {
         if capture {
             out.h = read_f16_buf(gpu, &h_buf, s_pad * dm)?;
         }
+        // Phase split under `QASR_ENC_TRACE`: the conv rounds each end in a
+        // submit + wait-for-idle, the whole transformer is one command buffer,
+        // and the readback is the third piece.  `t_all` mixes them, which is
+        // why the encoder's rate was never compared against its own GEMM.
+        let conv_ms = t_conv.elapsed().as_secs_f64() * 1000.0;
+        let t_xf = std::time::Instant::now();
 
         self.mid_capture.set(capture);
         self.gd_slot.set(0);
@@ -1039,6 +1075,13 @@ impl GpuAudioEncoder {
         gpu.device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| anyhow::anyhow!("audio encoder: device lost at readback: {e:?}"))?;
+        let xf_ms = t_xf.elapsed().as_secs_f64() * 1000.0;
+        if enc_trace() {
+            eprintln!(
+                "enc trace: tokens={n_total} conv={conv_ms:.1}ms xf={xf_ms:.1}ms pack={:.2}ms",
+                t_pack.as_secs_f64() * 1000.0
+            );
+        }
 
         let read_f16 = |buf: &wgpu::Buffer, n: usize| -> Result<Vec<f16>> {
             let bytes = gpu.readback(buf, (n * 2) as u64)?;

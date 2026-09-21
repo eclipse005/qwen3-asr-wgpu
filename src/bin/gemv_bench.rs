@@ -466,8 +466,56 @@ fn main() -> Result<()> {
             Ok(t0.elapsed().as_secs_f64() * 1000.0 / iters as f64)
         };
 
+        // Every alternative shares one explicit pipeline layout.  With
+        // `None` each pipeline gets its *own* auto layout, and wgpu then
+        // rejects a bind group built from another pipeline's layout
+        // ("Exclusive pipelines don't match"), so the `chain_alt` probe below
+        // was silently dispatching only half its work and reporting an
+        // impossible 0.5-2.0 us/dispatch.  The measurement was invalid, not
+        // just implausible.
+        let bgl = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gemv_bench"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let gl = gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("gemv_bench"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+
         let src = shaders::gemv(rows, cols, false, false, 8);
-        let pipe_p = gpu.pipeline("prod", &src, "gemv", None)?;
+        let pipe_p = gpu.pipeline("prod", &src, "gemv", Some(&gl))?;
         let bg_p = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("prod"),
             layout: &pipe_p.get_bind_group_layout(0),
@@ -482,7 +530,7 @@ fn main() -> Result<()> {
         let src4 = UNROLL4_WGSL
             .replace("{kg}u", &format!("{kg}u"))
             .replace("{tiles}u", &format!("{tiles}u"));
-        let pipe_u = gpu.pipeline("unroll4", &src4, "gemv", None)?;
+        let pipe_u = gpu.pipeline("unroll4", &src4, "gemv", Some(&gl))?;
         let bg_u = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("unroll4"),
             layout: &pipe_u.get_bind_group_layout(0),
@@ -499,7 +547,7 @@ fn main() -> Result<()> {
             .replace("{tiles}u", &format!("{tiles}u"))
             .replace("{xw2}u", &format!("{}u", cols / 4))
             .replace("{xw}u", &format!("{}u", cols / 8));
-        let pipe_s = gpu.pipeline("xsmem", &srcs, "gemv", None)?;
+        let pipe_s = gpu.pipeline("xsmem", &srcs, "gemv", Some(&gl))?;
         let bg_s = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("xsmem"),
             layout: &pipe_s.get_bind_group_layout(0),
@@ -514,7 +562,7 @@ fn main() -> Result<()> {
         let src2 = ROWS2_WGSL
             .replace("{kg}u", &format!("{kg}u"))
             .replace("{tiles}u", &format!("{tiles}u"));
-        let pipe_2 = gpu.pipeline("rows2", &src2, "gemv", None)?;
+        let pipe_2 = gpu.pipeline("rows2", &src2, "gemv", Some(&gl))?;
         let bg_2 = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rows2"),
             layout: &pipe_2.get_bind_group_layout(0),
@@ -528,7 +576,7 @@ fn main() -> Result<()> {
 
         let splits = 2usize;
         let srcs = shaders::gemv_split(rows, cols, false, splits);
-        let pipe_sp = gpu.pipeline("gemv_split", &srcs, "gemv", None)?;
+        let pipe_sp = gpu.pipeline("gemv_split", &srcs, "gemv", Some(&gl))?;
         let ngran = cols / 8 / 32 / splits;
         let _ = ngran;
         let p_buf = gpu.storage("p_partial", (rows * splits * 4) as u64);
