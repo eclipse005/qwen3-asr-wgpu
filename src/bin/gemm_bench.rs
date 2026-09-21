@@ -394,12 +394,21 @@ fn main() -> Result<()> {
         }
     }
 
-    let shapes: [(&str, usize, usize, usize); 5] = [
+    // (name, m, k, n).  The last four are the encoder transformer's exact shapes,
+    // which the `QASR_ENC_DUP` ablation found running at 1.17-1.65 TFLOP/s in the
+    // engine; the first five are the decoder prefill's, at ~1.9.  Same question
+    // as `attn_bench`: is the encoder's rate a property of the shape, or of the
+    // engine's dispatch of it?
+    let shapes: [(&str, usize, usize, usize); 9] = [
         ("gate m384 k1024 n4096", 384, 1024, 4096),
         ("gate m2304 k1024 n4096", 2304, 1024, 4096),
         ("gu   m384 k1024 n6144", 384, 1024, 6144),
         ("dp   m384 k3072 n1024", 384, 3072, 1024),
         ("o    m384 k2048 n1024", 384, 2048, 1024),
+        ("enc qkv m1170 k896 n2688", 1170, 896, 2688),
+        ("enc o   m1170 k896 n896", 1170, 896, 896),
+        ("enc fc1 m1170 k896 n3584", 1170, 896, 3584),
+        ("enc fc2 m1170 k3584 n896", 1170, 3584, 896),
     ];
     let iters = 20u32;
     println!("\n-- sweep, TFLOP/s (1-encoder timing) --");

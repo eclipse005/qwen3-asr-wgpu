@@ -1244,10 +1244,12 @@ impl GpuAudioEncoder {
         let wlen = geom.wlen;
 
         self.layernorm(gpu, enc, ctx.h, &l.sln, ctx.normed, s, "ln");
-        self.gemm(
-            gpu, enc, ctx.normed, &l.qkv.w, ctx.qkv, s, l.qkv.n_pad, l.qkv.k, l.qkv.n_pad,
-            Some(&l.qkv.bias), "qkv",
-        );
+        if !enc_skip("qkv") {
+            self.gemm(
+                gpu, enc, ctx.normed, &l.qkv.w, ctx.qkv, s, l.qkv.n_pad, l.qkv.k, l.qkv.n_pad,
+                Some(&l.qkv.bias), "qkv",
+            );
+        }
         {
             let bg = mkbg(gpu, wgpu::BindGroupDescriptor {
                 label: Some("enc.extract"),
@@ -1351,7 +1353,9 @@ impl GpuAudioEncoder {
             cp.set_bind_group(0, &bg, &[]);
             dup_dispatch(&mut cp, "attnflat", (ctx.s_pad * ctx.acols / 2).div_ceil(256) as u32, 1, 1);
         }
-        self.gemm_beta(gpu, enc, ctx.attn_flat, &l.o.w, ctx.h, s, l.o.n_pad, l.o.k, dm, Some(&l.o.bias), "o");
+        if !enc_skip("o") {
+            self.gemm_beta(gpu, enc, ctx.attn_flat, &l.o.w, ctx.h, s, l.o.n_pad, l.o.k, dm, Some(&l.o.bias), "o");
+        }
         if self.mid_capture.get() && li == 0 {
             let cb = std::mem::replace(enc, gpu.device.create_command_encoder(&Default::default()));
             gpu.queue.submit([cb.finish()]);
@@ -1361,12 +1365,16 @@ impl GpuAudioEncoder {
             *self.mid_h.borrow_mut() = Some(read_f16_buf(gpu, ctx.h, ctx.s_pad * dm)?);
         }
         self.layernorm(gpu, enc, ctx.h, &l.fln, ctx.norm2, s, "ln");
-        self.gemm(gpu, enc, ctx.norm2, &l.fc1.w, ctx.gu, s, l.fc1.n_pad, l.fc1.k, l.fc1.n_pad, None, "fc1");
+        if !enc_skip("fc1") {
+            self.gemm(gpu, enc, ctx.norm2, &l.fc1.w, ctx.gu, s, l.fc1.n_pad, l.fc1.k, l.fc1.n_pad, None, "fc1");
+        }
         self.bias_gelu_tensor(
             gpu, enc, ctx.gu, &l.fc1.bias, ctx.act, &self.u_sc[3],
             ctx.s_pad * l.fc1.n_pad, l.fc1.n_pad / 2, false, "gelu",
         );
-        self.gemm_beta(gpu, enc, ctx.act, &l.fc2.w, ctx.h, s, l.fc2.n_pad, l.fc2.k, dm, Some(&l.fc2.bias), "fc2");
+        if !enc_skip("fc2") {
+            self.gemm_beta(gpu, enc, ctx.act, &l.fc2.w, ctx.h, s, l.fc2.n_pad, l.fc2.k, dm, Some(&l.fc2.bias), "fc2");
+        }
         Ok(())
     }
 
@@ -1811,6 +1819,19 @@ impl Drop for PassGuard {
 fn enc_dup(name: &str) -> bool {
     static WANT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let want = WANT.get_or_init(|| std::env::var("QASR_ENC_DUP").unwrap_or_default());
+    !want.is_empty() && want == name
+}
+
+/// `QASR_ENC_SKIP=<op>`: drop the named op's dispatch entirely.
+///
+/// Where `QASR_ENC_DUP` gives a *marginal* price, this gives an exact one, and
+/// for the encoder it is safe to read: the token count comes from the audio, not
+/// from the values, so `xf` stays comparable even with garbage activations.
+/// That is what makes it possible to check the engine's GEMM rate against
+/// `gemm_bench` at the same shapes instead of against its own marginal.
+fn enc_skip(name: &str) -> bool {
+    static WANT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let want = WANT.get_or_init(|| std::env::var("QASR_ENC_SKIP").unwrap_or_default());
     !want.is_empty() && want == name
 }
 
