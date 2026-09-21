@@ -2686,26 +2686,40 @@ pub fn audio_layernorm() -> String {
 @group(0) @binding(3) var<uniform>             cfg: LnCfg;
 @group(0) @binding(4) var<storage, read_write> Dst: array<u32>;
 
-fn half_at(v: vec2<f32>, i: u32) -> f32 { return select(v.x, v.y, (i & 1u) == 1u); }
-
-@compute @workgroup_size(1)
-fn layernorm(@builtin(workgroup_id) wid: vec3<u32>) {
+@compute @workgroup_size(32)
+fn layernorm(@builtin(workgroup_id) wid: vec3<u32>,
+             @builtin(local_invocation_id) lid: vec3<u32>) {
+    // One row per lane, 32 rows per warp.
+    //
+    // This used to be `@workgroup_size(1)` -- one thread walking a whole 896-wide
+    // row through three serial passes, so a warp instruction drove one lane and
+    // an SM was pinned at its 32-workgroup ceiling, i.e. 32 one-lane warps.  The
+    // per-row arithmetic and its order are *untouched*: each lane still walks its
+    // own row, element by element, in the same sequence.  Only the lane mapping
+    // changes.  Measured +45.1 ms of a 302 ms transformer, 1.3 GB/s.
     let d = cfg.d;
-    let base = wid.x * (d / 2u);
+    let base = (wid.x * 32u + lid.x) * (d / 2u);
     var mean = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) {
-        mean = mean + half_at(unpack2x16float(Src[base + j / 2u]), j);
+    // Word-at-a-time instead of element-at-a-time: the old loop re-read and
+    // re-unpacked the same `Src` word for the even and the odd element it holds.
+    // `x` then `y` is the same accumulation order the element loop had.
+    for (var w: u32 = 0u; w < d / 2u; w = w + 1u) {
+        let s = unpack2x16float(Src[base + w]);
+        mean = mean + s.x;
+        mean = mean + s.y;
     }
     mean = mean / f32(d);
     var var_ = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) {
-        let x = half_at(unpack2x16float(Src[base + j / 2u]), j) - mean;
+    for (var w: u32 = 0u; w < d / 2u; w = w + 1u) {
+        let s = unpack2x16float(Src[base + w]);
+        let x = s.x - mean;
+        let y = s.y - mean;
         var_ = var_ + x * x;
+        var_ = var_ + y * y;
     }
     var_ = var_ / f32(d);
     let inv = 1.0 / sqrt(var_ + cfg.eps);
     for (var w: u32 = 0u; w < d / 2u; w = w + 1u) {
-        let j = w * 2u;
         let s = unpack2x16float(Src[base + w]);
         let g = unpack2x16float(Wgt[w]);
         let b = unpack2x16float(Bia[w]);
@@ -2741,20 +2755,22 @@ pub fn audio_extract_qkv() -> String {
 
 @compute @workgroup_size(256)
 fn extract(@builtin(global_invocation_id) gid: vec3<u32>) {
-    // gid = (token, head, word inside the head).  The head is its own grid axis
-    // rather than folded into x: `s_pad · nh` exceeds wgpu's 65535-per-dimension
-    // limit at ~6 minutes of audio, and the dispatch was rejected outright.
-    let hd2 = cfg.hd / 2u;
-    let tok = gid.x;
+    // gid = (word of a token's q/k/v slice, token).  The token is on `y` and the
+    // word on `x` so adjacent lanes read adjacent words; with the token on `x`
+    // every warp load was 32 lanes at a `3*dm/2`-word stride -- 32 cache lines
+    // for 128 B of use, each line re-fetched once per word that fell in it.
+    // Measured +30.1 ms of a 302 ms transformer, 11.7 GB/s against a 289 GB/s
+    // roof.  `s_pad` alone cannot exceed 65535, so the `s_pad * nh` limit this
+    // used to work around no longer exists.
+    let acols2 = cfg.attn_cols / 2u;
+    let col = gid.x;
+    if (col >= acols2) { return; }
+    let tok = gid.y;
     if (tok >= cfg.n_tokens) { return; }
-    let head = gid.y;
-    let w = gid.z;
-    if (w >= hd2) { return; }
 
     let dm2 = cfg.dm / 2u;
     let row = tok * (dm2 * 3u);
-    let col = head * hd2 + w;
-    let dst = tok * (cfg.attn_cols / 2u) + col;
+    let dst = tok * acols2 + col;
 
     // No positional embedding here: the reference adds it to the *conv_out
     // output* (`audio_add_pe`), and adding it twice is not the reference's math.
