@@ -1344,7 +1344,14 @@ fn gqa_split_p1(@builtin(workgroup_id) wgid: vec3<u32>,
 /// half sees exactly the same sequence of ops), and the same per-head key and
 /// dim strides.  Only the number of workgroups changes: `nkvh` instead of `nqh`
 /// per chunk, each doing `REP` heads' worth of work.
-pub fn gqa_decode_split_p1_pair(d: usize, chunk: usize, rep: usize, row0: bool, coop: bool) -> String {
+pub fn gqa_decode_split_p1_pair(
+    d: usize,
+    chunk: usize,
+    rep: usize,
+    row0: bool,
+    coop: bool,
+    pf: bool,
+) -> String {
     assert_eq!(d % 2, 0);
     assert_eq!(rep, 2, "paired split handles exactly the 2 q heads of a kv head");
     let t_split = 256 / d;
@@ -1427,21 +1434,46 @@ pub fn gqa_decode_split_p1_pair(d: usize, chunk: usize, rep: usize, row0: bool, 
         t
     } else {
         let mut t = String::new();
-        t.push_str(
-            "        for (var t = lid.x; t < chunk_len; t = t + BS) {\n\
-             \x20       var da = 0.0;\n\
-             \x20       var db = 0.0;\n\
-             \x20       let row4 = (kbase + (t_start + t) * D2) >> 2u;\n\
-             \x20       for (var j4 = 0u; j4 < D4; j4 = j4 + 1u) {\n",
-        );
-        t.push_str(&format!("            let kv = KC4[{krow_expr} + j4];\n"));
+        if pf {
+            // Same arithmetic, loads issued one word early: the FMA sequence and
+            // every operand are untouched, only when the next `KC4`/`Q4` word is
+            // fetched moves.  If load latency is what costs, this is the cheapest
+            // bit-identical way to give it something to overlap with.
+            t.push_str(
+                "        for (var t = lid.x; t < chunk_len; t = t + BS) {\n\
+                 \x20       var da = 0.0;\n\
+                 \x20       var db = 0.0;\n\
+                 \x20       let row4 = (kbase + (t_start + t) * D2) >> 2u;\n\
+                 \x20       var kp = KC4[row4];\n\
+                 \x20       var qap = Q4[qa4];\n\
+                 \x20       var qbp = Q4[qb4];\n\
+                 \x20       for (var j4 = 0u; j4 < D4; j4 = j4 + 1u) {\n\
+                 \x20           let kv = kp;\n\
+                 \x20           let qa = qap;\n\
+                 \x20           let qb = qbp;\n\
+                 \x20           let jn = min(j4 + 1u, D4 - 1u);\n\
+                 \x20           kp = KC4[row4 + jn];\n\
+                 \x20           qap = Q4[qa4 + jn];\n\
+                 \x20           qbp = Q4[qb4 + jn];\n",
+            );
+        } else {
+            t.push_str(
+                "        for (var t = lid.x; t < chunk_len; t = t + BS) {\n\
+                 \x20       var da = 0.0;\n\
+                 \x20       var db = 0.0;\n\
+                 \x20       let row4 = (kbase + (t_start + t) * D2) >> 2u;\n\
+                 \x20       for (var j4 = 0u; j4 < D4; j4 = j4 + 1u) {\n",
+            );
+            t.push_str(&format!("            let kv = KC4[{krow_expr} + j4];\n"));
+            t.push_str("            let qa = Q4[qa4 + j4];\n");
+            t.push_str("            let qb = Q4[qb4 + j4];\n");
+        }
         for j in 0..4 {
             t.push_str(&format!(
                 "            let k{j} = unpack2x16float(kv.{});\n",
                 ['x', 'y', 'z', 'w'][j]
             ));
         }
-        t.push_str("            let qa = Q4[qa4 + j4];\n");
         for j in 0..4 {
             t.push_str(&format!(
                 "            let a{j} = unpack2x16float(qa.{});\n",
@@ -1451,7 +1483,6 @@ pub fn gqa_decode_split_p1_pair(d: usize, chunk: usize, rep: usize, row0: bool, 
         for j in 0..4 {
             t.push_str(&format!("            da = da + (a{j}.x * k{j}.x + a{j}.y * k{j}.y);\n"));
         }
-        t.push_str("            let qb = Q4[qb4 + j4];\n");
         for j in 0..4 {
             t.push_str(&format!(
                 "            let b{j} = unpack2x16float(qb.{});\n",

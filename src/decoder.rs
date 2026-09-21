@@ -438,9 +438,9 @@ fn slab_path(s: usize) -> bool {
 /// the config does not have exactly two q heads per kv head.  The paired kernel
 /// assumes `REP == 2`; anything else keeps the old (correct, just 2x the KV
 /// traffic) path so a different checkpoint cannot silently break.
-fn pair_split_src(nqh: usize, nkvh: usize, hd: usize, chunk: usize, row0: bool, coop: bool) -> String {
+fn pair_split_src(nqh: usize, nkvh: usize, hd: usize, chunk: usize, row0: bool, coop: bool, pf: bool) -> String {
     if nqh / nkvh == 2 {
-        shaders::gqa_decode_split_p1_pair(hd, chunk, 2, row0, coop)
+        shaders::gqa_decode_split_p1_pair(hd, chunk, 2, row0, coop, pf)
     } else {
         shaders::gqa_decode_split_p1(nqh, nkvh, hd, chunk)
     }
@@ -462,6 +462,22 @@ fn gqa_coop() -> bool {
         matches!(
             std::env::var("QASR_GQA_COOP").unwrap_or_default().to_ascii_lowercase().as_str(),
             "1" | "on" | "yes"
+        )
+    })
+}
+
+/// Stage 1 issues its `KC4`/`Q4` loads one word early.  The FMA sequence and
+/// every operand are unchanged, so this is bit-identical by construction -- it
+/// only tests whether load latency is what the kernel waits on, which is the one
+/// hypothesis the traffic/lines/chain/occupancy experiments left standing.
+/// Measured +0.9% (0.6B / 180 s_en, interleaved 3 reps) and gated 12/12, so it is
+/// on by default; `QASR_GQA_PF=0` turns it off.
+fn gqa_pf() -> bool {
+    static PF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PF.get_or_init(|| {
+        !matches!(
+            std::env::var("QASR_GQA_PF").unwrap_or_default().to_ascii_lowercase().as_str(),
+            "0" | "off" | "no"
         )
     })
 }
@@ -618,9 +634,9 @@ impl WgpuTextDecoder {
             gqa256: build("gqa256", &shaders::gqa_decode_single(nqh, nkvh, hd, 256, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl))?,
             gqa512: build("gqa512", &shaders::gqa_decode_single(nqh, nkvh, hd, 512, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl))?,
             gqa_split128: build("gqa_split128", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 128), "gqa_split_p1", Some(&split_pl))?,
-            gqa_split_pair256: build("gqa_split_pair256", &pair_split_src(nqh, nkvh, hd, 256, false, subgroup && gqa_coop()), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
-            gqa_split_pair512: build("gqa_split_pair512", &pair_split_src(nqh, nkvh, hd, 512, false, subgroup && gqa_coop()), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
-            gqa_split_pair256_row0: build("gqa_split_pair256_row0", &shaders::gqa_decode_split_p1_pair(hd, 256, 2, true, false), "gqa_split_p1_pair", Some(&split_pl))?,
+            gqa_split_pair256: build("gqa_split_pair256", &pair_split_src(nqh, nkvh, hd, 256, false, subgroup && gqa_coop(), gqa_pf()), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
+            gqa_split_pair512: build("gqa_split_pair512", &pair_split_src(nqh, nkvh, hd, 512, false, subgroup && gqa_coop(), gqa_pf()), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
+            gqa_split_pair256_row0: build("gqa_split_pair256_row0", &shaders::gqa_decode_split_p1_pair(hd, 256, 2, true, false, false), "gqa_split_p1_pair", Some(&split_pl))?,
             gqa_split256: build("gqa_split256", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 256), "gqa_split_p1", Some(&split_pl))?,
             gqa_split512: build("gqa_split512", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 512), "gqa_split_p1", Some(&split_pl))?,
             gqa_merge: build("gqa_merge", &shaders::gqa_split_merge(hd), "gqa_merge", None)?,
