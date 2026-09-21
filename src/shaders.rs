@@ -2189,6 +2189,26 @@ fn prefill_gemm_impl(
 /// bound is `p + 1 - row0` clamped at zero.  With `row0 = 0` the bound collapses
 /// to `min(p + 1, valid)` — the flat path is untouched.
 pub fn softmax_causal(bs: usize, subgroup: bool) -> String {
+    // Three rewrites of this kernel have been measured and reverted; do not
+    // re-derive them.
+    //
+    //   * word-at-a-time in the max/sum passes (the fix that paid in the audio
+    //     layer norm): +3 ms, 3 reps.
+    //   * `exp2(y * LOG2E)` for `exp(y)`: 719 against a 719 ms baseline.  This is
+    //     *not* evidence that the exp is cheap -- naga lowers `exp` to the same
+    //     instruction, so the rewrite was a no-op.  It is evidence that guessing
+    //     at this kernel from its instruction mix does not work.
+    //   * keeping stage 3's exp values in `var<workgroup>` for stage 4 to read
+    //     instead of recomputing: **683 ms (off) against 689 ms (on), 5 reps
+    //     interleaved, both arms MATCH** -- an smem round trip costs more than
+    //     the exp it saves.  That was the one with arithmetic behind it (two
+    //     exps per element over 11.2M element-visits per layer) and it was still
+    //     wrong.
+    //
+    // What *did* pay here was the barrier count: see `sg_reduce` in
+    // `decoder.rs`.  The lesson this kernel keeps teaching is that its cost is
+    // in latency -- barriers and the three global row reads -- and not in the
+    // arithmetic or the instruction count.
     // The two reduction trees cross warps above distance 32 and stay inside one
     // warp below it, so the last five levels (16, 8, 4, 2, 1) can be a shuffle
     // instead of five smem rounds plus five barriers.  Lane 0's accumulation is
