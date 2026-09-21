@@ -25,16 +25,27 @@ pub fn conv_tile() -> usize {
 
 const TAP_OOB: u32 = shaders::TAP_OOB;
 
+/// `audio_extract_qkv`'s `@workgroup_size`, mirrored here because the dispatch
+/// grid has to be divided by it.
+const ENC_EXTRACT_WG: usize = 256;
+
 /// `QASR_ENC_TRACE`: split the encoder into its conv stem, its transformer and
 /// its host-side mel packing, and print the conv geometry.
 ///
 /// The phase line in `transcribe` reports the encoder as one number, which hid
 /// the fact that the *conv stem* is 42% of it (0.6B / 90 s_en: conv 221 ms,
-/// transformer 303 ms for 1170 tokens).  Both halves are compute-bound and they
-/// run at very different rates: the conv does ~397 GFLOP (level 2 alone is 299
-/// -- its GEMM has k = 4320) at **1.80 TFLOP/s**, the same as the decoder's
-/// prefill, while the transformer's ~314 GFLOP at **1.04 TFLOP/s** would need
-/// only 167 ms at that rate.  So the encoder's headroom is not in the conv.
+/// transformer 304 ms for 1170 tokens).  Both halves are compute-bound and the
+/// conv is the faster one: it does ~397 GFLOP (level 2 alone is 299 -- its GEMM
+/// has k = 4320) at **1.80 TFLOP/s**, the same as the decoder's prefill, while
+/// the transformer's ~316 GFLOP takes ~302 ms of device time, **1.04 TFLOP/s**.
+/// So the encoder's headroom is not in the conv.
+///
+/// The trace also breaks the transformer's wall clock into the two blocking
+/// mid-loop `submit`+`poll` calls, compute-pass recording, `create_bind_group`
+/// and the device drain.  That split is the point: the first reading of this
+/// trace said "host encode 202 ms, device 102 ms" and was written up as
+/// host-bound before it was checked, when in fact 199.7 of those 202 ms are the
+/// host *blocked on the GPU* and the real host cost is ~2 ms.
 fn enc_trace() -> bool {
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *TRACE.get_or_init(|| std::env::var("QASR_ENC_TRACE").is_ok())
@@ -989,6 +1000,8 @@ impl GpuAudioEncoder {
         // why the encoder's rate was never compared against its own GEMM.
         let conv_ms = t_conv.elapsed().as_secs_f64() * 1000.0;
         let t_xf = std::time::Instant::now();
+        HOST_REC_US.store(0, Ordering::Relaxed);
+        HOST_WAIT_US.store(0, Ordering::Relaxed);
 
         self.mid_capture.set(capture);
         self.gd_slot.set(0);
@@ -1014,6 +1027,70 @@ impl GpuAudioEncoder {
             vp: &vp,
             attn_out: &attn_out,
         };
+        // These four uniforms are geometry-only: every layer writes the *same*
+        // bytes, so writing them once instead of 14 times is 56 fewer
+        // `queue.write_buffer` calls per encode.  Measured worth 2.4 ms of a
+        // 3900 ms run, i.e. nothing; kept because writing the same 32 bytes
+        // fourteen times is not a design, it is a habit.
+        {
+            let (wpad, hd_pad) = (align(wlen, GEMM_BM), align(hd, GEMM_BN));
+            gpu.queue.write_buffer(
+                &self.u_ex,
+                0,
+                bytemuck::bytes_of(&ExCfg {
+                    n_tokens: n_total as u32,
+                    nh: nh as u32,
+                    hd: hd as u32,
+                    tpc: self.tpc as u32,
+                    row_stride: (3 * dm) as u32,
+                    attn_cols: acols as u32,
+                    pe_stride: 0,
+                    dm: dm as u32,
+                }),
+            );
+            gpu.queue.write_buffer(
+                &self.u_wp,
+                0,
+                bytemuck::bytes_of(&WinCfg {
+                    wlen: wlen as u32,
+                    wpad: wpad as u32,
+                    hd: hd as u32,
+                    n_win: geom.n_win as u32,
+                    s: n_total as u32,
+                    acols: acols as u32,
+                    pad_n: hd_pad as u32,
+                    _a: 0,
+                }),
+            );
+            gpu.queue.write_buffer(
+                &self.u_sm,
+                0,
+                bytemuck::bytes_of(&SmCfg {
+                    s: n_total as u32,
+                    wlen: wlen as u32,
+                    wpad: wpad as u32,
+                    n_win: geom.n_win as u32,
+                    scale: 1.0 / (hd as f32).sqrt(),
+                    _a: 0,
+                    _b: 0,
+                    _c: 0,
+                }),
+            );
+            gpu.queue.write_buffer(
+                &self.u_cp,
+                0,
+                bytemuck::bytes_of(&CpCfg {
+                    cols: (nh * hd) as u32,
+                    wlen: wlen as u32,
+                    wpad: wpad as u32,
+                    hd: hd as u32,
+                    n_win: geom.n_win as u32,
+                    rows: n_total as u32,
+                    _a: 0,
+                    _b: 0,
+                }),
+            );
+        }
         for li in 0..self.layers.len() {
             self.layer(gpu, &mut enc, &ctx, li)?;
             if capture {
@@ -1052,10 +1129,19 @@ impl GpuAudioEncoder {
                 }
             }
             if !capture && (li + 1) % 6 == 0 && li + 1 < self.layers.len() {
+                // This submit blocks until the GPU has drained the six layers
+                // encoded so far, so the wall clock around `layer()` includes
+                // that GPU time.  Timed separately, or the "host encode"
+                // figure silently absorbs it.
+                let t_wait = std::time::Instant::now();
                 gpu.queue.submit([enc.finish()]);
                 gpu.device
                     .poll(wgpu::PollType::wait_indefinitely())
                     .map_err(|e| anyhow::anyhow!("audio encoder: device lost after layer {li}: {e:?}"))?;
+                HOST_WAIT_US.fetch_add(
+                    t_wait.elapsed().as_micros() as u64,
+                    Ordering::Relaxed,
+                );
                 enc = gpu.device.create_command_encoder(&Default::default());
             }
         }
@@ -1071,6 +1157,11 @@ impl GpuAudioEncoder {
         );
 
         anyhow::ensure!(self.gd_slot.get() <= MAX_GEMMS, "{} GEMM slots > {MAX_GEMMS}", self.gd_slot.get());
+        // `t_xf` is wall clock, so it covers *encoding* the 14 layers as well as
+        // running them.  Splitting the two answers whether the transformer is
+        // slow on the device or starved by the host: every layer writes ~13
+        // uniforms and creates ~13 bind groups inside this window.
+        let host_ms = t_xf.elapsed().as_secs_f64() * 1000.0;
         gpu.queue.submit([enc.finish()]);
         gpu.device
             .poll(wgpu::PollType::wait_indefinitely())
@@ -1078,7 +1169,12 @@ impl GpuAudioEncoder {
         let xf_ms = t_xf.elapsed().as_secs_f64() * 1000.0;
         if enc_trace() {
             eprintln!(
-                "enc trace: tokens={n_total} conv={conv_ms:.1}ms xf={xf_ms:.1}ms pack={:.2}ms",
+                "enc trace: tokens={n_total} conv={conv_ms:.1}ms xf={xf_ms:.1}ms \
+                 (host encode {host_ms:.1}: wait {:.1}, passes {:.1}, bg {:.1}, device {:.1}) pack={:.2}ms",
+                HOST_WAIT_US.load(Ordering::Relaxed) as f64 / 1000.0,
+                HOST_REC_US.load(Ordering::Relaxed) as f64 / 1000.0,
+                HOST_BUILD_US.load(Ordering::Relaxed) as f64 / 1000.0,
+                xf_ms - host_ms,
                 t_pack.as_secs_f64() * 1000.0
             );
         }
@@ -1153,21 +1249,7 @@ impl GpuAudioEncoder {
             Some(&l.qkv.bias),
         );
         {
-            gpu.queue.write_buffer(
-                &self.u_ex,
-                0,
-                bytemuck::bytes_of(&ExCfg {
-                    n_tokens: s as u32,
-                    nh: nh as u32,
-                    hd: hd as u32,
-                    tpc: self.tpc as u32,
-                    row_stride: (3 * dm) as u32,
-                    attn_cols: ctx.acols as u32,
-                    pe_stride: 0,
-                    dm: dm as u32,
-                }),
-            );
-            let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let bg = mkbg(gpu, wgpu::BindGroupDescriptor {
                 label: Some("enc.extract"),
                 layout: &self.p.extract.get_bind_group_layout(0),
                 entries: &[
@@ -1178,29 +1260,28 @@ impl GpuAudioEncoder {
                     wgpu::BindGroupEntry { binding: 5, resource: self.u_ex.as_entire_binding() },
                 ],
             });
+            let _pg = PassGuard::new();
             let mut cp = enc.begin_compute_pass(&Default::default());
             cp.set_pipeline(&self.p.extract);
             cp.set_bind_group(0, &bg, &[]);
-            cp.dispatch_workgroups(ctx.s_pad as u32, nh as u32, (hd / 2) as u32);
+            // `extract` maps `gid.x` to the token and is `@workgroup_size(256)`,
+            // so the x grid is in *workgroups*: dispatching `s_pad` of them
+            // launches 256x the invocations needed and every one outside the
+            // first `s_pad/256` workgroups returns on its `tok >= n_tokens`
+            // guard.  At 90 s_en that is 524 160 workgroups per layer of which
+            // 2 240 do anything -- 7.3M dead workgroups over the 14 layers.
+            // Same coverage, same values, same guards; only the dead launches
+            // go away.
+            cp.dispatch_workgroups(
+                ctx.s_pad.div_ceil(ENC_EXTRACT_WG) as u32,
+                nh as u32,
+                (hd / 2) as u32,
+            );
         }
         let (wpad, hd_pad) = (align(wlen, GEMM_BM), align(hd, GEMM_BN));
         let n_blocks = nh * geom.n_win;
         {
-            gpu.queue.write_buffer(
-                &self.u_wp,
-                0,
-                bytemuck::bytes_of(&WinCfg {
-                    wlen: wlen as u32,
-                    wpad: wpad as u32,
-                    hd: hd as u32,
-                    n_win: geom.n_win as u32,
-                    s: s as u32,
-                    acols: ctx.acols as u32,
-                    pad_n: hd_pad as u32,
-                    _a: 0,
-                }),
-            );
-            let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let bg = mkbg(gpu, wgpu::BindGroupDescriptor {
                 label: Some("enc.win_pack"),
                 layout: &self.p.win_pack.get_bind_group_layout(0),
                 entries: &[
@@ -1213,6 +1294,7 @@ impl GpuAudioEncoder {
                     wgpu::BindGroupEntry { binding: 6, resource: self.u_wp.as_entire_binding() },
                 ],
             });
+            let _pg = PassGuard::new();
             let mut cp = enc.begin_compute_pass(&Default::default());
             cp.set_pipeline(&self.p.win_pack);
             cp.set_bind_group(0, &bg, &[]);
@@ -1228,21 +1310,7 @@ impl GpuAudioEncoder {
             );
         }
         {
-            gpu.queue.write_buffer(
-                &self.u_sm,
-                0,
-                bytemuck::bytes_of(&SmCfg {
-                    s: s as u32,
-                    wlen: wlen as u32,
-                    wpad: wpad as u32,
-                    n_win: geom.n_win as u32,
-                    scale: 1.0 / (hd as f32).sqrt(),
-                    _a: 0,
-                    _b: 0,
-                    _c: 0,
-                }),
-            );
-            let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let bg = mkbg(gpu, wgpu::BindGroupDescriptor {
                 label: Some("enc.sm"),
                 layout: &self.p.softmax.get_bind_group_layout(0),
                 entries: &[
@@ -1251,6 +1319,7 @@ impl GpuAudioEncoder {
                     wgpu::BindGroupEntry { binding: 2, resource: self.u_sm.as_entire_binding() },
                 ],
             });
+            let _pg = PassGuard::new();
             let mut cp = enc.begin_compute_pass(&Default::default());
             cp.set_pipeline(&self.p.softmax);
             cp.set_bind_group(0, &bg, &[]);
@@ -1266,21 +1335,7 @@ impl GpuAudioEncoder {
             );
         }
         {
-            gpu.queue.write_buffer(
-                &self.u_cp,
-                0,
-                bytemuck::bytes_of(&CpCfg {
-                    cols: (nh * hd) as u32,
-                    wlen: wlen as u32,
-                    wpad: wpad as u32,
-                    hd: hd as u32,
-                    n_win: geom.n_win as u32,
-                    rows: s as u32,
-                    _a: 0,
-                    _b: 0,
-                }),
-            );
-            let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let bg = mkbg(gpu, wgpu::BindGroupDescriptor {
                 label: Some("enc.attn_flat"),
                 layout: &self.p.attn_flat.get_bind_group_layout(0),
                 entries: &[
@@ -1289,6 +1344,7 @@ impl GpuAudioEncoder {
                     wgpu::BindGroupEntry { binding: 2, resource: self.u_cp.as_entire_binding() },
                 ],
             });
+            let _pg = PassGuard::new();
             let mut cp = enc.begin_compute_pass(&Default::default());
             cp.set_pipeline(&self.p.attn_flat);
             cp.set_bind_group(0, &bg, &[]);
@@ -1343,7 +1399,7 @@ impl GpuAudioEncoder {
         c: &wgpu::Buffer,
         bias: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
-        gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        mkbg(gpu, wgpu::BindGroupDescriptor {
             label: Some("enc.gemm_bias"),
             layout: &pipe.get_bind_group_layout(0),
             entries: &[
@@ -1364,7 +1420,7 @@ impl GpuAudioEncoder {
     }
 
     fn gemm_bind(&self, gpu: &Gpu, pipe: &wgpu::ComputePipeline, a: &wgpu::Buffer, w: &wgpu::Buffer, c: &wgpu::Buffer) -> wgpu::BindGroup {
-        gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        mkbg(gpu, wgpu::BindGroupDescriptor {
             label: Some("enc.gemm"),
             layout: &pipe.get_bind_group_layout(0),
             entries: &[
@@ -1441,7 +1497,7 @@ impl GpuAudioEncoder {
                 _a: 0,
             }),
         );
-        let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bg = mkbg(gpu, wgpu::BindGroupDescriptor {
             label: Some("enc.im2col"),
             layout: &self.p.im2col.get_bind_group_layout(0),
             entries: &[
@@ -1451,6 +1507,7 @@ impl GpuAudioEncoder {
                 wgpu::BindGroupEntry { binding: 3, resource: self.u_im[level].as_entire_binding() },
             ],
         });
+        let _pg = PassGuard::new();
         let mut cp = enc.begin_compute_pass(&Default::default());
         cp.set_pipeline(&self.p.im2col);
         cp.set_bind_group(0, &bg, &[]);
@@ -1501,7 +1558,7 @@ impl GpuAudioEncoder {
                 n_tokens: n_total as u32,
             }),
         );
-        let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bg = mkbg(gpu, wgpu::BindGroupDescriptor {
             label: Some("enc.permute"),
             layout: &self.p.permute.get_bind_group_layout(0),
             entries: &[
@@ -1510,6 +1567,7 @@ impl GpuAudioEncoder {
                 wgpu::BindGroupEntry { binding: 2, resource: self.u_pm.as_entire_binding() },
             ],
         });
+        let _pg = PassGuard::new();
         let mut cp = enc.begin_compute_pass(&Default::default());
         cp.set_pipeline(&self.p.permute);
         cp.set_bind_group(0, &bg, &[]);
@@ -1530,7 +1588,7 @@ impl GpuAudioEncoder {
             0,
             bytemuck::bytes_of(&PeCfg { d: dm as u32, tpc: self.tpc as u32, s_pad: dm as u32, _a: 0 }),
         );
-        let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bg = mkbg(gpu, wgpu::BindGroupDescriptor {
             label: Some("enc.add_pe"),
             layout: &self.p.add_pe.get_bind_group_layout(0),
             entries: &[
@@ -1540,6 +1598,7 @@ impl GpuAudioEncoder {
                 wgpu::BindGroupEntry { binding: 3, resource: self.u_pe.as_entire_binding() },
             ],
         });
+        let _pg = PassGuard::new();
         let mut cp = enc.begin_compute_pass(&Default::default());
         cp.set_pipeline(&self.p.add_pe);
         cp.set_bind_group(0, &bg, &[]);
@@ -1613,6 +1672,7 @@ impl GpuAudioEncoder {
             Some(b) => self.gemm_bind_bias(gpu, pipe, a, w, c, b),
             None => self.gemm_bind(gpu, pipe, a, w, c),
         };
+        let _pg = PassGuard::new();
         let mut cp = enc.begin_compute_pass(&Default::default());
         cp.set_pipeline(pipe);
         cp.set_bind_group(0, &bg, &[(slot * 256) as u32]);
@@ -1643,7 +1703,7 @@ impl GpuAudioEncoder {
                 gx,
             }),
         );
-        let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bg = mkbg(gpu, wgpu::BindGroupDescriptor {
             label: Some("enc.gelu"),
             layout: &self.p.gelu.get_bind_group_layout(0),
             entries: &[
@@ -1653,6 +1713,7 @@ impl GpuAudioEncoder {
                 wgpu::BindGroupEntry { binding: 3, resource: sc.as_entire_binding() },
             ],
         });
+        let _pg = PassGuard::new();
         let mut cp = enc.begin_compute_pass(&Default::default());
         cp.set_pipeline(&self.p.gelu);
         cp.set_bind_group(0, &bg, &[]);
@@ -1672,7 +1733,7 @@ impl GpuAudioEncoder {
         u[0..4].copy_from_slice(&(self.d_model as u32).to_le_bytes());
         u[4..8].copy_from_slice(&ln.eps.to_le_bytes());
         gpu.upload(&self.u_ln, &u);
-        let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bg = mkbg(gpu, wgpu::BindGroupDescriptor {
             label: Some("enc.ln"),
             layout: &self.p.layernorm.get_bind_group_layout(0),
             entries: &[
@@ -1683,6 +1744,7 @@ impl GpuAudioEncoder {
                 wgpu::BindGroupEntry { binding: 4, resource: dst.as_entire_binding() },
             ],
         });
+        let _pg = PassGuard::new();
         let mut cp = enc.begin_compute_pass(&Default::default());
         cp.set_pipeline(&self.p.layernorm);
         cp.set_bind_group(0, &bg, &[]);
@@ -1690,8 +1752,46 @@ impl GpuAudioEncoder {
     }
 }
 
+/// Times `gpu.device.create_bind_group` into [`HOST_BUILD_US`], unless tracing
+/// is off.
+fn mkbg(gpu: &Gpu, d: wgpu::BindGroupDescriptor<'_>) -> wgpu::BindGroup {
+    if !enc_trace() {
+        return gpu.device.create_bind_group(&d);
+    }
+    let t = std::time::Instant::now();
+    let v = gpu.device.create_bind_group(&d);
+    HOST_BUILD_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    v
+}
+
+/// RAII: accumulates the enclosing compute pass (begin, record, end) into
+/// [`HOST_REC_US`].  Declared *before* the pass handle so it drops *after* it,
+/// which is what makes the span include the pass end.  Inert without
+/// `QASR_ENC_TRACE`.
+struct PassGuard(Option<std::time::Instant>);
+
+impl PassGuard {
+    fn new() -> Self {
+        Self(enc_trace().then(std::time::Instant::now))
+    }
+}
+
+impl Drop for PassGuard {
+    fn drop(&mut self) {
+        if let Some(t) = self.0 {
+            HOST_REC_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+    }
+}
 static ENC_MS: AtomicU64 = AtomicU64::new(0);
 static PACK_MS: AtomicU64 = AtomicU64::new(0);
+/// Host-side microseconds spent *recording* compute passes (begin, record, end),
+/// accumulated under `QASR_ENC_TRACE` by [`PassGuard`].
+static HOST_REC_US: AtomicU64 = AtomicU64::new(0);
+/// Host-side microseconds spent in `create_bind_group`.
+static HOST_BUILD_US: AtomicU64 = AtomicU64::new(0);
+/// Host-side microseconds blocked in the encoder mid-loop submit+poll.
+static HOST_WAIT_US: AtomicU64 = AtomicU64::new(0);
 
 pub fn last_encode_ms() -> f64 {
     ENC_MS.load(Ordering::Relaxed) as f64
