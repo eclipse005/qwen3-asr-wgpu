@@ -1477,7 +1477,8 @@ impl Inner {
                     // step is still executing, so the 229-dispatch record -- which
                     // `step` makes the GPU idle through -- is off the critical
                     // path; the token is taken before this step is submitted, so
-                    // an EOS drops the recorded step instead of running it.
+                    // an EOS drops the recorded step instead of running it (and
+                    // has to *stop holding* it -- see `discard_step`).
                     let mut steps = 0usize;
                     let mut done = false;
                     while steps + 1 < max_new_tokens {
@@ -1485,6 +1486,7 @@ impl Inner {
                         if steps > 0 {
                             let tok = d.take_token()?;
                             if eos.contains(&tok) {
+                                d.discard_step();
                                 done = true;
                                 break;
                             }
@@ -1553,22 +1555,33 @@ fn spec_study_k() -> Option<usize> {
         .filter(|k| (2..=64).contains(k))
 }
 
-/// `QASR_DEC_PIPE=1`: run the decode loop as a one-deep pipeline -- record step
-/// `k+1` while step `k` executes, then take step `k`'s token, then submit --
-/// instead of the serial `step()` that makes the GPU wait out each step's
-/// recording (the cost `QASR_RECORD_PAD` prices).  **Opt-in, default off**: as
-/// measured it is too small to keep (0.6B / 90 s_en 2586 -> 2571 ms, 1.7B
-/// +3 ms) because `enc.finish()` -- the command buffer's validation -- is still
-/// on the critical side of the await; the fix is to hold a *finished*
-/// `CommandBuffer` in `record_step` instead of an encoder.  Not gated either:
-/// see `HANDOFF.md`.  The serial loop is what the streaming path uses in any
-/// case, because a callback wants a token the moment it exists.
+/// Run the decode loop as a one-deep pipeline -- record step `k+1` while step `k`
+/// executes, then take step `k`'s token, then submit -- instead of the serial
+/// `step()` that makes the GPU wait out each step's recording (the cost
+/// `QASR_RECORD_PAD` prices).  **Default on** (r34); `QASR_DEC_PIPE=0` restores
+/// the serial loop, which is also what the streaming path uses unconditionally,
+/// because a callback wants a token the moment it exists.
+///
+/// The first version of this held the `CommandEncoder` and finished it in
+/// `submit_step`, which left the buffer's validation on the critical side of the
+/// await and was worth only -15 ms of a 2586 ms decode (1.7B: +3 ms).  With
+/// `record_step` holding the *finished* `CommandBuffer` the same interleaved A/B,
+/// three reps, both arms MATCH, reads:
+///
+/// | fixture | pipe off | pipe on | delta |
+/// |---|---|---|---|
+/// | 0.6B / 90 s_en | 2597 | **2499** | -98 ms, **-3.8%** |
+/// | 1.7B / 90 s_en | 5121 | **5000** | -121 ms, **-2.4%** |
+///
+/// i.e. -0.31 and -0.39 ms/token, and the two halves move together: `submit`
+/// -105/-123 and `read` -102/-121, because the record now runs under the previous
+/// step's execution instead of in front of it.
 fn pipelined_decode() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("QASR_DEC_PIPE").unwrap_or_default().as_str(),
-            "1" | "on" | "true"
+            "0" | "off" | "false"
         )
     })
 }

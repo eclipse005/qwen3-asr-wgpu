@@ -73,32 +73,41 @@ fn record_pad() -> Option<usize> {
     })
 }
 
-fn env_split(name: &str) -> usize {
+fn env_split(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n >= 1)
-        .unwrap_or(1)
+        .unwrap_or(default)
 }
 
-/// `QASR_SUBMIT_SPLIT=n` (default 1): record a decode step in `n` command buffers
-/// and submit each one as it is recorded, so the GPU starts executing the first
-/// slice while the CPU is still recording the rest.  The step's 229 dispatches are
-/// ~0.38 ms of pure CPU work per token and the GPU waits out every microsecond of
+/// `QASR_SUBMIT_SPLIT=n` (**default 2**, r34): record a decode step in `n`
+/// command buffers and submit each one as it is recorded, so the GPU starts
+/// executing the first slice while the CPU is still recording the rest.  The
+/// step's 229 dispatches are ~0.4 ms of pure CPU work per token and the GPU waits
+/// out every microsecond of
 /// it (`QASR_RECORD_PAD` prices that: two extra recordings per step cost +129 ms of
 /// decode and +124 ms of it shows up as `host submit`, with both arms MATCHing).
-/// Slicing is worth it only if a submit is cheaper than the record it hides.
+/// Slicing is worth it only if a submit is cheaper than the record it hides, and
+/// that is what fixes `n`: **a submit costs ~41 us of token time** (submit
+/// +13/+26/+45 for 1/3/7 extra submits) against the ~200 us of record, so `n = 2`
+/// is the best measured arm (**-1.6%** on 0.6B/90 s_en, **-1.5%** on 0.6B/180 s_zh,
+/// three interleaved reps, both MATCH) and `n = 4` / `n = 8` collect less and less
+/// (-1.4%, -0.4%).  `QASR_SUBMIT_SPLIT=1` restores the single-submit step, which
+/// is what the A/B above was run against.
 ///
-/// `QASR_PASS_SPLIT=n`: the same slices as `n` passes of *one* encoder and one
-/// submit.  That has none of the overlap and all of the pass-boundary barriers, so
-/// running the two knobs separately separates the win from its cost -- if slicing
-/// loses, this says whether the barrier or the submit is what took it.
+/// `QASR_PASS_SPLIT=n` (default 1): the same slices as `n` passes of *one* encoder
+/// and one submit.  That has none of the overlap and all of the pass-boundary
+/// barriers, so running the two knobs separately separates the win from its cost --
+/// and it measured **+1.3%** (17 us of CPU and 16 us of GPU a boundary), i.e. the
+/// win above is the overlap and not a barrier effect, and any design that adds
+/// passes rather than submits is priced dead before it is built.
 fn submit_split() -> usize {
-    env_split("QASR_SUBMIT_SPLIT")
+    env_split("QASR_SUBMIT_SPLIT", 2)
 }
 
 fn pass_split() -> usize {
-    env_split("QASR_PASS_SPLIT")
+    env_split("QASR_PASS_SPLIT", 1)
 }
 
 /// The `c`th of `n` slices of a decode step: the layers cut as evenly as the
@@ -822,8 +831,10 @@ pub struct WgpuTextDecoder {
     pub host_read_ms: f64,
 
     /// A recorded-but-unsubmitted step, held so the record can overlap the step
-    /// in flight -- see `record_step` / `submit_step`.
-    pending: Option<wgpu::CommandEncoder>,
+    /// in flight -- see `record_step` / `submit_step`.  A *finished* command
+    /// buffer, not an encoder: `finish()` validates, and that is host work the
+    /// pipeline can only hide by doing it on the recording side of the await.
+    pending: Option<wgpu::CommandBuffer>,
     /// The token map armed for the step in flight, taken by `take_token`.
     pending_map: Option<std::sync::mpsc::Receiver<anyhow::Result<()>>>,
 
@@ -1625,22 +1636,41 @@ impl WgpuTextDecoder {
     /// on the step in flight) -> `submit_step`.  Bit-identical to `step`: same
     /// dispatches in the same order into the same pass, and the uniforms are still
     /// written before the submit that reads them.
+    ///
+    /// `finish()` is called *here*, and the held value is the finished
+    /// `CommandBuffer` — a CB is validated, and still just a value that can be
+    /// submitted later.  The first version of this pipeline held the encoder and
+    /// finished it in `submit_step`, which left ~0.14 ms/token of validation on
+    /// the critical side of the await and made the whole change worth only -15 ms
+    /// of a 2586 ms decode; moving it across is the difference between hiding the
+    /// record and hiding the record *and* its validation.
     pub fn record_step(&mut self) -> Result<()> {
         anyhow::ensure!(self.pending.is_none(), "step already recorded");
         let pos = self.pos;
+        let t_host = std::time::Instant::now();
         let mut enc = self.gpu.device.create_command_encoder(&Default::default());
         self.encode_step(&mut enc, pos);
-        self.pending = Some(enc);
+        self.pending = Some(enc.finish());
+        // Charged to `host submit` even though nothing is submitted yet: it is the
+        // same host work `step()` charges there, and it has to stay in the line or
+        // the phase split stops meaning anything in this loop (`submit` would drop
+        // from ~0.4 ms/token to ~0.03 and the record would vanish from the
+        // accounting while still costing time whenever it exceeds the overlap).
+        // What differs is *when* it runs -- under the previous step -- so in the
+        // pipelined loop `submit` and `read` overlap and their sum is longer than
+        // the wall by the overlap; `read` is the part of the previous step's
+        // execution the record did not cover.
+        self.host_submit_ms += t_host.elapsed().as_secs_f64() * 1000.0;
         Ok(())
     }
 
     /// Write the recorded step's uniforms, submit it, arm its token readback, and
     /// advance `pos`.
     pub fn submit_step(&mut self) -> Result<()> {
-        let enc = self.pending.take().context("no recorded step")?;
+        let cb = self.pending.take().context("no recorded step")?;
         let t_host = std::time::Instant::now();
         self.write_step_uniforms(self.pos);
-        self.gpu.queue.submit([enc.finish()]);
+        self.gpu.queue.submit([cb]);
         // Arm the map now so it resolves with *this* step: the copy that fills
         // `token_staging` is the last command in the buffer just submitted.
         let slice = self.scratch.token_staging.slice(..);
@@ -1652,6 +1682,20 @@ impl WgpuTextDecoder {
         self.pos += 1;
         self.host_submit_ms += t_host.elapsed().as_secs_f64() * 1000.0;
         Ok(())
+    }
+
+    /// Drop a recorded-but-unsubmitted step without running it.
+    ///
+    /// The pipelined loop takes step `k-1`'s token *before* submitting step `k`,
+    /// so an EOS there means the step just recorded must not run.  It also has to
+    /// stop being held: `record_step`'s invariant is one recorded step at a time,
+    /// and a decode that ends early leaves the decoder to be used again (the next
+    /// `transcribe` on the same instance, batched or streaming).  Not dropping it
+    /// made that *second* decode fail with "step already recorded" -- and since
+    /// every fixture EOS-terminates before `max_new`, that was every second call on
+    /// an instance, on the default path.
+    pub fn discard_step(&mut self) {
+        self.pending = None;
     }
 
     /// The token of the step in flight, blocking until the GPU hands it over.
@@ -1710,6 +1754,12 @@ impl WgpuTextDecoder {
             // rise in the step time says the record is dead time the GPU waits out,
             // and a smaller rise says part of it is already hidden.  Both arms have to
             // MATCH -- the probe cannot change the tokens.
+            //
+            // It lives in the single-submit arm, so reading it as it was read for the
+            // +129 ms above needs `QASR_SUBMIT_SPLIT=1` as well as `QASR_DEC_PIPE=0`:
+            // the shipped default is the two-submit step, which returns at `n > 1`
+            // above and never reaches this.  The probe prices *this* arm's record;
+            // the pipelined arm's is priced by the A/B in `pipelined_decode`.
             if let Some(n) = record_pad() {
                 for _ in 0..n {
                     let mut throw = self.gpu.device.create_command_encoder(&Default::default());
