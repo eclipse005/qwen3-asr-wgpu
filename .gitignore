@@ -17,3 +17,8 @@ exp_probe/*.bin
 # bench harness output (regenerate with scripts/bench.ps1)
 /scripts/bench-*.tsv
 /scripts/*.log
+
+# the measured-performance docs -- this machine's numbers, kept out of the
+# published tree (they live on disk; the history they were in was never pushed)
+/docs/
+/HANDOFF.md
