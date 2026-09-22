@@ -2598,8 +2598,9 @@ fn prefill_gemm_impl(
 ///
 /// The reason to want that: at `bt = 1024` a workgroup is one per SM
 /// (`1024 x ~40 registers`), so the row's 16-barrier tree plus its two cold row
-/// reads run only 15 rows at a time.  `docs/perf.md` prices it at 80 ms of a
-/// 90 s_en prefill.  Capping the block *changes the tree* and the gate caught it
+/// reads run only 15 rows at a time.  That was 80 ms of a 90 s_en prefill when it
+/// was priced, 56 of which the `QASR_SM_BS` physical-width change collected.
+/// Capping the block *changes the tree* and the gate caught it
 /// (`1.7B / 180s_zh` MISMATCH at r22); this changes only the thread count, so the
 /// two are not the same experiment and only one of them is safe.
 ///

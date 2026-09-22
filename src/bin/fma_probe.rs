@@ -1,8 +1,9 @@
 //! What can this card actually issue, and what does a shared-memory read cost?
 //!
-//! `docs/perf.md` spent several rounds asserting that the GEMMs were "at the
-//! machine's own rate" without ever measuring the machine.  `nvidia-smi` gives
-//! 1911 MHz max SM clock and the P104-100 has 1920 FP32 lanes, so *by spec* the
+//! This probe exists because the engine's GEMMs spent several rounds being
+//! described as "at the machine's own rate" without the machine ever being
+//! measured.  `nvidia-smi` gives 1911 MHz max SM clock and the P104-100 has 1920
+//! FP32 lanes, so *by spec* the
 //! card is 7.34 TFLOP/s -- but spec clocks assume the part never throttles, and
 //! a mining card at a 180 W cap with no display output is exactly the part that
 //! might.  This probe measures the ceiling instead of arguing about it, and
