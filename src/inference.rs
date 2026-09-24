@@ -87,7 +87,9 @@ fn mel_pad_even(v: usize) -> usize {
 }
 
 /// Per-request knobs, mirroring `Qwen3ASRModel.transcribe(audio,
-/// context=…, language=…)`.  `context` is the hotword/bias text and goes into
+/// context=…, language=…)` (= transformers
+/// `apply_transcription_request(audio=…, prompt=…, language=…)`).
+/// `context` is the free-form context / hotwords text and goes into
 /// the chat template's **system** message; `language` forces text-only output by
 /// prefilling `language {Language}<asr_text>` after the assistant header.
 ///
@@ -101,6 +103,9 @@ fn mel_pad_even(v: usize) -> usize {
 #[derive(Debug, Clone)]
 pub struct TranscribeOptions {
     /// Hotword / bias text — the content of the chat template's `system` turn.
+    /// This is the official `prompt=` (transformers `apply_transcription_request`)
+    /// / `context=` (`qwen-asr` `transcribe`) slot, e.g. the official
+    /// `"Vocabulary: Quilter, apostle, gospel."` / `"交易 停滞"`.
     /// Empty means "no context", which is what the frozen baselines were made
     /// with.
     pub context: String,
@@ -124,9 +129,11 @@ impl Default for TranscribeOptions {
 }
 
 impl TranscribeOptions {
-    /// Bias the transcription towards a domain — the chat template's `system`
-    /// message.  See the hotword notes in `README.md` for what this does and
-    /// does not buy.
+    /// Free-form context (e.g. domain-specific vocabulary, names, or background
+    /// information) to bias the transcription — the chat template's `system`
+    /// message.  This is the official `prompt=` (`apply_transcription_request`)
+    /// / `context=` (`transcribe`) slot; pass the official strings verbatim,
+    /// e.g. `"Vocabulary: Quilter, apostle, gospel."`.
     #[must_use]
     pub fn with_context(mut self, context: impl Into<String>) -> Self {
         self.context = context.into();
@@ -415,7 +422,7 @@ impl AsrInference {
         let samples = load_audio_wav(audio_path, MEL_SAMPLE_RATE)?;
         let mut guard = self.lock()?;
         let r = guard
-            .transcribe_samples(&samples, opts.max_new_tokens)
+            .transcribe_samples_impl(&samples, opts.max_new_tokens, None, false, &opts)
             .map_err(crate::AsrError::Inference)?;
         Ok(with_forced_language(r, forced))
     }
@@ -429,7 +436,7 @@ impl AsrInference {
         let forced = check_options(&opts)?;
         let mut guard = self.lock()?;
         let r = guard
-            .transcribe_samples(samples, opts.max_new_tokens)
+            .transcribe_samples_impl(samples, opts.max_new_tokens, None, false, &opts)
             .map_err(crate::AsrError::Inference)?;
         Ok(with_forced_language(r, forced))
     }
@@ -1270,15 +1277,12 @@ impl Inner {
         Ok(embeds)
     }
 
-    pub fn transcribe_samples(&mut self, samples: &[f32], max_new_tokens: usize) -> Result<TranscribeResult> {
-        self.transcribe_samples_with_dump(samples, max_new_tokens, None)
-    }
-
     pub fn transcribe_from_embeds(
         &mut self,
         audio_embeds: &[f32],
         max_new_tokens: usize,
         dump_dir: Option<&Path>,
+        opts: &TranscribeOptions,
     ) -> Result<TranscribeResult> {
         self.decode_from_audio_embeds(
             audio_embeds,
@@ -1286,18 +1290,9 @@ impl Inner {
             dump_dir,
             0.0,
             0.0,
-            &TranscribeOptions::default(),
+            opts,
             None,
         )
-    }
-
-    pub fn transcribe_samples_with_dump(
-        &mut self,
-        samples: &[f32],
-        max_new_tokens: usize,
-        dump_dir: Option<&Path>,
-    ) -> Result<TranscribeResult> {
-        self.transcribe_samples_impl(samples, max_new_tokens, dump_dir, false, &TranscribeOptions::default())
     }
 
     fn transcribe_samples_impl(

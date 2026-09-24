@@ -62,6 +62,9 @@ pub fn transcribe_from_mel(
 
 /// Decode from already-encoded audio embeddings — skips the tower entirely,
 /// which is what makes it useful for isolating a decoder bug.
+///
+/// Like every other entry point, the prompt (context / language) comes from
+/// `opts`: embeddings alone cannot reproduce a decode that used them.
 pub fn transcribe_from_embeds(
     asr: &AsrInference,
     audio_embeds: &[f32],
@@ -69,7 +72,7 @@ pub fn transcribe_from_embeds(
     dump_dir: Option<&Path>,
 ) -> Result<TranscribeResult> {
     let mut g = asr.lock()?;
-    g.transcribe_from_embeds(audio_embeds, opts.max_new_tokens, dump_dir)
+    g.transcribe_from_embeds(audio_embeds, opts.max_new_tokens, dump_dir, opts)
         .map_err(AsrError::Inference)
 }
 

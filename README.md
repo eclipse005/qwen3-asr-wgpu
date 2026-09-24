@@ -46,8 +46,8 @@ transcribe --model ./Qwen3-ASR-0.6B-hf --wav audio.wav
 |------|------|
 | `--model <dir>` | 模型目录（也可用环境变量 `QASR_MODEL`） |
 | `--wav <file>` | 要转写的音频，任意采样率，内部自动转成 16 kHz（也可用 `QASR_WAV`） |
-| `--lang <name>` | 指定语言，如 `zh`、`English`；不填则自动识别 |
-| `--context <text>` | 热词/提示文本，帮助模型认准专有名词（`--prompt` 同义） |
+| `--lang <name>` | 指定语言，如 `zh`、`English`；不填则自动识别（`--language` 同义） |
+| `--prompt <text>` | 上下文/热词：领域词、名字、背景信息，原样进 system 消息偏置转写（`--context` 同义，即 `qwen-asr` 包的 `transcribe(context=…)` 拼写）。官方示例：`--prompt "Vocabulary: Quilter, apostle, gospel."` |
 | `--max-new <n>` | 最多生成多少 token，默认 2048 |
 | `--device <name>` | 指定设备，默认自动；`cpu` 表示强制用 CPU |
 | `--list-devices` | 列出这台机器上可用的设备 |
@@ -96,17 +96,17 @@ std::thread::spawn(move || worker.transcribe("audio.wav", TranscribeOptions::def
 
 | 字段 | 说明 |
 |------|------|
-| `language` | 指定语言，`None` 表示自动识别 |
-| `context` | 热词/提示文本 |
+| `language` | 指定语言，`None` 表示自动识别（`zh`/`Chinese` 均可，官方示例用 `"English"` / `"Chinese"` / `"zh"`） |
+| `context` | 上下文/热词，即官方 `apply_transcription_request(prompt=…)` / `transcribe(context=…)` 的同个 system 槽。官方示例：`"Vocabulary: Quilter, apostle, gospel."` / `"交易 停滞"` |
 | `max_new_tokens` | 生成上限，默认 2048 |
 
-链式构造：
+链式构造（只用官方出现过的热词写法）：
 
 ```rust
 let opts = TranscribeOptions::default()
-    .with_language("zh")
-    .with_context("订单号、专有名词……")
-    .with_max_new_tokens(1024);
+    .with_language("English")
+    .with_context("Vocabulary: Quilter, apostle, gospel.")
+    .with_max_new_tokens(256);
 ```
 
 ### 结果 `TranscribeResult`

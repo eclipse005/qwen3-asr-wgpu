@@ -69,10 +69,13 @@ fn main() -> Result<()> {
     );
 
     let mut opts = TranscribeOptions::default().with_max_new_tokens(max_new);
-    opts.context = arg(&args, "--context")
-        .or_else(|| arg(&args, "--prompt"))
+    // Official name first: transformers `apply_transcription_request(prompt=…)`
+    // and the chat-template system message; `--context` is the qwen-asr
+    // package's `transcribe(context=…)` spelling for the same slot.
+    opts.context = arg(&args, "--prompt")
+        .or_else(|| arg(&args, "--context"))
         .unwrap_or_default();
-    opts.language = arg(&args, "--lang");
+    opts.language = arg(&args, "--language").or_else(|| arg(&args, "--lang"));
     let dump = arg(&args, "--dump").map(PathBuf::from);
     let compare_enc = flag(&args, "--compare-enc");
     if flag(&args, "--diag-enc") {
