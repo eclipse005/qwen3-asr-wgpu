@@ -2,7 +2,7 @@
 
 [package]
 name = "qwen3-asr-wgpu"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Qwen3-ASR speech recognition on wgpu — cross-vendor GPU inference in Rust"
 license = "Apache-2.0"
