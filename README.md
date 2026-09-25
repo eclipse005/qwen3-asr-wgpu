@@ -34,13 +34,14 @@ cargo build --release        # 得到 target/release/transcribe
 
 ### 量化（INT8）
 
-自压的 INT8 权重（配套的 `quantize_int8.py` 导出，只量化解码器的 7 个线性层，音频塔与 `embed_tokens` 保持 bf16；1.7B 体积 4.08 GB → 2.67 GB）直接当 `--model` 用——加载时按权重 dtype 自动识别，无需任何参数，量化与未量化目录、GPU 与 `--cpu-dec` 全部同一调用：
+量化版权重（加载时自动识别，用法与原版完全相同，显存与解码速度更优）：
+
+- [eclipse005/Qwen3-ASR-0.6B-int8](https://modelscope.cn/models/eclipse005/Qwen3-ASR-0.6B-int8)（ModelScope）
+- [eclipse005/Qwen3-ASR-1.7B-int8](https://modelscope.cn/models/eclipse005/Qwen3-ASR-1.7B-int8)（ModelScope）
 
 ```bash
 transcribe --model ./Qwen3-ASR-1.7B-int8 --wav audio.wav
 ```
-
-权重以 INT8 常驻显存，反量化在 shader 内完成（仅解码器；`lm_head`/音频塔不变）：1.7B 的 90 s 音频常驻显存 4.3 GB → 3.1 GB，decode 提速约 25%；INT8 与 fp16 在 180 条多语言评测集（9 语种）上九个语言组逐组 WER/CER 一致，0.6B 同样支持。
 
 ## 使用
 
