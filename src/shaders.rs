@@ -208,7 +208,7 @@ fn gemv_merge(@builtin(global_invocation_id) gid: vec3<u32>) {{
 /// `n` must be a multiple of 8 (all model shapes are) so no partial workgroup
 /// exists; `k/8` must be a multiple of 32 so the granule loop divides evenly.
 pub fn gemv(n: usize, k: usize, accum: bool, subgroup: bool, rows_per_wg: usize) -> String {
-    gemv_impl(n, k, accum, subgroup, rows_per_wg, 1)
+    gemv_impl(n, k, accum, subgroup, rows_per_wg, 1, false)
 }
 
 /// [`gemv`] with `rows_per_warp` rows per warp instead of one.
@@ -234,7 +234,85 @@ pub fn gemv_rpwr(
     rows_per_wg: usize,
     rows_per_warp: usize,
 ) -> String {
-    gemv_impl(n, k, accum, subgroup, rows_per_wg, rows_per_warp)
+    gemv_impl(n, k, accum, subgroup, rows_per_wg, rows_per_warp, false)
+}
+
+/// [`gemv`] reading an **int8-resident** weight (the M3 layout): the same
+/// granule, lane map, unroll, accumulators, butterfly and epilogue as the f16
+/// kernel — `KG` is still `k/8`, a granule still covers 8 values — with the
+/// weight word now a `vec2<u32>` of 8 int8 and a per-row f32 scale bound
+/// alongside.  Per value the kernel computes `f16(q * scale[row])`: the two
+/// half-products are formed in f32 and rounded to f16 by `pack2x16float`
+/// (round-to-nearest-even, the same rounding the host dequant `half::from_f32`
+/// applies), then fed to the f32 fma.  So this kernel consumes exactly the
+/// values M2 materialized, in exactly the f16 kernel's order — the decode
+/// arithmetic is unchanged and only the bytes on the bus are half.
+///
+/// Layout: row `r`'s bytes start at word `r * KG` of `Wt` (each byte of a word
+/// is value `4*word + j`, LSB first — the file's own sequence, no repacking);
+/// `cols` being a multiple of 4 keeps rows word-aligned, and `k % 8 == 0` keeps
+/// the granule grid exact.
+pub fn gemv_w8(n: usize, k: usize, accum: bool, subgroup: bool, rows_per_wg: usize) -> String {
+    gemv_impl(n, k, accum, subgroup, rows_per_wg, 1, true)
+}
+
+/// [`gemv_w8`] with `rows_per_warp` rows per warp — [`gemv_rpwr`]'s knob on the
+/// int8 kernel, bit-identical for the same reason the f16 one is.
+pub fn gemv_w8_rpwr(
+    n: usize,
+    k: usize,
+    accum: bool,
+    subgroup: bool,
+    rows_per_wg: usize,
+    rows_per_warp: usize,
+) -> String {
+    gemv_impl(n, k, accum, subgroup, rows_per_wg, rows_per_warp, true)
+}
+
+/// The shared GEMV tile body: the eight prefetch loads of one iteration come
+/// first, then per granule the weight unpack, the activation unpack and the
+/// four fma lines — the same lines in both modes, so value `j` of a granule
+/// feeds accumulator `j/2` identically whichever form the weights came in.
+/// `xsrc` names the activation array (`X`, global, in `gemv`; the staged `xs`
+/// workgroup array in `gemv_norm`); `wbase`, `i`, `s` and `q8` are the caller's.
+fn gemv_tile_body(w8: bool, xsrc: &str) -> String {
+    let mut body = String::new();
+    for t in 0..4 {
+        let off = ["", " + 32u", " + 64u", " + 96u"][t];
+        body.push_str(&format!(
+            "        let wv{t} = Wt[wbase + i{off}];\n        let xv{t} = {xsrc}[i{off}];\n"
+        ));
+    }
+    for t in 0..4 {
+        for wi in 0..4 {
+            if w8 {
+                // `wv.{comp}` holds values 4*wi..4*wi+3; the pair for `w{t}{wi}`
+                // is the first two of them, each `f16(q * s)` via pack2x16float
+                // (round-to-nearest-even — the host dequant's own rounding).
+                let (comp, sha, shb) =
+                    [("x", 24u32, 16u32), ("x", 8, 0), ("y", 24, 16), ("y", 8, 0)][wi];
+                body.push_str(&format!(
+                    "        let w{t}{wi} = unpack2x16float(pack2x16float(vec2<f32>(q8(wv{t}.{comp}, {sha}u) * s, q8(wv{t}.{comp}, {shb}u) * s)));\n"
+                ));
+            } else {
+                let comp = ["x", "y", "z", "w"][wi];
+                body.push_str(&format!(
+                    "        let w{t}{wi} = unpack2x16float(wv{t}.{comp});\n"
+                ));
+            }
+            let xcomp = ["x", "y", "z", "w"][wi];
+            body.push_str(&format!(
+                "        let x{t}{wi} = unpack2x16float(xv{t}.{xcomp});\n"
+            ));
+        }
+        for a in 0..4 {
+            body.push_str(&format!(
+                "        a{a} = fma(w{t}{a}.x, x{t}{a}.x, fma(w{t}{a}.y, x{t}{a}.y, a{a}));\n"
+            ));
+        }
+    }
+    body.push_str("        i = i + 128u;\n");
+    body
 }
 
 fn gemv_impl(
@@ -244,6 +322,7 @@ fn gemv_impl(
     subgroup: bool,
     rows_per_wg: usize,
     rows_per_warp: usize,
+    w8: bool,
 ) -> String {
     assert_eq!(n % 8, 0, "gemv: rows must be a multiple of 8");
     let kg = k / 8;
@@ -305,12 +384,27 @@ fn gemv_impl(
 var<workgroup> bt1: array<f32, THREADS>;
 "
     };
+    // The two weight forms share every structural constant — `KG` is `k/8`
+    // granules of 8 values in both, so the lane map, the unroll, the
+    // accumulators and the reduction tree are one shader; only the weight word
+    // (8 f16 in a vec4, 8 int8 in a vec2), the per-value unpack and the scale
+    // binding differ.
+    let (wty, sbind, q8fn, sload) = if w8 {
+        (
+            "vec2<u32>",
+            "@group(0) @binding(3) var<storage, read>       S:  array<f32>;\n",
+            "\n/// Byte `j` of `w` as a signed f32: shift it to the top of the word,\n/// bitcast, and let the arithmetic shift right do the sign extension.\nfn q8(w: u32, sh: u32) -> f32 {\n    return f32((bitcast<i32>(w << sh)) >> 24u);\n}\n",
+            "let s = S[row];\n    ",
+        )
+    } else {
+        ("vec4<u32>", "", "", "    ")
+    };
+    let body = gemv_tile_body(w8, "X");
     format!(
-        "@group(0) @binding(0) var<storage, read>       Wt: array<vec4<u32>>;
+        "@group(0) @binding(0) var<storage, read>       Wt: array<{wty}>;
 @group(0) @binding(1) var<storage, read>       X:  array<vec4<u32>>;
 @group(0) @binding(2) var<storage, read_write> Y:  array<u32>;
-
-const KG: u32 = {kg}u;
+{sbind}const KG: u32 = {kg}u;
 const TILES: u32 = {tiles}u;
 const ACCUM: u32 = {accum_lit}u;
 const SUBGROUP: u32 = {subgroup_lit}u;
@@ -318,8 +412,7 @@ const THREADS: u32 = {threads}u;
 const RPW: u32 = {rpw}u;
 const RPWR: u32 = {rpwr}u;
 const ROWSW: u32 = {rowsw}u;
-
-{bfly_scratch}var<workgroup> rows_out: array<f32, {rowsn}>;
+{q8fn}{bfly_scratch}var<workgroup> rows_out: array<f32, {rowsn}>;
 
 /// 5-round xor butterfly over the 32 lanes of one warp -- the exact tree
 /// `__shfl_xor_sync(acc, [16,8,4,2,1])` produces.
@@ -350,55 +443,14 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
     let row = rbase + rr;
 
     let wbase = row * KG;
-    var a0 = 0.0; var a1 = 0.0; var a2 = 0.0; var a3 = 0.0;
+    {sload}var a0 = 0.0; var a1 = 0.0; var a2 = 0.0; var a3 = 0.0;
     // Tiles unrolled x4 with prefetched loads: each warp keeps 4 (Wt, X) pairs
     // in flight to hide DRAM latency (rows == warps leaves the machine
     // underfilled on the small projections).  The fma chain still consumes
     // tiles in ascending order, so the reduction bits are unchanged.
     var i = lane;
     for (var g = 0u; g < TILES; g = g + 4u) {{
-        let wv0 = Wt[wbase + i];
-        let xv0 = X[i];
-        let wv1 = Wt[wbase + i + 32u];
-        let xv1 = X[i + 32u];
-        let wv2 = Wt[wbase + i + 64u];
-        let xv2 = X[i + 64u];
-        let wv3 = Wt[wbase + i + 96u];
-        let xv3 = X[i + 96u];
-        let w00 = unpack2x16float(wv0.x); let x00 = unpack2x16float(xv0.x);
-        let w01 = unpack2x16float(wv0.y); let x01 = unpack2x16float(xv0.y);
-        let w02 = unpack2x16float(wv0.z); let x02 = unpack2x16float(xv0.z);
-        let w03 = unpack2x16float(wv0.w); let x03 = unpack2x16float(xv0.w);
-        a0 = fma(w00.x, x00.x, fma(w00.y, x00.y, a0));
-        a1 = fma(w01.x, x01.x, fma(w01.y, x01.y, a1));
-        a2 = fma(w02.x, x02.x, fma(w02.y, x02.y, a2));
-        a3 = fma(w03.x, x03.x, fma(w03.y, x03.y, a3));
-        let w10 = unpack2x16float(wv1.x); let x10 = unpack2x16float(xv1.x);
-        let w11 = unpack2x16float(wv1.y); let x11 = unpack2x16float(xv1.y);
-        let w12 = unpack2x16float(wv1.z); let x12 = unpack2x16float(xv1.z);
-        let w13 = unpack2x16float(wv1.w); let x13 = unpack2x16float(xv1.w);
-        a0 = fma(w10.x, x10.x, fma(w10.y, x10.y, a0));
-        a1 = fma(w11.x, x11.x, fma(w11.y, x11.y, a1));
-        a2 = fma(w12.x, x12.x, fma(w12.y, x12.y, a2));
-        a3 = fma(w13.x, x13.x, fma(w13.y, x13.y, a3));
-        let w20 = unpack2x16float(wv2.x); let x20 = unpack2x16float(xv2.x);
-        let w21 = unpack2x16float(wv2.y); let x21 = unpack2x16float(xv2.y);
-        let w22 = unpack2x16float(wv2.z); let x22 = unpack2x16float(xv2.z);
-        let w23 = unpack2x16float(wv2.w); let x23 = unpack2x16float(xv2.w);
-        a0 = fma(w20.x, x20.x, fma(w20.y, x20.y, a0));
-        a1 = fma(w21.x, x21.x, fma(w21.y, x21.y, a1));
-        a2 = fma(w22.x, x22.x, fma(w22.y, x22.y, a2));
-        a3 = fma(w23.x, x23.x, fma(w23.y, x23.y, a3));
-        let w30 = unpack2x16float(wv3.x); let x30 = unpack2x16float(xv3.x);
-        let w31 = unpack2x16float(wv3.y); let x31 = unpack2x16float(xv3.y);
-        let w32 = unpack2x16float(wv3.z); let x32 = unpack2x16float(xv3.z);
-        let w33 = unpack2x16float(wv3.w); let x33 = unpack2x16float(xv3.w);
-        a0 = fma(w30.x, x30.x, fma(w30.y, x30.y, a0));
-        a1 = fma(w31.x, x31.x, fma(w31.y, x31.y, a1));
-        a2 = fma(w32.x, x32.x, fma(w32.y, x32.y, a2));
-        a3 = fma(w33.x, x33.x, fma(w33.y, x33.y, a3));
-        i = i + 128u;
-    }}
+{body}    }}
     let acc = (a0 + a1) + (a2 + a3);
     let r = bfly(acc, lid.x, lane);
     if (lane == 0u) {{ rows_out[warp * RPWR + rr] = r; }}
@@ -430,6 +482,11 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
         rowsn = rows_per_wg_tot,
         rpwr = rows_per_warp,
         threads = threads,
+        wty = wty,
+        sbind = sbind,
+        q8fn = q8fn,
+        sload = sload,
+        body = body,
     )
 }
 
@@ -462,6 +519,33 @@ pub fn gemv_norm(
     last: usize,
     bs: usize,
     eps: f32,
+) -> String {
+    gemv_norm_impl(n, k, accum, subgroup, last, bs, eps, false)
+}
+
+/// [`gemv_norm`] on the int8-resident weights — [`gemv_w8`]'s weight form with
+/// [`gemv_norm`]'s folded RMSNorm prologue, unchanged in every other respect.
+pub fn gemv_norm_w8(
+    n: usize,
+    k: usize,
+    accum: bool,
+    subgroup: bool,
+    last: usize,
+    bs: usize,
+    eps: f32,
+) -> String {
+    gemv_norm_impl(n, k, accum, subgroup, last, bs, eps, true)
+}
+
+fn gemv_norm_impl(
+    n: usize,
+    k: usize,
+    accum: bool,
+    subgroup: bool,
+    last: usize,
+    bs: usize,
+    eps: f32,
+    w8: bool,
 ) -> String {
     assert_eq!(n % 8, 0, "gemv_norm: rows must be a multiple of 8");
     let kg = k / 8;
@@ -535,12 +619,23 @@ pub fn gemv_norm(
 var<workgroup> bt1: array<f32, 256>;
 "
     };
+    let (wty, sbind, q8fn, sload) = if w8 {
+        (
+            "vec2<u32>",
+            "@group(0) @binding(4) var<storage, read>       S:   array<f32>;\n",
+            "\n/// Byte `j` of `w` as a signed f32: shift it to the top of the word,\n/// bitcast, and let the arithmetic shift right do the sign extension.\nfn q8(w: u32, sh: u32) -> f32 {\n    return f32((bitcast<i32>(w << sh)) >> 24u);\n}\n",
+            "let s = S[row];\n    ",
+        )
+    } else {
+        ("vec4<u32>", "", "", "    ")
+    };
+    let body = gemv_tile_body(w8, "xs");
     format!(
-        "@group(0) @binding(0) var<storage, read>       Wt:  array<vec4<u32>>;
+        "@group(0) @binding(0) var<storage, read>       Wt:  array<{wty}>;
 @group(0) @binding(1) var<storage, read>       Xr:  array<u32>;
 @group(0) @binding(2) var<storage, read_write> Y:   array<u32>;
 @group(0) @binding(3) var<storage, read>       NW:  array<u32>;
-
+{sbind}
 const KG: u32 = {kg}u;
 const TILES: u32 = {tiles}u;
 const ACCUM: u32 = {accum_lit}u;
@@ -550,7 +645,7 @@ const LAST2: u32 = {last2}u;
 const BS: u32 = {bs}u;
 const EPS: f32 = {eps:?}f;
 
-{bfly_scratch}var<workgroup> rows_out: array<f32, 8>;
+{q8fn}{bfly_scratch}var<workgroup> rows_out: array<f32, 8>;
 var<workgroup> red: array<f32, 256>;
 /// The normalized row, f16-packed exactly as `rms_norm` would have written it.
 var<workgroup> xs: array<vec4<u32>, {kg}u>;
@@ -593,52 +688,11 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
     workgroupBarrier();
 
     let wbase = row * KG;
-    var a0 = 0.0; var a1 = 0.0; var a2 = 0.0; var a3 = 0.0;
+    {sload}var a0 = 0.0; var a1 = 0.0; var a2 = 0.0; var a3 = 0.0;
     // Body identical to `gemv`; only the activation comes from `xs`.
     var i = lane;
     for (var g = 0u; g < TILES; g = g + 4u) {{
-        let wv0 = Wt[wbase + i];
-        let xv0 = xs[i];
-        let wv1 = Wt[wbase + i + 32u];
-        let xv1 = xs[i + 32u];
-        let wv2 = Wt[wbase + i + 64u];
-        let xv2 = xs[i + 64u];
-        let wv3 = Wt[wbase + i + 96u];
-        let xv3 = xs[i + 96u];
-        let w00 = unpack2x16float(wv0.x); let x00 = unpack2x16float(xv0.x);
-        let w01 = unpack2x16float(wv0.y); let x01 = unpack2x16float(xv0.y);
-        let w02 = unpack2x16float(wv0.z); let x02 = unpack2x16float(xv0.z);
-        let w03 = unpack2x16float(wv0.w); let x03 = unpack2x16float(xv0.w);
-        a0 = fma(w00.x, x00.x, fma(w00.y, x00.y, a0));
-        a1 = fma(w01.x, x01.x, fma(w01.y, x01.y, a1));
-        a2 = fma(w02.x, x02.x, fma(w02.y, x02.y, a2));
-        a3 = fma(w03.x, x03.x, fma(w03.y, x03.y, a3));
-        let w10 = unpack2x16float(wv1.x); let x10 = unpack2x16float(xv1.x);
-        let w11 = unpack2x16float(wv1.y); let x11 = unpack2x16float(xv1.y);
-        let w12 = unpack2x16float(wv1.z); let x12 = unpack2x16float(xv1.z);
-        let w13 = unpack2x16float(wv1.w); let x13 = unpack2x16float(xv1.w);
-        a0 = fma(w10.x, x10.x, fma(w10.y, x10.y, a0));
-        a1 = fma(w11.x, x11.x, fma(w11.y, x11.y, a1));
-        a2 = fma(w12.x, x12.x, fma(w12.y, x12.y, a2));
-        a3 = fma(w13.x, x13.x, fma(w13.y, x13.y, a3));
-        let w20 = unpack2x16float(wv2.x); let x20 = unpack2x16float(xv2.x);
-        let w21 = unpack2x16float(wv2.y); let x21 = unpack2x16float(xv2.y);
-        let w22 = unpack2x16float(wv2.z); let x22 = unpack2x16float(xv2.z);
-        let w23 = unpack2x16float(wv2.w); let x23 = unpack2x16float(xv2.w);
-        a0 = fma(w20.x, x20.x, fma(w20.y, x20.y, a0));
-        a1 = fma(w21.x, x21.x, fma(w21.y, x21.y, a1));
-        a2 = fma(w22.x, x22.x, fma(w22.y, x22.y, a2));
-        a3 = fma(w23.x, x23.x, fma(w23.y, x23.y, a3));
-        let w30 = unpack2x16float(wv3.x); let x30 = unpack2x16float(xv3.x);
-        let w31 = unpack2x16float(wv3.y); let x31 = unpack2x16float(xv3.y);
-        let w32 = unpack2x16float(wv3.z); let x32 = unpack2x16float(xv3.z);
-        let w33 = unpack2x16float(wv3.w); let x33 = unpack2x16float(xv3.w);
-        a0 = fma(w30.x, x30.x, fma(w30.y, x30.y, a0));
-        a1 = fma(w31.x, x31.x, fma(w31.y, x31.y, a1));
-        a2 = fma(w32.x, x32.x, fma(w32.y, x32.y, a2));
-        a3 = fma(w33.x, x33.x, fma(w33.y, x33.y, a3));
-        i = i + 128u;
-    }}
+{body}    }}
     let acc = (a0 + a1) + (a2 + a3);
     let r = bfly(acc, lid.x, lane);
     if (lane == 0u) {{ rows_out[warp] = r; }}
@@ -671,6 +725,11 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
         folded = folded,
         subgroup_body = subgroup_body,
         bfly_scratch = bfly_scratch,
+        wty = wty,
+        sbind = sbind,
+        q8fn = q8fn,
+        sload = sload,
+        body = body,
     )
 }
 
@@ -1981,7 +2040,28 @@ pub const PREFILL_GEMM_BN: usize = 16 * PREFILL_GEMM_TN;
 /// The tile geometry comes from the `PREFILL_GEMM_*` constants above; callers
 /// must pad `m`, `n` and the operand row strides with those same values.
 pub fn prefill_gemm(transb: bool, beta: bool) -> String {
-    prefill_gemm_impl(transb, beta, false, false, false)
+    prefill_gemm_impl(transb, beta, false, false, false, false)
+}
+
+/// [`prefill_gemm`] with an **int8-resident** W operand (the M3 decoder
+/// weights).  Only the B side changes: a thread's four weight rows are read as
+/// u32 words (4 int8 per word, `gd.k/4` words per row — the same four-word
+/// loads the f16 form issues), unpacked, scaled by `S8[row]`, rounded to f16 by
+/// `pack2x16float` (the GEMV's own rounding, and the host dequant's), and
+/// stored into the same f32 chunk tile the compute loop consumes.  The A tile,
+/// the compute loop and the epilogue are untouched, so the accumulation order
+/// is the f16 GEMM's.
+///
+/// The byte position within a word is `ck % 4` — a per-thread constant, since
+/// `kx` steps by `BK` (a multiple of 4) and the chunk's `ck` is fixed — and the
+/// four scales are hoisted out of the k loop entirely.
+///
+/// Restricted to the plain weight form (`transb = 0`, no bias, no causal
+/// skip): the attention GEMMs stay f16 and the bias form is unused by the
+/// decoder.  Requires the v4 chunk tile (the default; `QASR_GEMM_V4=0` is the
+/// scalar debug tile and does not have an int8 form).
+pub fn prefill_gemm_w8(beta: bool) -> String {
+    prefill_gemm_impl(false, beta, false, false, false, true)
 }
 
 /// [`prefill_gemm`] with the causal-attention tile skip: a tile wholly above the
@@ -1990,7 +2070,7 @@ pub fn prefill_gemm(transb: bool, beta: bool) -> String {
 /// past `row + 1`, so skipping it is bit-identical — it just stops writing ~half
 /// of the `s × cur` score matrix.
 pub fn prefill_gemm_causal() -> String {
-    prefill_gemm_impl(false, false, false, true, false)
+    prefill_gemm_impl(false, false, false, true, false, false)
 }
 
 /// [`prefill_gemm_bias`]-style AV form (`transb = 1`) with the causal *k* bound:
@@ -1999,7 +2079,7 @@ pub fn prefill_gemm_causal() -> String {
 /// slab's key offset; zero on the flat path).  Skipping exact zeros from a sum is
 /// bit-identical.
 pub fn prefill_gemm_causal_av() -> String {
-    prefill_gemm_impl(true, false, false, false, true)
+    prefill_gemm_impl(true, false, false, false, true, false)
 }
 
 /// As [`prefill_gemm`], plus the per-column bias add (binding 4).  A separate
@@ -2007,7 +2087,7 @@ pub fn prefill_gemm_causal_av() -> String {
 /// *declared* only for the variants that read it, and a declared-but-unbound
 /// binding fails pipeline validation even when the read is dead code.
 pub fn prefill_gemm_bias(transb: bool, beta: bool) -> String {
-    prefill_gemm_impl(transb, beta, true, false, false)
+    prefill_gemm_impl(transb, beta, true, false, false, false)
 }
 
 /// `QASR_GEMM_V4` -- the prefill/encoder GEMM's shared-memory tile: the default
@@ -2037,6 +2117,7 @@ fn prefill_gemm_impl(
     bias: bool,
     causal_skip: bool,
     causal_k: bool,
+    w8: bool,
 ) -> String {
     let tm = PREFILL_GEMM_TM;
     let tn = PREFILL_GEMM_TN;
@@ -2091,6 +2172,11 @@ fn prefill_gemm_impl(
     let v4 = gemm_v4();
     let (aq, bq) = (bm / 4, bn / 4);
     let cstep = bm * bk / 4 / 2;
+    if w8 {
+        assert!(!transb && !bias && !causal_skip && !causal_k,
+            "prefill_gemm_w8 supports only the plain weight operand (the attention GEMMs stay f16)");
+        assert!(v4, "prefill_gemm_w8 requires the v4 chunk tile (QASR_GEMM_V4 != 0)");
+    }
     assert_eq!(tm, 8, "the vec4 chunk store is derived for TM = 8");
     assert_eq!(tn, 8, "the vec4 chunk store is derived for TN = 8");
     assert_eq!(bk % 16, 0, "the vec4 chunk store assumes 8 k per chunk half");
@@ -2108,6 +2194,9 @@ fn prefill_gemm_impl(
     );
     if bias {
         s.push_str("@group(0) @binding(4) var<storage, read> Bias: array<u32>;\n");
+    }
+    if w8 {
+        s.push_str("@group(0) @binding(4) var<storage, read> S8: array<f32>;\n");
     }
     s.push_str(&format!(
         "const BM: u32 = {bm}u;\nconst BN: u32 = {bn}u;\nconst BK: u32 = {bk}u;\n\
@@ -2134,19 +2223,35 @@ fn prefill_gemm_impl(
          \x20 return select(p.x, p.y, odd);\n\
          }\n",
     );
+    if w8 {
+        // The int8 unpack and the f16-rounded dequant — `q8` takes the
+        // left-shift that brings a byte to the top of the word, `wq` the byte
+        // *index* (`24 - 8*by` is its shift) and produces the same
+        // `f16(q * s)` value the host dequant produced for M2 (pack2x16float
+        // rounds to f16 nearest-even).
+        s.push_str(
+            "fn q8(w: u32, sh: u32) -> f32 {\n\
+             \x20 return f32((bitcast<i32>(w << sh)) >> 24u);\n\
+             }\n\
+             fn wq(w: u32, by: u32, sc: f32) -> f32 {\n\
+             \x20 return unpack2x16float(pack2x16float(vec2<f32>(q8(w, 24u - 8u * by) * sc, 0.0))).x;\n\
+             }\n",
+        );
+    }
 
-    s.push_str(
+    s.push_str(&format!(
         "@compute @workgroup_size(16, 16)\n\
          fn gemm(@builtin(workgroup_id) wid: vec3<u32>,\n\
-                 @builtin(local_invocation_id) lid: vec3<u32>) {\n\
+                 @builtin(local_invocation_id) lid: vec3<u32>) {{\n\
          let tx = lid.x;\n let ty = lid.y;\n\
-         let m0 = wid.y * BM;\n let n0 = wid.x * BN;\n let kk = gd.k / 2u;\n\
+         let m0 = wid.y * BM;\n let n0 = wid.x * BN;\n let kk = gd.k / {kkd}u;\n\
          let alda = gd.lda / 2u;\n\
          let abase = wid.z * gd.bsa;\n let wb = wid.z * gd.bsb;\n\
          let cbase = wid.z * gd.bsc;\n\
-         if (CAUSAL == 1u && n0 + gd.row0 > m0 + BM - 1u) { return; }\n\
+         if (CAUSAL == 1u && n0 + gd.row0 > m0 + BM - 1u) {{ return; }}\n\
          let klim = select(gd.k, min(gd.k, max(m0 + BM, gd.row0) - gd.row0), CAUSAL_K == 1u);\n",
-    );
+        kkd = if w8 { 4 } else { 2 },
+    ));
     if v4 {
         // The chunk index and half-word parity every store path is written in
         // terms of: thread (tx, ty) owns chunks `c0` and `c0 + CSTEP`, i.e.
@@ -2161,6 +2266,17 @@ fn prefill_gemm_impl(
              \x20 let bog = ((bop >> 4u) << 3u) | (bop & 7u);\n\
              \x20 let bos = (bop >> 3u) & 1u;\n",
         );
+        if w8 {
+            // The int8 B tile: the thread's four weight rows (the same rows for
+            // `c0` and `c0 + CSTEP`), their scales, and the byte position —
+            // `kx` steps by `BK` (a multiple of 4), so `ck % 4` is the whole
+            // k loop's byte-in-word index.
+            s.push_str(
+                " let brow = gd.row0 + n0 + 8u * bog + 4u * bos;\n\
+                 \x20 let s0 = S8[brow]; let s1 = S8[brow + 1u]; let s2 = S8[brow + 2u]; let s3 = S8[brow + 3u];\n\
+                 \x20 let by = ck % 4u;\n",
+            );
+        }
     }
 
     for i in 0..tm {
@@ -2245,6 +2361,25 @@ fn prefill_gemm_impl(
                 }
                 return t;
             }
+            if w8 {
+                // The same four rows at one k, but each value is now a byte of
+                // its row's word `(kx + ck + 8*half) / 4` — the byte position
+                // itself is the per-thread constant `by`.
+                for half in 0..2 {
+                    let wo = format!("({kx} + ck + {}u) / 4u", half * 8);
+                    let mut comps = String::new();
+                    for e in 0..4 {
+                        comps.push_str(&format!(
+                            "\x20 wq(W[wb + (gd.row0 + n0 + 8u * bog + 4u * bos + {e}u) * kk + {wo}], by, s{e}),"
+                        ));
+                    }
+                    t.push_str(&format!(
+                        "  B4[c0{}] = vec4<f32>({comps});\n",
+                        if half == 0 { String::new() } else { " + CSTEP".into() }
+                    ));
+                }
+                return t;
+            }
             for half in 0..2 {
                 let kw = format!("({kx} + ck + {}u)", half * 8);
                 let mut comps = String::new();
@@ -2319,6 +2454,18 @@ fn prefill_gemm_impl(
                 }
                 return t;
             }
+            if w8 {
+                for half in 0..2 {
+                    let wo = format!("({kx} + ck + {}u) / 4u", half * 8);
+                    for e in 0..4 {
+                        t.push_str(&format!(
+                            "   pfb{} = W[wb + (gd.row0 + n0 + 8u * bog + 4u * bos + {e}u) * kk + {wo}];\n",
+                            half * 4 + e
+                        ));
+                    }
+                }
+                return t;
+            }
             for half in 0..2 {
                 let kw = format!("({kx} + ck + {}u)", half * 8);
                 for e in 0..4 {
@@ -2387,6 +2534,19 @@ fn prefill_gemm_impl(
                         cs = if half == 0 { String::new() } else { " + CSTEP".into() },
                         r = half * 2,
                         r2 = half * 2 + 1
+                    ));
+                }
+                return t;
+            }
+            if w8 {
+                for half in 0..2 {
+                    let mut comps = String::new();
+                    for e in 0..4 {
+                        comps.push_str(&format!("\x20 wq(pfb{}, by, s{e}),", half * 4 + e));
+                    }
+                    t.push_str(&format!(
+                        "   B4[c0{}] = vec4<f32>({comps});\n",
+                        if half == 0 { String::new() } else { " + CSTEP".into() }
                     ));
                 }
                 return t;

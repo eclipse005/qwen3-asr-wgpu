@@ -22,3 +22,6 @@ exp_probe/*.bin
 # published tree (they live on disk; the history they were in was never pushed)
 /docs/
 /HANDOFF.md
+
+# python bytecode from the eval drivers
+/scripts/__pycache__/

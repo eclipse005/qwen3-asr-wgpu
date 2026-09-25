@@ -43,6 +43,17 @@ fn main() -> anyhow::Result<()> {
         "gemv_rpwr" => {
             shaders::gemv_rpwr(num(2)?, num(3)?, num(4)? != 0, sg(), num(5)?, num(6)?)
         }
+        "gemv_w8" => shaders::gemv_w8(num(2)?, num(3)?, num(4)? != 0, sg(), num(5)?),
+        "gemv_w8_rpwr" => {
+            shaders::gemv_w8_rpwr(num(2)?, num(3)?, num(4)? != 0, sg(), num(5)?, num(6)?)
+        }
+        "gemv_norm" => {
+            shaders::gemv_norm(num(2)?, num(3)?, num(4)? != 0, sg(), num(3)?, num(5)?, 1e-6)
+        }
+        "gemv_norm_w8" => {
+            shaders::gemv_norm_w8(num(2)?, num(3)?, num(4)? != 0, sg(), num(3)?, num(5)?, 1e-6)
+        }
+        "gemm_w8" => shaders::prefill_gemm_w8(num(2)? != 0),
         "repeat_kv" => shaders::repeat_kv(num(2)?),
         "list" => {
             println!(

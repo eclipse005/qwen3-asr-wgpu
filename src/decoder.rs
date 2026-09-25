@@ -475,6 +475,12 @@ struct Layer {
     o_w: wgpu::Buffer,
     gu_w: wgpu::Buffer,
     dp_w: wgpu::Buffer,
+    /// The per-row f32 scale buffers for the W8 kernels — `Some` iff the
+    /// checkpoint is int8 (see [`LayerScales`]); the f16 kernels never see them.
+    qkv_s: Option<wgpu::Buffer>,
+    o_s: Option<wgpu::Buffer>,
+    gu_s: Option<wgpu::Buffer>,
+    dp_s: Option<wgpu::Buffer>,
     bg_gemv_qkv: wgpu::BindGroup,
     bg_gemv_o: wgpu::BindGroup,
     /// The same buffers as `bg_gemv_o` / `bg_gemv_dp`, bound against the
@@ -487,6 +493,17 @@ struct Layer {
     bg_gemv_dp: wgpu::BindGroup,
     bg_gemv_qkv_norm: wgpu::BindGroup,
     bg_gemv_gu_norm: wgpu::BindGroup,
+    /// The int8 forms of the six decode GEMVs, bound against the `_w8`
+    /// pipelines with the scale buffers at their extra binding.  Built only for
+    /// an int8 checkpoint; the dispatch sites pick by [`WgpuTextDecoder::int8`].
+    bg_gemv_w8_qkv: Option<wgpu::BindGroup>,
+    bg_gemv_w8_gu: Option<wgpu::BindGroup>,
+    bg_gemv_w8_qkv_norm: Option<wgpu::BindGroup>,
+    bg_gemv_w8_o: Option<wgpu::BindGroup>,
+    bg_gemv_w8_o_rpwr2: Option<wgpu::BindGroup>,
+    bg_gemv_w8_gu_norm: Option<wgpu::BindGroup>,
+    bg_gemv_w8_dp: Option<wgpu::BindGroup>,
+    bg_gemv_w8_dp_rpwr2: Option<wgpu::BindGroup>,
     bg_rms1: wgpu::BindGroup,
     bg_rms2: wgpu::BindGroup,
     bg_extract: wgpu::BindGroup,
@@ -507,6 +524,21 @@ struct Pipes {
     gemv_qkv_norm: wgpu::ComputePipeline,
     gemv_gu_norm: wgpu::ComputePipeline,
     gemv_lm_norm: wgpu::ComputePipeline,
+    /// The int8-resident forms (`shaders::gemv_w8*`, `shaders::prefill_gemm_w8`):
+    /// same granule/lane/reduction structure as the f16 kernels, half the weight
+    /// bytes on the bus, per-row scale bound alongside.  Built for every model —
+    /// an f16 checkpoint never dispatches them, and the compile cost is what
+    /// [`load_trace`] can price if it ever matters.
+    gemv_w8_o: wgpu::ComputePipeline,
+    gemv_w8_o_rpwr2: wgpu::ComputePipeline,
+    gemv_w8_dp: wgpu::ComputePipeline,
+    gemv_w8_dp_rpwr2: wgpu::ComputePipeline,
+    gemv_w8_qkv: wgpu::ComputePipeline,
+    gemv_w8_gu: wgpu::ComputePipeline,
+    gemv_w8_qkv_norm: wgpu::ComputePipeline,
+    gemv_w8_gu_norm: wgpu::ComputePipeline,
+    gemm_w8: wgpu::ComputePipeline,
+    gemm_w8_acc: wgpu::ComputePipeline,
     rms_norm: wgpu::ComputePipeline,
     extract: wgpu::ComputePipeline,
     gqa256: wgpu::ComputePipeline,
@@ -841,6 +873,11 @@ pub struct WgpuTextDecoder {
     embed_table: wgpu::Buffer,
     layers: Vec<Layer>,
     pipes: Pipes,
+    /// The checkpoint quantized the decoder's linears (M3): the weights sit in
+    /// VRAM as int8 with per-row scales, and every decode/prefill GEMV/GEMM
+    /// dispatch goes through the `_w8` kernels.  `embed`/`lm_head` and the
+    /// audio tower are unaffected (they are not quantized by the exporter).
+    int8: bool,
     pub scratch: Scratch,
 
     bg_final_rms: wgpu::BindGroup,
@@ -873,6 +910,7 @@ impl WgpuTextDecoder {
         let t = std::time::Instant::now();
         let w = weights::load_tensors(model_dir)?;
         crate::load_trace::note("decoder: tensors", t);
+        let int8 = checkpoint_is_int8(&w, prefix)?;
         let hs = cfg.hidden_size;
         let q_dim = cfg.q_dim();
         let nqh = cfg.num_attention_heads;
@@ -905,6 +943,13 @@ impl WgpuTextDecoder {
             &gpu,
             "prefill_gemm",
             &[(0, true), (1, true), (2, false)],
+            3,
+            true,
+        );
+        let gemm_w8_pl = family_layout_dyn(
+            &gpu,
+            "prefill_gemm_w8",
+            &[(0, true), (1, true), (2, false), (4, true)],
             3,
             true,
         );
@@ -941,6 +986,39 @@ impl WgpuTextDecoder {
                 "gemv",
                 None,
             )?,
+            gemv_w8_o: build("gemv_w8_o", &shaders::gemv_w8(hs, q_dim, true, subgroup, gemv_rpw()), "gemv", None)?,
+            gemv_w8_o_rpwr2: build(
+                "gemv_w8_o_rpwr2",
+                &shaders::gemv_w8_rpwr(hs, q_dim, true, subgroup, gemv_rpw(), 2),
+                "gemv",
+                None,
+            )?,
+            gemv_w8_dp: build("gemv_w8_dp", &shaders::gemv_w8(hs, inter, true, subgroup, gemv_rpw()), "gemv", None)?,
+            gemv_w8_dp_rpwr2: build(
+                "gemv_w8_dp_rpwr2",
+                &shaders::gemv_w8_rpwr(hs, inter, true, subgroup, gemv_rpw(), 2),
+                "gemv",
+                None,
+            )?,
+            // The plain (norm-not-folded) qkv/gu forms exist only so the
+            // per-op debug probes keep their exact f16 shape on an int8 model;
+            // the shipped decode loop uses the `_norm` fused forms above.
+            gemv_w8_qkv: build("gemv_w8_qkv", &shaders::gemv_w8(cfg.fused_qkv_cols(), hs, false, subgroup, gemv_rpw()), "gemv", None)?,
+            gemv_w8_gu: build("gemv_w8_gu", &shaders::gemv_w8(2 * inter, hs, false, subgroup, gemv_rpw()), "gemv", None)?,
+            gemv_w8_qkv_norm: build(
+                "gemv_w8_qkv_norm",
+                &shaders::gemv_norm_w8(cfg.fused_qkv_cols(), hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
+                "gemv",
+                None,
+            )?,
+            gemv_w8_gu_norm: build(
+                "gemv_w8_gu_norm",
+                &shaders::gemv_norm_w8(2 * inter, hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
+                "gemv",
+                None,
+            )?,
+            gemm_w8: build("gemm_w8", &shaders::prefill_gemm_w8(false), "gemm", Some(&gemm_w8_pl))?,
+            gemm_w8_acc: build("gemm_w8_acc", &shaders::prefill_gemm_w8(true), "gemm", Some(&gemm_w8_pl))?,
             rms_norm: build("rms_norm", &shaders::rms_norm(hs, rms_bs), "rms_norm", None)?,
             extract: build("qkv_extract", &shaders::qkv_extract(nqh, nkvh, hd), "qkv_extract", None)?,
             gqa256: build("gqa256", &shaders::gqa_decode_single(nqh, nkvh, hd, 256, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl))?,
@@ -1088,6 +1166,45 @@ impl WgpuTextDecoder {
                 ],
             })
         };
+        // The int8 forms: same weight/activation/output bindings plus the
+        // per-row f32 scale buffer (`gemv_w8` binding 3, `gemv_norm_w8`
+        // binding 4 — after the norm weights).
+        let gemv_w8_bg = |pipe: &wgpu::ComputePipeline,
+                          wt: &wgpu::Buffer,
+                          x: &wgpu::Buffer,
+                          y: &wgpu::Buffer,
+                          s: &wgpu::Buffer|
+         -> wgpu::BindGroup {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gemv_w8"),
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wt.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: y.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: s.as_entire_binding() },
+                ],
+            })
+        };
+        let gemv_norm_w8_bg = |pipe: &wgpu::ComputePipeline,
+                               wt: &wgpu::Buffer,
+                               x: &wgpu::Buffer,
+                               y: &wgpu::Buffer,
+                               nw: &wgpu::Buffer,
+                               s: &wgpu::Buffer|
+         -> wgpu::BindGroup {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gemv_norm_w8"),
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wt.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: y.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: nw.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: s.as_entire_binding() },
+                ],
+            })
+        };
         let gemv_norm_bg = |pipe: &wgpu::ComputePipeline,
                             wt: &wgpu::Buffer,
                             x: &wgpu::Buffer,
@@ -1130,7 +1247,7 @@ impl WgpuTextDecoder {
         scope.spawn(move || {
             for i in 0..nl {
                 let p = format!("{prefix}.layers.{i}");
-                if tx.send(convert_layer(&w, &p)).is_err() {
+                if tx.send(convert_layer(&w, &p, int8)).is_err() {
                     break; // consumer went away
                 }
             }
@@ -1141,13 +1258,32 @@ impl WgpuTextDecoder {
                 .recv()
                 .map_err(|_| anyhow!("weight conversion thread died at layer {i}"))??;
             t_conv += t.elapsed();
-            let LayerWeights { qkv: qkv_p, o: o_w, gu: gu_p, dp: dp_w, iln: iln_v, pln: pln_v, qn: qn_v, kn: kn_v } = lw;
+            let LayerWeights {
+                qkv: qkv_p,
+                o: o_w,
+                gu: gu_p,
+                dp: dp_w,
+                scales,
+                iln: iln_v,
+                pln: pln_v,
+                qn: qn_v,
+                kn: kn_v,
+            } = lw;
 
             let t = std::time::Instant::now();
             let qkv = up.upload_pieces("qkv_w", &qkv_p)?;
             let o = upload_weight(&mut up, "o_w", &o_w)?;
             let gu = up.upload_pieces("gu_w", &gu_p)?;
             let dp = upload_weight(&mut up, "dp_w", &dp_w)?;
+            let (qkv_s, o_s, gu_s, dp_s) = match &scales {
+                None => (None, None, None, None),
+                Some(sc) => (
+                    Some(upload_bytes(&mut up, "qkv_s", &sc.qkv)?),
+                    Some(upload_bytes(&mut up, "o_s", &sc.o)?),
+                    Some(upload_bytes(&mut up, "gu_s", &sc.gu)?),
+                    Some(upload_bytes(&mut up, "dp_s", &sc.dp)?),
+                ),
+            };
             let iln = upload_vec(&mut up, "iln_w", &iln_v)?;
             let pln = upload_vec(&mut up, "pln_w", &pln_v)?;
             let qn = upload_vec(&mut up, "qn_w", &qn_v)?;
@@ -1167,6 +1303,20 @@ impl WgpuTextDecoder {
             let bg_gemv_dp = gemv_bg(&pipes.gemv_dp, &dp, &scratch.activated, &scratch.h);
             let bg_gemv_dp_rpwr2 =
                 gemv_bg(&pipes.gemv_dp_rpwr2, &dp, &scratch.activated, &scratch.h);
+            let (bg_gemv_w8_qkv, bg_gemv_w8_gu, bg_gemv_w8_qkv_norm, bg_gemv_w8_o, bg_gemv_w8_o_rpwr2, bg_gemv_w8_gu_norm, bg_gemv_w8_dp, bg_gemv_w8_dp_rpwr2) =
+                match (&qkv_s, &o_s, &gu_s, &dp_s) {
+                    (Some(qs), Some(os), Some(gs), Some(ds)) => (
+                        Some(gemv_w8_bg(&pipes.gemv_w8_qkv, &qkv, &scratch.norm1, &scratch.qkv, qs)),
+                        Some(gemv_w8_bg(&pipes.gemv_w8_gu, &gu, &scratch.norm2, &scratch.gate_up, gs)),
+                        Some(gemv_norm_w8_bg(&pipes.gemv_w8_qkv_norm, &qkv, &scratch.h, &scratch.qkv, &iln, qs)),
+                        Some(gemv_w8_bg(&pipes.gemv_w8_o, &o, &scratch.attn_out, &scratch.h, os)),
+                        Some(gemv_w8_bg(&pipes.gemv_w8_o_rpwr2, &o, &scratch.attn_out, &scratch.h, os)),
+                        Some(gemv_norm_w8_bg(&pipes.gemv_w8_gu_norm, &gu, &scratch.h, &scratch.gate_up, &pln, gs)),
+                        Some(gemv_w8_bg(&pipes.gemv_w8_dp, &dp, &scratch.activated, &scratch.h, ds)),
+                        Some(gemv_w8_bg(&pipes.gemv_w8_dp_rpwr2, &dp, &scratch.activated, &scratch.h, ds)),
+                    ),
+                    _ => (None, None, None, None, None, None, None, None),
+                };
             let bg_rms1 = rms_bg(&scratch.h, &iln, &scratch.norm1);
             let bg_rms2 = rms_bg(&scratch.h, &pln, &scratch.norm2);
 
@@ -1195,6 +1345,10 @@ impl WgpuTextDecoder {
                 o_w: o,
                 gu_w: gu,
                 dp_w: dp,
+                qkv_s,
+                o_s,
+                gu_s,
+                dp_s,
                 bg_gemv_qkv,
                 bg_gemv_qkv_norm,
                 bg_gemv_o,
@@ -1203,6 +1357,14 @@ impl WgpuTextDecoder {
                 bg_gemv_gu,
                 bg_gemv_gu_norm,
                 bg_gemv_dp,
+                bg_gemv_w8_qkv,
+                bg_gemv_w8_gu,
+                bg_gemv_w8_qkv_norm,
+                bg_gemv_w8_o,
+                bg_gemv_w8_o_rpwr2,
+                bg_gemv_w8_gu_norm,
+                bg_gemv_w8_dp,
+                bg_gemv_w8_dp_rpwr2,
                 bg_rms1,
                 bg_rms2,
                 bg_extract,
@@ -1266,6 +1428,7 @@ impl WgpuTextDecoder {
             embed_table,
             layers,
             pipes,
+            int8,
             scratch,
             bg_final_rms,
             bg_gemv_lm,
@@ -1454,8 +1617,13 @@ impl WgpuTextDecoder {
 
         for l in &self.layers[lo..hi] {
             if !k("qkv") {
-                cp.set_pipeline(&self.pipes.gemv_qkv_norm);
-                cp.set_bind_group(0, &l.bg_gemv_qkv_norm, &[]);
+                if self.int8 {
+                    cp.set_pipeline(&self.pipes.gemv_w8_qkv_norm);
+                    cp.set_bind_group(0, l.bg_gemv_w8_qkv_norm.as_ref().expect("int8 bind groups"), &[]);
+                } else {
+                    cp.set_pipeline(&self.pipes.gemv_qkv_norm);
+                    cp.set_bind_group(0, &l.bg_gemv_qkv_norm, &[]);
+                }
                 cp.dispatch_workgroups(norm_grid(cfg.fused_qkv_cols()), 1, 1);
             }
             if d("qkv") {
@@ -1482,7 +1650,19 @@ impl WgpuTextDecoder {
 
             let rpwr = gemv_rpwr_o_dp(cfg.hidden_size);
             if !k("o") {
-                if rpwr == 2 {
+                if self.int8 {
+                    let bg = if rpwr == 2 {
+                        &l.bg_gemv_w8_o_rpwr2
+                    } else {
+                        &l.bg_gemv_w8_o
+                    };
+                    cp.set_pipeline(if rpwr == 2 {
+                        &self.pipes.gemv_w8_o_rpwr2
+                    } else {
+                        &self.pipes.gemv_w8_o
+                    });
+                    cp.set_bind_group(0, bg.as_ref().expect("int8 bind groups"), &[]);
+                } else if rpwr == 2 {
                     cp.set_pipeline(&self.pipes.gemv_o_rpwr2);
                     cp.set_bind_group(0, &l.bg_gemv_o_rpwr2, &[]);
                 } else {
@@ -1496,8 +1676,13 @@ impl WgpuTextDecoder {
             }
 
             if !k("gu") {
-                cp.set_pipeline(&self.pipes.gemv_gu_norm);
-                cp.set_bind_group(0, &l.bg_gemv_gu_norm, &[]);
+                if self.int8 {
+                    cp.set_pipeline(&self.pipes.gemv_w8_gu_norm);
+                    cp.set_bind_group(0, l.bg_gemv_w8_gu_norm.as_ref().expect("int8 bind groups"), &[]);
+                } else {
+                    cp.set_pipeline(&self.pipes.gemv_gu_norm);
+                    cp.set_bind_group(0, &l.bg_gemv_gu_norm, &[]);
+                }
                 cp.dispatch_workgroups(norm_grid(2 * cfg.intermediate_size), 1, 1);
             }
             if d("gu") {
@@ -1514,7 +1699,19 @@ impl WgpuTextDecoder {
             }
 
             if !k("dp") {
-                if rpwr == 2 {
+                if self.int8 {
+                    let bg = if rpwr == 2 {
+                        &l.bg_gemv_w8_dp_rpwr2
+                    } else {
+                        &l.bg_gemv_w8_dp
+                    };
+                    cp.set_pipeline(if rpwr == 2 {
+                        &self.pipes.gemv_w8_dp_rpwr2
+                    } else {
+                        &self.pipes.gemv_w8_dp
+                    });
+                    cp.set_bind_group(0, bg.as_ref().expect("int8 bind groups"), &[]);
+                } else if rpwr == 2 {
                     cp.set_pipeline(&self.pipes.gemv_dp_rpwr2);
                     cp.set_bind_group(0, &l.bg_gemv_dp_rpwr2, &[]);
                 } else {
@@ -1805,30 +2002,63 @@ impl WgpuTextDecoder {
         let silu_grid = grid_xy((cfg.intermediate_size / 2).div_ceil(256));
         let layer = &self.layers[l];
         let mut cp = enc.begin_compute_pass(&Default::default());
+        let w8 = self.int8;
         cp.set_pipeline(&self.pipes.rms_norm);
         cp.set_bind_group(0, &layer.bg_rms1, &[]);
         cp.dispatch_workgroups(1, 1, 1);
-        cp.set_pipeline(&self.pipes.gemv_qkv);
-        cp.set_bind_group(0, &layer.bg_gemv_qkv, &[]);
+        cp.set_pipeline(if w8 { &self.pipes.gemv_w8_qkv } else { &self.pipes.gemv_qkv });
+        cp.set_bind_group(
+            0,
+            if w8 {
+                layer.bg_gemv_w8_qkv.as_ref().expect("int8 bind groups")
+            } else {
+                &layer.bg_gemv_qkv
+            },
+            &[],
+        );
         cp.dispatch_workgroups(gemv_grid(cfg.fused_qkv_cols()), 1, 1);
         cp.set_pipeline(&self.pipes.extract);
         cp.set_bind_group(0, &layer.bg_extract, &[]);
         cp.dispatch_workgroups(1, (cfg.num_attention_heads + cfg.num_key_value_heads) as u32, 1);
         self.encode_gqa(&mut cp, layer, cur_len);
-        cp.set_pipeline(&self.pipes.gemv_o);
-        cp.set_bind_group(0, &layer.bg_gemv_o, &[]);
+        cp.set_pipeline(if w8 { &self.pipes.gemv_w8_o } else { &self.pipes.gemv_o });
+        cp.set_bind_group(
+            0,
+            if w8 {
+                layer.bg_gemv_w8_o.as_ref().expect("int8 bind groups")
+            } else {
+                &layer.bg_gemv_o
+            },
+            &[],
+        );
         cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
         cp.set_pipeline(&self.pipes.rms_norm);
         cp.set_bind_group(0, &layer.bg_rms2, &[]);
         cp.dispatch_workgroups(1, 1, 1);
-        cp.set_pipeline(&self.pipes.gemv_gu);
-        cp.set_bind_group(0, &layer.bg_gemv_gu, &[]);
+        cp.set_pipeline(if w8 { &self.pipes.gemv_w8_gu } else { &self.pipes.gemv_gu });
+        cp.set_bind_group(
+            0,
+            if w8 {
+                layer.bg_gemv_w8_gu.as_ref().expect("int8 bind groups")
+            } else {
+                &layer.bg_gemv_gu
+            },
+            &[],
+        );
         cp.dispatch_workgroups(gemv_grid(2 * cfg.intermediate_size), 1, 1);
         cp.set_pipeline(&self.pipes.silu);
         cp.set_bind_group(0, &self.bg_silu, &[]);
         cp.dispatch_workgroups(silu_grid.0, silu_grid.1, 1);
-        cp.set_pipeline(&self.pipes.gemv_dp);
-        cp.set_bind_group(0, &layer.bg_gemv_dp, &[]);
+        cp.set_pipeline(if w8 { &self.pipes.gemv_w8_dp } else { &self.pipes.gemv_dp });
+        cp.set_bind_group(
+            0,
+            if w8 {
+                layer.bg_gemv_w8_dp.as_ref().expect("int8 bind groups")
+            } else {
+                &layer.bg_gemv_dp
+            },
+            &[],
+        );
         cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
     }
 
@@ -1870,16 +2100,33 @@ impl WgpuTextDecoder {
         let cfg = &self.cfg;
         let gemv_grid = |rows: usize| (rows / gemv_rpw()) as u32;
         let layer = &self.layers[l];
+        let w8 = self.int8;
         match op {
             0 => { cp.set_pipeline(&self.pipes.rms_norm); cp.set_bind_group(0, &layer.bg_rms1, &[]); cp.dispatch_workgroups(1, 1, 1); }
-            1 => { cp.set_pipeline(&self.pipes.gemv_qkv); cp.set_bind_group(0, &layer.bg_gemv_qkv, &[]); cp.dispatch_workgroups(gemv_grid(cfg.fused_qkv_cols()), 1, 1); }
+            1 => {
+                cp.set_pipeline(if w8 { &self.pipes.gemv_w8_qkv } else { &self.pipes.gemv_qkv });
+                cp.set_bind_group(0, if w8 { layer.bg_gemv_w8_qkv.as_ref().expect("int8 bind groups") } else { &layer.bg_gemv_qkv }, &[]);
+                cp.dispatch_workgroups(gemv_grid(cfg.fused_qkv_cols()), 1, 1);
+            }
             2 => { cp.set_pipeline(&self.pipes.extract); cp.set_bind_group(0, &layer.bg_extract, &[]); cp.dispatch_workgroups(1, (cfg.num_attention_heads + cfg.num_key_value_heads) as u32, 1); }
             3 => self.encode_gqa(cp, layer, pos + 1),
-            4 => { cp.set_pipeline(&self.pipes.gemv_o); cp.set_bind_group(0, &layer.bg_gemv_o, &[]); cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1); }
+            4 => {
+                cp.set_pipeline(if w8 { &self.pipes.gemv_w8_o } else { &self.pipes.gemv_o });
+                cp.set_bind_group(0, if w8 { layer.bg_gemv_w8_o.as_ref().expect("int8 bind groups") } else { &layer.bg_gemv_o }, &[]);
+                cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
+            }
             5 => { cp.set_pipeline(&self.pipes.rms_norm); cp.set_bind_group(0, &layer.bg_rms2, &[]); cp.dispatch_workgroups(1, 1, 1); }
-            6 => { cp.set_pipeline(&self.pipes.gemv_gu); cp.set_bind_group(0, &layer.bg_gemv_gu, &[]); cp.dispatch_workgroups(gemv_grid(2 * cfg.intermediate_size), 1, 1); }
+            6 => {
+                cp.set_pipeline(if w8 { &self.pipes.gemv_w8_gu } else { &self.pipes.gemv_gu });
+                cp.set_bind_group(0, if w8 { layer.bg_gemv_w8_gu.as_ref().expect("int8 bind groups") } else { &layer.bg_gemv_gu }, &[]);
+                cp.dispatch_workgroups(gemv_grid(2 * cfg.intermediate_size), 1, 1);
+            }
             7 => { cp.set_pipeline(&self.pipes.silu); cp.set_bind_group(0, &self.bg_silu, &[]); cp.dispatch_workgroups(((cfg.intermediate_size / 2).div_ceil(256)) as u32, 1, 1); }
-            8 => { cp.set_pipeline(&self.pipes.gemv_dp); cp.set_bind_group(0, &layer.bg_gemv_dp, &[]); cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1); }
+            8 => {
+                cp.set_pipeline(if w8 { &self.pipes.gemv_w8_dp } else { &self.pipes.gemv_dp });
+                cp.set_bind_group(0, if w8 { layer.bg_gemv_w8_dp.as_ref().expect("int8 bind groups") } else { &layer.bg_gemv_dp }, &[]);
+                cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
+            }
             _ => panic!("debug_encode_op: op {op} out of range"),
         }
     }
@@ -1948,11 +2195,17 @@ impl WgpuTextDecoder {
     /// Bytes of weight traffic per decode step (for the bandwidth figure).
     pub fn step_weight_bytes(&self) -> u64 {
         let c = &self.cfg;
-        let per_layer = (c.fused_qkv_cols() * c.hidden_size
+        let elems = (c.fused_qkv_cols() * c.hidden_size
             + c.hidden_size * c.q_dim()
             + 2 * c.intermediate_size * c.hidden_size
-            + c.hidden_size * c.intermediate_size) as u64
-            * 2;
+            + c.hidden_size * c.intermediate_size) as u64;
+        // int8 residency: one byte per weight plus the per-row f32 scale of
+        // each matrix (`lm_head`/embed stay f16 either way).
+        let per_layer = if self.int8 {
+            elems + (c.fused_qkv_cols() + c.hidden_size + 2 * c.intermediate_size + c.hidden_size) as u64 * 4
+        } else {
+            elems * 2
+        };
         per_layer * c.num_hidden_layers as u64 + (c.vocab_size * c.hidden_size) as u64 * 2
     }
 
@@ -2017,6 +2270,13 @@ fn upload_weight(up: &mut BulkUpload, label: &str, w: &PackedWeight) -> Result<w
     Ok(b)
 }
 
+/// Upload raw bytes (the int8 layers' scale buffers) as a storage binding.
+fn upload_bytes(up: &mut BulkUpload, label: &str, v: &[u8]) -> Result<wgpu::Buffer> {
+    let b = up.storage(label, v.len() as u64);
+    up.upload(&b, v)?;
+    Ok(b)
+}
+
 fn upload_vec(up: &mut BulkUpload, label: &str, v: &[half::f16]) -> Result<wgpu::Buffer> {
     let b = up.storage(label, (v.len() * 2) as u64);
     up.upload(&b, &weights::words_bytes(v))?;
@@ -2055,13 +2315,54 @@ fn fused_pieces(
         return Ok(pieces);
     }
 
+    // An I8 part in an f16 fusion group is a malformed file: the GPU path for
+    // int8 checkpoints is [`fused_i8_pieces`] (weights stay resident), so a
+    // silent dequantize here would put f16 bytes where the W8 kernels expect
+    // int8 — fail loudly instead.
+    anyhow::ensure!(
+        tensors.iter().all(|t| t.dtype != Dtype::I8),
+        "mixed I8/float fusion for {prefix}: the exporter quantizes whole groups"
+    );
+
     let mut out = Vec::with_capacity(total_bytes(&tensors)?);
-    for t in &tensors {
+    for t in tensors.iter() {
         let start = out.len();
         out.resize(start + t.data.len() / t.dtype.size() * 2, 0);
         t.narrow_f16_into(&mut out[start..])?;
     }
     Ok(vec![(0, out.into())])
+}
+
+/// Fuse an I8 fusion group into the device's resident-int8 form: per-part zero-
+/// copy byte pieces (the file's own rows, u32-word aligned because every part's
+/// `cols` is a multiple of 4) plus the per-row f32 scales concatenated in the
+/// *same part order* — fused row `r` must read `S[r]`, and the ordering bug M2
+/// made impossible is exactly the one this function could reintroduce, so
+/// weights and scales travel together and `concat_rows`-style order is the
+/// only order they can have.
+fn fused_i8_pieces(
+    w: &HashMap<String, weights::RawTensor>,
+    prefix: &str,
+    parts: &[&str],
+) -> Result<(Vec<(u64, bytes::Bytes)>, bytes::Bytes)> {
+    let mut pieces = Vec::with_capacity(parts.len());
+    let mut scales = Vec::new();
+    let mut off = 0u64;
+    let mut cols: Option<usize> = None;
+    for p in parts {
+        let name = format!("{prefix}.{p}.weight");
+        let m = weights::get_int8(w, &name)?;
+        anyhow::ensure!(
+            cols.map_or(true, |c| c == m.cols),
+            "{prefix}: fused int8 parts disagree on cols ({cols:?} vs {})",
+            m.cols
+        );
+        cols = Some(m.cols);
+        pieces.push((off, m.data.clone()));
+        off += m.data.len() as u64;
+        scales.extend_from_slice(&m.scale);
+    }
+    Ok((pieces, scales.into()))
 }
 
 /// How many layers of converted weights the prefetch thread may run ahead with.
@@ -2077,23 +2378,93 @@ struct LayerWeights {
     o: PackedWeight,
     gu: Vec<(u64, bytes::Bytes)>,
     dp: PackedWeight,
+    /// `Some` iff this layer's linears are int8-resident (the M3 layout): f32
+    /// LE per-row scales for `qkv | o | gu | dp` in fused row order, while
+    /// `qkv`/`o`/`gu`/`dp` then carry the raw int8 bytes the W8 kernels read.
+    /// `None` is the f16 checkpoint.  The exporter quantizes a layer's linears
+    /// all-or-none, and [`convert_layer`] fails anything in between.
+    scales: Option<LayerScales>,
     iln: Vec<half::f16>,
     pln: Vec<half::f16>,
     qn: Vec<half::f16>,
     kn: Vec<half::f16>,
 }
 
+/// The four scale buffers of an int8 layer, in fused row order — the buffer
+/// the W8 kernels' `S` binding reads.
+struct LayerScales {
+    qkv: bytes::Bytes,
+    o: bytes::Bytes,
+    gu: bytes::Bytes,
+    dp: bytes::Bytes,
+}
+
+/// Whether the checkpoint quantized the decoder's linears at all.  The
+/// exporter does so checkpoint-wide, so layer 0's `q_proj` decides; every
+/// layer is held to that answer by [`convert_layer`].
+fn checkpoint_is_int8(w: &HashMap<String, weights::RawTensor>, prefix: &str) -> Result<bool> {
+    let name = format!("{prefix}.layers.0.self_attn.q_proj.weight");
+    let t = w
+        .get(&name)
+        .ok_or_else(|| anyhow!("weight not found: {name}"))?;
+    Ok(t.dtype == Dtype::I8)
+}
+
 /// Read one layer's tensors out of the checkpoint in upload-ready form.
-fn convert_layer(w: &HashMap<String, weights::RawTensor>, p: &str) -> Result<LayerWeights> {
+///
+/// `int8` is the checkpoint-wide mode ([`checkpoint_is_int8`]); an f16 layer
+/// with an I8 part (or the reverse) is a malformed file and an error here, not
+/// a silent dequantize — the W8 kernels would read the wrong bytes.
+fn convert_layer(w: &HashMap<String, weights::RawTensor>, p: &str, int8: bool) -> Result<LayerWeights> {
+    let iln = weights::get_vector(w, &format!("{p}.input_layernorm.weight"))?;
+    let pln = weights::get_vector(w, &format!("{p}.post_attention_layernorm.weight"))?;
+    let qn = weights::get_vector(w, &format!("{p}.self_attn.q_norm.weight"))?;
+    let kn = weights::get_vector(w, &format!("{p}.self_attn.k_norm.weight"))?;
+    if int8 {
+        let (qkv, qkv_s) =
+            fused_i8_pieces(w, &format!("{p}.self_attn"), &["q_proj", "k_proj", "v_proj"])?;
+        let (gu, gu_s) = fused_i8_pieces(w, &format!("{p}.mlp"), &["gate_proj", "up_proj"])?;
+        let o = weights::get_int8(w, &format!("{p}.self_attn.o_proj.weight"))?;
+        let dp = weights::get_int8(w, &format!("{p}.mlp.down_proj.weight"))?;
+        return Ok(LayerWeights {
+            // The int8 bytes ride in `PackedWeight`'s data slot (the upload is
+            // dtype-blind); `scales` is what says how to read them back.
+            o: PackedWeight { data: o.data.clone(), rows: o.rows, cols: o.cols },
+            dp: PackedWeight { data: dp.data.clone(), rows: dp.rows, cols: dp.cols },
+            qkv,
+            gu,
+            scales: Some(LayerScales {
+                qkv: qkv_s,
+                o: o.scale.clone(),
+                gu: gu_s,
+                dp: dp.scale.clone(),
+            }),
+            iln,
+            pln,
+            qn,
+            kn,
+        });
+    }
+    let o_name = format!("{p}.self_attn.o_proj.weight");
+    anyhow::ensure!(
+        w.get(&o_name).map(|t| t.dtype != Dtype::I8).unwrap_or(false),
+        "{o_name} is I8 in an otherwise-f16 checkpoint; quantize the whole decoder or none"
+    );
+    let dp_name = format!("{p}.mlp.down_proj.weight");
+    anyhow::ensure!(
+        w.get(&dp_name).map(|t| t.dtype != Dtype::I8).unwrap_or(false),
+        "{dp_name} is I8 in an otherwise-f16 checkpoint; quantize the whole decoder or none"
+    );
     Ok(LayerWeights {
-        o: weights::get_matrix(w, &format!("{p}.self_attn.o_proj.weight"))?,
-        dp: weights::get_matrix(w, &format!("{p}.mlp.down_proj.weight"))?,
+        o: weights::get_matrix(w, &o_name)?,
+        dp: weights::get_matrix(w, &dp_name)?,
         qkv: fused_pieces(w, &format!("{p}.self_attn"), &["q_proj", "k_proj", "v_proj"])?,
         gu: fused_pieces(w, &format!("{p}.mlp"), &["gate_proj", "up_proj"])?,
-        iln: weights::get_vector(w, &format!("{p}.input_layernorm.weight"))?,
-        pln: weights::get_vector(w, &format!("{p}.post_attention_layernorm.weight"))?,
-        qn: weights::get_vector(w, &format!("{p}.self_attn.q_norm.weight"))?,
-        kn: weights::get_vector(w, &format!("{p}.self_attn.k_norm.weight"))?,
+        scales: None,
+        iln,
+        pln,
+        qn,
+        kn,
     })
 }
 
@@ -2223,6 +2594,46 @@ impl WgpuTextDecoder {
                 ],
             })
         };
+        // The int8 weight GEMM: `gemm_bg` plus the per-row f32 scale buffer at
+        // binding 4 (the shader's `S8`).
+        let gemm_w8_bg = |pipe: &wgpu::ComputePipeline,
+                          a: &wgpu::Buffer,
+                          w: &wgpu::Buffer,
+                          s: &wgpu::Buffer,
+                          c: &wgpu::Buffer,
+                          coff: u64,
+                          u_gd: &wgpu::Buffer|
+         -> wgpu::BindGroup {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("p.gemm_w8"),
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: a.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: w.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: if coff == 0 {
+                            c.as_entire_binding()
+                        } else {
+                            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: c,
+                                offset: coff,
+                                size: None,
+                            })
+                        },
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: u_gd,
+                            offset: 0,
+                            size: std::num::NonZeroU64::new(64),
+                        }),
+                    },
+                    wgpu::BindGroupEntry { binding: 4, resource: s.as_entire_binding() },
+                ],
+            })
+        };
         let mut gd_slot = 2 * MAX_SLAB;
         macro_rules! gemm_at {
             ($cp:expr, $pipe:expr, $a:expr, $w:expr, $c:expr, $coff:expr, $slot:expr, $gdims:expr,
@@ -2257,6 +2668,34 @@ impl WgpuTextDecoder {
                     },
                     $gx, $gy, $gz
                 );
+            }};
+        }
+        // The int8 weight GEMM — `gemm!` with the scale buffer.  Dispatched only
+        // on an int8 checkpoint (`self.int8`), and only for the four weight
+        // operands; the attention GEMMs stay f16.
+        macro_rules! gemm_w8 {
+            ($cp:expr, $pipe:expr, $a:expr, $w:expr, $s:expr, $c:expr, $m:expr, $n:expr, $k:expr,
+             $ldc:expr, $bsa:expr, $bsb:expr, $bsc:expr, $gx:expr, $gy:expr, $gz:expr) => {{
+                let slot = gd_slot;
+                gd_slot += 1;
+                assert!(slot < MAX_GEMMS as usize, "prefill: GEMM uniform slots exhausted");
+                let off = ((slot) * 256) as u64;
+                gpu.queue.write_buffer(&u_gd, off, bytemuck::bytes_of(&GDims {
+                    m: $m as u32,
+                    n: $n as u32,
+                    k: $k as u32,
+                    ldc: $ldc as u32,
+                    bsa: $bsa as u32,
+                    bsb: $bsb as u32,
+                    bsc: $bsc as u32,
+                    beta: 0,
+                    row0: 0,
+                    lda: $k as u32,
+                }));
+                let bg = gemm_w8_bg($pipe, $a, $w, $s, $c, 0u64, &u_gd);
+                $cp.set_pipeline($pipe);
+                $cp.set_bind_group(0, &bg, &[off as u32]);
+                $cp.dispatch_workgroups($gx, $gy, $gz);
             }};
         }
 
@@ -2396,11 +2835,20 @@ impl WgpuTextDecoder {
             cp.dispatch_workgroups(s as u32, 1, 1);
 
             if !sk("p_qkv") {
-                gemm!(
-                    &mut cp, &self.pipes.gemm, &normed, &layer.qkv_w, &qkv,
-                    s, cfg.fused_qkv_cols(), hs, cfg.fused_qkv_cols(), 0, 0, 0,
-                    (cfg.fused_qkv_cols() / 128) as u32, (mp / 128) as u32, 1
-                );
+                if self.int8 {
+                    gemm_w8!(
+                        &mut cp, &self.pipes.gemm_w8, &normed, &layer.qkv_w,
+                        layer.qkv_s.as_ref().expect("int8 scale buffers"), &qkv,
+                        s, cfg.fused_qkv_cols(), hs, cfg.fused_qkv_cols(), 0, 0, 0,
+                        (cfg.fused_qkv_cols() / 128) as u32, (mp / 128) as u32, 1
+                    );
+                } else {
+                    gemm!(
+                        &mut cp, &self.pipes.gemm, &normed, &layer.qkv_w, &qkv,
+                        s, cfg.fused_qkv_cols(), hs, cfg.fused_qkv_cols(), 0, 0, 0,
+                        (cfg.fused_qkv_cols() / 128) as u32, (mp / 128) as u32, 1
+                    );
+                }
             }
 
             let bg_ex = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2646,11 +3094,20 @@ impl WgpuTextDecoder {
             }
 
             if !sk("p_o") {
-                gemm!(
-                    &mut cp, &self.pipes.gemm_acc, &attn_flat, &layer.o_w, &h_buf,
-                    s, hs, nqh * hd, hs, 0, 0, 0,
-                    (hs / 128) as u32, (mp / 128) as u32, 1
-                );
+                if self.int8 {
+                    gemm_w8!(
+                        &mut cp, &self.pipes.gemm_w8_acc, &attn_flat, &layer.o_w,
+                        layer.o_s.as_ref().expect("int8 scale buffers"), &h_buf,
+                        s, hs, nqh * hd, hs, 0, 0, 0,
+                        (hs / 128) as u32, (mp / 128) as u32, 1
+                    );
+                } else {
+                    gemm!(
+                        &mut cp, &self.pipes.gemm_acc, &attn_flat, &layer.o_w, &h_buf,
+                        s, hs, nqh * hd, hs, 0, 0, 0,
+                        (hs / 128) as u32, (mp / 128) as u32, 1
+                    );
+                }
             }
 
             let bg_rms2 = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2671,11 +3128,20 @@ impl WgpuTextDecoder {
             }
 
             if !sk("p_gu") {
-                gemm!(
-                    &mut cp, &self.pipes.gemm, &norm2, &layer.gu_w, &gu,
-                    s, 2 * inter, hs, 2 * inter, 0, 0, 0,
-                    ((2 * inter) / 128) as u32, (mp / 128) as u32, 1
-                );
+                if self.int8 {
+                    gemm_w8!(
+                        &mut cp, &self.pipes.gemm_w8, &norm2, &layer.gu_w,
+                        layer.gu_s.as_ref().expect("int8 scale buffers"), &gu,
+                        s, 2 * inter, hs, 2 * inter, 0, 0, 0,
+                        ((2 * inter) / 128) as u32, (mp / 128) as u32, 1
+                    );
+                } else {
+                    gemm!(
+                        &mut cp, &self.pipes.gemm, &norm2, &layer.gu_w, &gu,
+                        s, 2 * inter, hs, 2 * inter, 0, 0, 0,
+                        ((2 * inter) / 128) as u32, (mp / 128) as u32, 1
+                    );
+                }
             }
 
             let bg_silu = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2695,11 +3161,20 @@ impl WgpuTextDecoder {
             }
 
             if !sk("p_dp") {
-                gemm!(
-                    &mut cp, &self.pipes.gemm_acc, &activated, &layer.dp_w, &h_buf,
-                    s, hs, inter, hs, 0, 0, 0,
-                    (hs / 128) as u32, (mp / 128) as u32, 1
-                );
+                if self.int8 {
+                    gemm_w8!(
+                        &mut cp, &self.pipes.gemm_w8_acc, &activated, &layer.dp_w,
+                        layer.dp_s.as_ref().expect("int8 scale buffers"), &h_buf,
+                        s, hs, inter, hs, 0, 0, 0,
+                        (hs / 128) as u32, (mp / 128) as u32, 1
+                    );
+                } else {
+                    gemm!(
+                        &mut cp, &self.pipes.gemm_acc, &activated, &layer.dp_w, &h_buf,
+                        s, hs, inter, hs, 0, 0, 0,
+                        (hs / 128) as u32, (mp / 128) as u32, 1
+                    );
+                }
             }
 
             let submit_every = if s >= 4096 { 2 } else { 4 };
