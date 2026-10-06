@@ -5,6 +5,11 @@ use crate::inference::EncoderBackend;
 ///
 /// The GPU here is whatever wgpu can drive — Vulkan, D3D12, Metal or GL — and
 /// there is deliberately no variant naming one vendor's runtime.
+///
+/// * [`Self::Auto`] — one real GPU, or the CPU towers when none can be opened.
+/// * [`Self::Cpu`] — the CPU towers. No adapter.
+/// * [`Self::Gpu`] — the best GPU. No adapter, a failed open, or a GPU audio
+///   tower that will not build is an error, not a silent CPU run.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
@@ -35,25 +40,57 @@ impl Backend {
         }
     }
 
-    pub(crate) fn resolve(self) -> crate::Result<(DeviceSelector, EncoderBackend)> {
+    /// Device, audio tower, and whether a failed open may use the CPU towers.
+    ///
+    /// Only [`Self::Auto`] sets the fallback. [`Self::Gpu`] still selects
+    /// [`DeviceSelector::Auto`] (the best card) and leaves the error to the load.
+    pub(crate) fn plan(self) -> DevicePlan {
         match self {
-            Backend::Auto => Ok((DeviceSelector::Auto, EncoderBackend::Gpu)),
-            Backend::Cpu => Ok((DeviceSelector::Cpu, EncoderBackend::Cpu)),
-            Backend::Gpu => {
-                if !has_gpu_adapter() {
-                    return Err(crate::AsrError::ModelLoad(anyhow::anyhow!(
-                        "no GPU adapter: wgpu sees no device that is not itself a CPU \
-                         implementation — use Backend::Cpu, or Backend::Auto to fall back"
-                    )));
-                }
-                Ok((DeviceSelector::Auto, EncoderBackend::Gpu))
-            }
+            Backend::Auto => DevicePlan {
+                selector: DeviceSelector::Auto,
+                encoder: EncoderBackend::Gpu,
+                allow_fallback: true,
+            },
+            Backend::Cpu => DevicePlan {
+                selector: DeviceSelector::Cpu,
+                encoder: EncoderBackend::Cpu,
+                allow_fallback: false,
+            },
+            Backend::Gpu => DevicePlan {
+                selector: DeviceSelector::Auto,
+                encoder: EncoderBackend::Gpu,
+                allow_fallback: false,
+            },
         }
     }
 }
 
-fn has_gpu_adapter() -> bool {
-    crate::inference::AsrInference::device_targets()
-        .iter()
-        .any(|t| t.info.device_type != wgpu::DeviceType::Cpu)
+/// What [`Backend::plan`] decided, before any weight is read.
+pub(crate) struct DevicePlan {
+    pub selector: DeviceSelector,
+    pub encoder: EncoderBackend,
+    pub allow_fallback: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_fallback_is_only_auto() {
+        let auto = Backend::Auto.plan();
+        assert!(auto.allow_fallback);
+        assert_eq!(auto.selector, DeviceSelector::Auto);
+        assert_eq!(auto.encoder, EncoderBackend::Gpu);
+
+        let cpu = Backend::Cpu.plan();
+        assert!(!cpu.allow_fallback);
+        assert_eq!(cpu.selector, DeviceSelector::Cpu);
+        assert_eq!(cpu.encoder, EncoderBackend::Cpu);
+
+        let gpu = Backend::Gpu.plan();
+        assert!(!gpu.allow_fallback);
+        assert_eq!(gpu.selector, DeviceSelector::Auto);
+        assert_eq!(gpu.encoder, EncoderBackend::Gpu);
+    }
 }

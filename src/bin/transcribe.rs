@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
-use qwen3_asr_wgpu::{diagnostics, AsrInference, DeviceSelector, EncoderBackend, TranscribeOptions};
+use qwen3_asr_wgpu::{
+    diagnostics, AsrInference, Backend, DeviceSelector, EncoderBackend, TranscribeOptions,
+};
 
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
@@ -10,6 +12,37 @@ fn arg(args: &[String], name: &str) -> Option<String> {
 
 fn flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+
+/// `auto` may fall back. `cpu` is the host. `gpu` and any other spec require
+/// that device. `--cpu-enc` keeps the host audio tower and still obeys the
+/// same device policy for the text decoder.
+fn load_asr(model: &std::path::Path, spec: &str, cpu_enc: bool) -> Result<AsrInference> {
+    if spec.eq_ignore_ascii_case("cpu") {
+        return Ok(AsrInference::load(model, Backend::Cpu)?);
+    }
+    if cpu_enc {
+        let (selector, allow_fallback) = if spec.eq_ignore_ascii_case("auto") {
+            (DeviceSelector::Auto, true)
+        } else if spec.eq_ignore_ascii_case("gpu") {
+            (DeviceSelector::Auto, false)
+        } else {
+            (DeviceSelector::parse(spec)?, false)
+        };
+        return Ok(AsrInference::load_with_fallback(
+            model,
+            selector,
+            EncoderBackend::Cpu,
+            allow_fallback,
+        )?);
+    }
+    if spec.eq_ignore_ascii_case("auto") {
+        return Ok(AsrInference::load(model, Backend::Auto)?);
+    }
+    if spec.eq_ignore_ascii_case("gpu") {
+        return Ok(AsrInference::load(model, Backend::Gpu)?);
+    }
+    Ok(AsrInference::load_on(model, DeviceSelector::parse(spec)?)?)
 }
 
 fn required(args: &[String], name: &str, env: &str) -> Result<String> {
@@ -38,30 +71,25 @@ fn main() -> Result<()> {
     }
     let model = PathBuf::from(required(&args, "--model", "QASR_MODEL")?);
     let wav = PathBuf::from(required(&args, "--wav", "QASR_WAV")?);
-    let adapter = if flag(&args, "--cpu-dec") {
-        Some("cpu".to_string())
+    // `--cpu-dec` is the whole host path. Otherwise `auto` may fall back,
+    // `gpu` must open a GPU, and a runtime or name is that adapter or an error.
+    let spec = if flag(&args, "--cpu-dec") {
+        "cpu".to_string()
     } else {
         arg(&args, "--device")
             .or_else(|| arg(&args, "--adapter"))
             .or_else(|| std::env::var("QASR_DEVICE").ok().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "auto".to_string())
     };
     let max_new: usize = arg(&args, "--max-new")
         .and_then(|s| s.parse().ok())
         .unwrap_or(512);
-    let backend = if flag(&args, "--cpu-enc") {
-        EncoderBackend::Cpu
-    } else {
-        EncoderBackend::Gpu
-    };
-    let selector = match adapter.as_deref() {
-        Some(a) => DeviceSelector::parse(a)?,
-        None => DeviceSelector::Auto,
-    };
+    let cpu_enc = flag(&args, "--cpu-enc");
 
     println!("model: {}", model.display());
     println!("wav:   {}", wav.display());
     let t_load = Instant::now();
-    let asr = AsrInference::load_with(&model, selector, backend)?;
+    let asr = load_asr(&model, &spec, cpu_enc)?;
     println!(
         "loaded in {:.1}s (audio tower: {})",
         t_load.elapsed().as_secs_f64(),

@@ -55,6 +55,9 @@ impl DeviceSelector {
         if s.eq_ignore_ascii_case("cpu") {
             return Ok(Self::Cpu);
         }
+        if s.eq_ignore_ascii_case("gpu") {
+            bail!("`gpu` is a backend, not an adapter name — use Backend::Gpu or `--device gpu`");
+        }
         if let Some(rest) = s.strip_prefix('#') {
             return Ok(Self::Index(rest.trim().parse().context("device index")?));
         }
@@ -724,5 +727,24 @@ impl<'a> BulkUpload<'a> {
         crate::load_trace::transfer::add_wait(t.elapsed().as_nanos() as u64);
         self.pending = 0;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_is_a_backend_not_an_adapter_name() {
+        assert!(DeviceSelector::parse("gpu").is_err());
+        assert_eq!(DeviceSelector::parse("auto").unwrap(), DeviceSelector::Auto);
+        assert_eq!(DeviceSelector::parse("cpu").unwrap(), DeviceSelector::Cpu);
+        assert_eq!(
+            DeviceSelector::parse("vulkan:1").unwrap(),
+            DeviceSelector::Runtime {
+                api: wgpu::Backend::Vulkan,
+                index: 1
+            }
+        );
     }
 }

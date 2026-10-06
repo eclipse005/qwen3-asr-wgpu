@@ -323,8 +323,8 @@ impl AsrInference {
     /// safetensors weights — i.e. one of the HuggingFace `Qwen/Qwen3-ASR-*`
     /// repositories, as downloaded or via [`Self::from_pretrained`].
     pub fn load(model_dir: &Path, backend: Backend) -> crate::Result<Self> {
-        let (selector, encoder) = backend.resolve()?;
-        Self::load_with(model_dir, selector, encoder)
+        let plan = backend.plan();
+        Self::load_with_fallback(model_dir, plan.selector, plan.encoder, plan.allow_fallback)
     }
 
     /// [`Self::load`] with [`Backend::Auto`].
@@ -337,10 +337,11 @@ impl AsrInference {
     /// adapter name.  See [`crate::AsrInference::device_targets`] —
     /// or `transcribe --list-devices` — for the names this machine accepts.
     ///
-    /// The GPU audio tower is used; a device that cannot build it falls back to
-    /// the host tower with a printed reason.
+    /// The GPU audio tower is required. Opening the device or building that
+    /// tower returns the error — this does not fall back to the host.
+    /// [`DeviceSelector::Auto`] still picks the best card.
     pub fn load_on(model_dir: &Path, selector: DeviceSelector) -> crate::Result<Self> {
-        Self::load_with(model_dir, selector, EncoderBackend::Gpu)
+        Self::load_with_fallback(model_dir, selector, EncoderBackend::Gpu, false)
     }
 
     /// The full form: pick the device *and* which audio tower to build.
@@ -348,12 +349,44 @@ impl AsrInference {
     /// [`EncoderBackend::Cpu`] is the host f32 reference the GPU tower is
     /// verified against — ~2.7× slower on the encoder phase, and the reason the
     /// two can be diffed at all.
+    ///
+    /// [`DeviceSelector::Auto`] may use the CPU towers when no real adapter
+    /// opens, or when the GPU audio tower cannot be built. Any other selector
+    /// returns that error. For a required GPU even on the best card, use
+    /// [`Self::load`] with [`Backend::Gpu`] or [`Self::load_with_fallback`].
     pub fn load_with(
         model_dir: &Path,
         selector: DeviceSelector,
         encoder: EncoderBackend,
     ) -> crate::Result<Self> {
-        let inner = Inner::load_with_selector(model_dir, selector, encoder)
+        let allow_fallback = selector == DeviceSelector::Auto;
+        Self::load_with_fallback(model_dir, selector, encoder, allow_fallback)
+    }
+
+    /// [`Self::load_with`] with the fallback stated by the caller.
+    ///
+    /// Fallback is the CPU towers, and only when `allow_fallback` is set **and**
+    /// `selector` is [`DeviceSelector::Auto`]. It covers a failed open and a GPU
+    /// audio tower that cannot be built. A named adapter returns the error
+    /// either way. [`Backend::Gpu`] is the best card with `allow_fallback` false.
+    pub fn load_with_fallback(
+        model_dir: &Path,
+        selector: DeviceSelector,
+        encoder: EncoderBackend,
+        allow_fallback: bool,
+    ) -> crate::Result<Self> {
+        if !allow_fallback
+            && matches!(selector, DeviceSelector::Auto)
+            && !Self::device_targets()
+                .iter()
+                .any(|t| t.info.device_type != wgpu::DeviceType::Cpu)
+        {
+            return Err(crate::AsrError::ModelLoad(anyhow::anyhow!(
+                "no GPU adapter: wgpu sees no device that is not itself a CPU \
+                 implementation — use Backend::Cpu, or Backend::Auto to fall back"
+            )));
+        }
+        let inner = Inner::load_with_selector(model_dir, selector, encoder, allow_fallback)
             .map_err(crate::AsrError::ModelLoad)?;
         Ok(Self {
             inner: std::sync::Mutex::new(inner),
@@ -539,6 +572,7 @@ impl Inner {
         model_dir: &Path,
         selector: DeviceSelector,
         backend: EncoderBackend,
+        allow_fallback: bool,
     ) -> Result<Self> {
         let t = Instant::now();
         let config = AsrConfig::from_file(&model_dir.join("config.json"))
@@ -563,7 +597,7 @@ impl Inner {
         } else {
             match pollster::block_on(Gpu::new_with(selector.clone())) {
                 Ok(g) => Some(g),
-                Err(e) if selector == DeviceSelector::Auto => {
+                Err(e) if allow_fallback && selector == DeviceSelector::Auto => {
                     eprintln!("[device] no usable GPU ({e:#}); falling back to the CPU backend");
                     None
                 }
@@ -580,10 +614,11 @@ impl Inner {
                 let window_infer = ac.n_window_infer.max(ac.n_window * 2);
                 match GpuAudioEncoder::load(gpu, &tensors, "thinker.audio_tower", ac, window_infer) {
                     Ok(e) => Some(e),
-                    Err(e) => {
+                    Err(e) if allow_fallback && selector == DeviceSelector::Auto => {
                         eprintln!("[gpu encoder] unavailable, falling back to CPU: {e:#}");
                         None
                     }
+                    Err(e) => return Err(e),
                 }
             }
         };
