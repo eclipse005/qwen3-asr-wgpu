@@ -6,10 +6,11 @@ use crate::inference::EncoderBackend;
 /// The GPU here is whatever wgpu can drive — Vulkan, D3D12, Metal or GL — and
 /// there is deliberately no variant naming one vendor's runtime.
 ///
-/// * [`Self::Auto`] — one real GPU, or the CPU towers when none can be opened.
+/// * [`Self::Auto`] — a real GPU, or the CPU towers when none can be opened.
+///   An unpinned selector tries discrete, then integrated, then a virtual GPU.
 /// * [`Self::Cpu`] — the CPU towers. No adapter.
-/// * [`Self::Gpu`] — the best GPU. No adapter, a failed open, or a GPU audio
-///   tower that will not build is an error, not a silent CPU run.
+/// * [`Self::Gpu`] — a real GPU, discrete before integrated. No adapter, a
+///   failed open, or a GPU audio tower that will not build is an error.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
@@ -43,7 +44,7 @@ impl Backend {
     /// Device, audio tower, and whether a failed open may use the CPU towers.
     ///
     /// Only [`Self::Auto`] sets the fallback. [`Self::Gpu`] still selects
-    /// [`DeviceSelector::Auto`] (the best card) and leaves the error to the load.
+    /// [`DeviceSelector::Auto`] (discrete, then integrated) and leaves the error to the load.
     pub(crate) fn plan(self) -> DevicePlan {
         match self {
             Backend::Auto => DevicePlan {

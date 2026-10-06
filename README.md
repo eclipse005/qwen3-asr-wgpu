@@ -69,7 +69,7 @@ The run prints the device in use (GPU or CPU), timings and the recognized langua
 | `--lang <name>` | Language such as `zh` or `English`; omit for automatic detection |
 | `--prompt <text>` | Context / hot words (domain terms, names) that bias transcription through the system message |
 | `--max-new <n>` | Generation cap, default 2048 |
-| `--device <name>` | `auto` (default: GPU, or CPU when none opens), `cpu`, `gpu` (error if no GPU opens), or `vulkan[:i]` / `dx12` / a name substring |
+| `--device <name>` | `auto` (default: discrete GPU, then integrated, else CPU), `cpu`, `gpu` (discrete then integrated, error if none opens), or `vulkan[:i]` / `dx12` / a name substring |
 | `--list-devices` | List the devices usable on this machine |
 
 ### Library

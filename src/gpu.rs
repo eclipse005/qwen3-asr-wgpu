@@ -84,14 +84,23 @@ impl DeviceSelector {
     }
 }
 
-fn rank(info: &wgpu::AdapterInfo) -> (u8, u8) {
-    let class = match info.device_type {
+/// Discrete, then integrated, then virtual. A CPU adapter is not a GPU.
+fn device_class(kind: wgpu::DeviceType) -> u8 {
+    match kind {
         wgpu::DeviceType::DiscreteGpu => 0,
         wgpu::DeviceType::IntegratedGpu => 1,
         wgpu::DeviceType::VirtualGpu => 2,
         wgpu::DeviceType::Cpu => 3,
         _ => 4,
-    };
+    }
+}
+
+fn is_real_gpu(info: &wgpu::AdapterInfo) -> bool {
+    device_class(info.device_type) <= 2
+}
+
+fn rank(info: &wgpu::AdapterInfo) -> (u8, u8) {
+    let class = device_class(info.device_type);
     let api = match info.backend {
         wgpu::Backend::Vulkan => 0,
         wgpu::Backend::Metal => 1,
@@ -363,13 +372,7 @@ pub fn runtime_name(api: wgpu::Backend) -> &'static str {
 }
 
 fn rank_of(d: &DeviceInfo) -> (u8, u8) {
-    let class = match d.device_type {
-        wgpu::DeviceType::DiscreteGpu => 0,
-        wgpu::DeviceType::IntegratedGpu => 1,
-        wgpu::DeviceType::VirtualGpu => 2,
-        wgpu::DeviceType::Cpu => 3,
-        _ => 4,
-    };
+    let class = device_class(d.device_type);
     let api = match d.backend {
         wgpu::Backend::Vulkan => 0,
         wgpu::Backend::Metal => 1,
@@ -382,8 +385,8 @@ fn rank_of(d: &DeviceInfo) -> (u8, u8) {
 
 impl Gpu {
     /// Enumerate adapters and pick one.  `prefer` matches a case-insensitive
-    /// substring of the adapter name (e.g. `"nvidia"`, `"intel"`); without it the
-    /// first discrete GPU wins, falling back to whatever is available.
+    /// substring of the adapter name (e.g. `"nvidia"`, `"intel"`); without it
+    /// Auto tries discrete, then integrated, then a virtual GPU, and skips CPU adapters.
     ///
     /// Shorthand for [`Gpu::new_with`] with [`DeviceSelector::Name`] / `Auto`.
     pub async fn new(prefer: Option<&str>) -> Result<Self> {
@@ -414,18 +417,21 @@ impl Gpu {
             );
         }
 
-        let adapter = match &selector {
-            DeviceSelector::Index(i) => adapters.get(*i).ok_or_else(|| {
+        // `Auto` walks every real GPU, discrete before integrated. A named
+        // adapter or a runtime index stays on that one device.
+        let candidates: Vec<&wgpu::Adapter> = match &selector {
+            DeviceSelector::Index(i) => vec![adapters.get(*i).ok_or_else(|| {
                 anyhow::anyhow!(
                     "device #{i} does not exist ({} adapter(s) visible: {})",
                     adapters.len(),
                     list_names(&adapters)
                 )
-            })?,
+            })?],
             sel => {
                 let mut hits: Vec<&wgpu::Adapter> = adapters
                     .iter()
                     .filter(|a| sel.matches(&a.get_info()))
+                    .filter(|a| !matches!(sel, DeviceSelector::Auto) || is_real_gpu(&a.get_info()))
                     .collect();
                 if hits.is_empty() {
                     let hint = if matches!(sel, DeviceSelector::Auto) {
@@ -437,38 +443,59 @@ impl Gpu {
                 }
                 hits.sort_by_key(|a| rank(&a.get_info()));
                 match sel {
-                    DeviceSelector::Runtime { index, .. } => hits.get(*index).copied().ok_or_else(
-                        || {
+                    DeviceSelector::Runtime { index, .. } => {
+                        vec![hits.get(*index).copied().ok_or_else(|| {
                             anyhow::anyhow!(
                                 "that runtime has {} device(s), index {index} is out of range",
                                 hits.len()
                             )
-                        },
-                    )?,
-                    _ => hits[0],
+                        })?]
+                    }
+                    DeviceSelector::Auto => hits,
+                    _ => vec![hits[0]],
                 }
             }
         };
 
-        let info = adapter.get_info();
-        let features = adapter.features();
-        let limits = adapter.limits();
-
         let t = std::time::Instant::now();
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("qwen3-asr-wgpu"),
-                required_features: features
-                    & (wgpu::Features::TIMESTAMP_QUERY
-                        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
-                        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
-                        | wgpu::Features::SUBGROUP),
-                required_limits: limits.clone(),
-                ..Default::default()
-            })
-            .await
-            .context("request_device")?;
+        let mut opened = None;
+        let mut skipped: Option<anyhow::Error> = None;
+        for adapter in &candidates {
+            let info = adapter.get_info();
+            let features = adapter.features();
+            let limits = adapter.limits();
+            match adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("qwen3-asr-wgpu"),
+                    required_features: features
+                        & (wgpu::Features::TIMESTAMP_QUERY
+                            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+                            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
+                            | wgpu::Features::SUBGROUP),
+                    required_limits: limits.clone(),
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok((device, queue)) => {
+                    opened = Some((info, features, limits, device, queue));
+                    break;
+                }
+                Err(e) => {
+                    if candidates.len() > 1 {
+                        eprintln!(
+                            "qwen3-asr: skip {} ({:?}, {:?}): {e:#}",
+                            info.name, info.backend, info.device_type
+                        );
+                    }
+                    skipped = Some(e.into());
+                }
+            }
+        }
         crate::load_trace::note("gpu: request_device", t);
+        let Some((info, features, limits, device, queue)) = opened else {
+            return Err(skipped.context("request_device")?);
+        };
 
         device.on_uncaptured_error(std::sync::Arc::new(|e| {
             eprintln!("[wgpu uncaptured error] {e}");
@@ -733,6 +760,14 @@ impl<'a> BulkUpload<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_orders_discrete_before_integrated() {
+        use wgpu::DeviceType::{Cpu, DiscreteGpu, IntegratedGpu, VirtualGpu};
+        assert!(device_class(DiscreteGpu) < device_class(IntegratedGpu));
+        assert!(device_class(IntegratedGpu) < device_class(VirtualGpu));
+        assert!(device_class(VirtualGpu) < device_class(Cpu));
+    }
 
     #[test]
     fn gpu_is_a_backend_not_an_adapter_name() {

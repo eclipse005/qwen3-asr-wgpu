@@ -69,7 +69,7 @@ transcribe --model ./Qwen3-ASR-0.6B-hf --wav ./audio.wav
 | `--lang <name>` | 语言，如 `zh`、`English`；不填则自动识别 |
 | `--prompt <text>` | 上下文 / 热词（领域词、人名），经 system 消息偏置转写结果 |
 | `--max-new <n>` | 生成上限，默认 2048 |
-| `--device <name>` | `auto`（默认：有显卡用显卡，打不开才用 CPU）、`cpu`、`gpu`（没有显卡或打不开就报错），或 `vulkan[:i]` / `dx12` / 适配器名子串 |
+| `--device <name>` | `auto`（默认：先独显再集显，都打不开才用 CPU）、`cpu`、`gpu`（先独显再集显，没有或打不开就报错），或 `vulkan[:i]` / `dx12` / 适配器名子串 |
 | `--list-devices` | 列出本机可用设备 |
 
 ### 作为库使用
