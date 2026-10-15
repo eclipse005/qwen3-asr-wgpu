@@ -13,7 +13,7 @@ use crate::decoder::{TextConfig, WgpuTextDecoder};
 use crate::gpu::{DeviceSelector, Gpu};
 use crate::mel::{load_audio_wav, MelExtractor, HOP_LENGTH, MEL_SAMPLE_RATE, N_FFT};
 use crate::mrope::{compute_mrope_cos_sin, text_positions};
-use crate::prompt::{self, TranscribeResult, ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID};
+use crate::prompt::{self, StopReason, TranscribeResult, ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID};
 use crate::weights;
 
 const DECODER_MAX_SEQ: usize = 16384;
@@ -1418,7 +1418,7 @@ impl Inner {
             let ids: String = gen.ids.iter().map(|id| format!("{id}\n")).collect();
             std::fs::write(dir.join("gen_ids.txt"), ids)?;
         }
-        prompt::decode_result(&self.tokenizer, &gen.ids)
+        prompt::decode_result(&self.tokenizer, &gen.ids, gen.stop_reason)
     }
 
     pub(crate) fn generate_from_embeds(
@@ -1494,6 +1494,9 @@ impl Inner {
 
         let eos = [ENDOFTEXT_TOKEN_ID as i32, IM_END_TOKEN_ID as i32];
         let mut generated: Vec<u32> = Vec::new();
+        // Stop reason: start from "the ceiling cut it off" and downgrade on
+        // every EOS exit below.  Reporting only — no path changes.
+        let mut stop_reason = StopReason::MaxTokens;
         let t3 = Instant::now();
         if !eos.contains(&first) {
             generated.push(first as u32);
@@ -1532,12 +1535,19 @@ impl Inner {
                         let tok = d.take_token()?;
                         if !eos.contains(&tok) {
                             generated.push(tok as u32);
+                        } else {
+                            // EOS as the very last allowed token: normal end.
+                            done = true;
                         }
+                    }
+                    if done {
+                        stop_reason = StopReason::Eos;
                     }
                 } else {
                     for _ in 1..max_new_tokens {
                         let tok = d.step()?;
                         if eos.contains(&tok) {
+                            stop_reason = StopReason::Eos;
                             break;
                         }
                         generated.push(tok as u32);
@@ -1550,6 +1560,7 @@ impl Inner {
                 for _ in 1..max_new_tokens {
                     let tok = self.decoder.step()?;
                     if eos.contains(&tok) {
+                        stop_reason = StopReason::Eos;
                         break;
                     }
                     generated.push(tok as u32);
@@ -1558,6 +1569,9 @@ impl Inner {
                     }
                 }
             }
+        } else {
+            // EOS before the first generated token: nothing to transcribe.
+            stop_reason = StopReason::Eos;
         }
         let t_decode = t3.elapsed();
         Ok(Generation {
@@ -1565,6 +1579,7 @@ impl Inner {
             seq_len,
             prefill_ms: t_prefill.as_secs_f64() * 1000.0,
             decode_ms: t_decode.as_secs_f64() * 1000.0,
+            stop_reason,
         })
     }
 }
@@ -1574,6 +1589,8 @@ pub(crate) struct Generation {
     pub seq_len: usize,
     pub prefill_ms: f64,
     pub decode_ms: f64,
+    /// Why the loop stopped (see [`StopReason`]); observational.
+    pub stop_reason: StopReason,
 }
 
 /// `QASR_SPEC_STUDY=<K>`: run the speculative-decode feasibility study at block

@@ -1,9 +1,24 @@
+/// Why token generation stopped.
+///
+/// Observational: it reports what the generation loop already knows, and does
+/// not change how tokens are produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// The model emitted an end-of-sequence token — normal termination.
+    Eos,
+    /// Generation hit the `max_new_tokens` ceiling without EOS; the text may
+    /// be cut off mid-sentence.
+    MaxTokens,
+}
+
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct TranscribeResult {
     pub text: String,
     pub language: String,
     pub raw_output: String,
+    /// Why generation stopped (see [`StopReason`]); `Eos` on every normal run.
+    pub stop_reason: StopReason,
 }
 
 pub(crate) const IM_END_TOKEN_ID: i64 = 151645;
@@ -67,6 +82,7 @@ pub(crate) fn build_prompt(
 pub(crate) fn decode_result(
     tokenizer: &tokenizers::Tokenizer,
     generated_ids: &[u32],
+    stop_reason: StopReason,
 ) -> anyhow::Result<TranscribeResult> {
     let raw_text = tokenizer
         .decode(generated_ids, true)
@@ -76,6 +92,7 @@ pub(crate) fn decode_result(
         text,
         language: lang,
         raw_output: raw_text,
+        stop_reason,
     })
 }
 

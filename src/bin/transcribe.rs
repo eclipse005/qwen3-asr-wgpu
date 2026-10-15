@@ -182,13 +182,17 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    let stop = match r.stop_reason {
+        qwen3_asr_wgpu::StopReason::Eos => "eos",
+        qwen3_asr_wgpu::StopReason::MaxTokens => "max-tokens",
+    };
     match audio_s {
         Some(audio_s) => println!(
-            "elapsed={elapsed:.3}s audio={audio_s:.3}s RTFx={:.3} lang={}",
+            "elapsed={elapsed:.3}s audio={audio_s:.3}s RTFx={:.3} lang={} stop={stop}",
             audio_s / elapsed,
             r.language
         ),
-        None => println!("elapsed={elapsed:.3}s lang={}", r.language),
+        None => println!("elapsed={elapsed:.3}s lang={} stop={stop}", r.language),
     }
     println!("{}", r.text);
 

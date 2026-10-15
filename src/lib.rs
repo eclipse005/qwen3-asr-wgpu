@@ -26,8 +26,8 @@
 //! # Layout
 //!
 //! * [`AsrInference`] plus its types ([`TranscribeOptions`],
-//!   [`TranscribeResult`], [`StreamToken`], [`AsrStreamingSession`],
-//!   [`AsrError`]) — the library API.
+//!   [`TranscribeResult`] (with [`StopReason`]), [`StreamToken`],
+//!   [`AsrStreamingSession`], [`AsrError`]) — the library API.
 //! * [`processor`] — the reference processor's own three steps
 //!   (`apply_transcription_request` → `generate` → `decode`).
 //! * [`diagnostics`] — probe and dump hooks.  Not part of the library API;
@@ -72,5 +72,5 @@ pub use inference::{
 };
 pub use mel::load_audio_wav;
 pub use processor::{AsrTranscription, Decoded, ReturnFormat, TranscriptionRequest};
-pub use prompt::TranscribeResult;
+pub use prompt::{StopReason, TranscribeResult};
 pub use streaming::AsrStreamingSession;
