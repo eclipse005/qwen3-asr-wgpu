@@ -2,6 +2,10 @@
 
 **基于 wgpu 的 Qwen3-ASR 语音识别（Rust 实现）。**
 
+[![GitHub stars](https://img.shields.io/github/stars/eclipse005/qwen3-asr-wgpu?style=flat-square&logo=github&color=f59e0b)](https://github.com/eclipse005/qwen3-asr-wgpu/stargazers) [![GitHub forks](https://img.shields.io/github/forks/eclipse005/qwen3-asr-wgpu?style=flat-square&logo=github)](https://github.com/eclipse005/qwen3-asr-wgpu/network/members) [![Build](https://img.shields.io/github/actions/workflow/status/eclipse005/qwen3-asr-wgpu/build.yml?branch=master&style=flat-square&label=build)](https://github.com/eclipse005/qwen3-asr-wgpu/actions/workflows/build.yml) [![License](https://img.shields.io/github/license/eclipse005/qwen3-asr-wgpu?style=flat-square&color=16a34a)](LICENSE)
+
+[![Windows](https://img.shields.io/badge/Windows-x64-0078D6?style=flat-square&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iI2ZmZiI%2BPHBhdGggZD0iTTAsMEgxMS4zNzdWMTEuMzcySDBaTTEyLjYyMywwSDI0VjExLjM3MkgxMi42MjNaTTAsMTIuNjIzSDExLjM3N1YyNEgwWm0xMi42MjMsMEgyNFYyNEgxMi42MjMiLz48L3N2Zz4%3D)](#安装) [![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-111111?style=flat-square&logo=apple&logoColor=white)](#安装) [![Linux](https://img.shields.io/badge/Linux-x86__64-FCC624?style=flat-square&logo=linux&logoColor=111111)](#安装)
+
 [English](README.md) · **简体中文**
 
 [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) 的轻量级跨平台 Rust 实现，使用 [wgpu](https://github.com/gfx-rs/wgpu) 进行 GPU 加速。
