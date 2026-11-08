@@ -2488,8 +2488,57 @@ impl WgpuTextDecoder {
     ///
     /// The prefill GEMM chain: f32 accumulate with a single f16 rounding, in
     /// this engine's own accumulation order.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// # GPU 资源失败必须变成 `Err`
+    ///
+    /// wgpu 的 `create_buffer` / `create_bind_group` 是 **infallible**：显存不足时
+    /// 返回的是 invalid handle，失败通过异步 validation error 报告，而不是同步
+    /// `Result`。不主动接 error scope 的话，代码会拿着无效 buffer 继续 dispatch，
+    /// prefill 变成空转，decode 随后吐出复读垃圾并返回 `Ok` —— 失败被伪装成
+    /// 成功，比报错糟糕得多。
+    ///
+    /// 实测（13.8 min 中文 / fp16 1.7B / 8 GB 卡）：451 次 uncaptured validation
+    /// error、prefill 只用了 172 ms（正常约 16.5 s）、输出 `damenopdamenop...`。
+    /// 接上 scope 后这里必须返回 `Err`。
+    ///
+    /// **只在运行期真正失败时报**：这里不预估显存、不提前拦。两个 scope 分别接
+    /// wgpu 的 OutOfMemory 与 Validation（buffer 分配失败在 wgpu 里表现为 invalid
+    /// handle + validation error，而不是同步 OOM 异常），捕获后翻成人能看懂的话。
+    ///
+    /// The prefill GEMM chain: f32 accumulate with a single f16 rounding, in
+    /// this engine's own accumulation order.
     pub fn prefill(&mut self, hidden_words: &[u8], s: usize, kv_start: usize) -> Result<i32> {
+        // 栈式 scope：内层先 pop。Validation 错误被内层吃掉，OOM 穿过它落到外层。
+        let oom = self
+            .gpu
+            .device
+            .push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let validation = self
+            .gpu
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let result = self.prefill_impl(hidden_words, s, kv_start);
+        let validation_err = pollster::block_on(validation.pop());
+        let oom_err = pollster::block_on(oom.pop());
+        let audio_min = s as f64 / 13.0 / 60.0;
+        if let Some(e) = oom_err {
+            return Err(anyhow::anyhow!(
+                "GPU out of memory during prefill ({s} tokens, about {audio_min:.1} min of audio). \
+                 Try the int8 checkpoint, shorter segments, or the CPU backend. Caused by: {e}"
+            ));
+        }
+        if let Some(e) = validation_err {
+            return Err(anyhow::anyhow!(
+                "GPU resource allocation failed during prefill ({s} tokens, about {audio_min:.1} \
+                 min of audio) — usually VRAM exhausted, so a buffer came back invalid. \
+                 Try the int8 checkpoint, shorter segments, or the CPU backend. Caused by: {e}"
+            ));
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn prefill_impl(&mut self, hidden_words: &[u8], s: usize, kv_start: usize) -> Result<i32> {
         let cfg = self.cfg.clone();
         let hs = cfg.hidden_size;
         let nqh = cfg.num_attention_heads;
