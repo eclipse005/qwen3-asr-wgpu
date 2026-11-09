@@ -155,7 +155,7 @@ fn main() -> Result<()> {
         }
         println!("session encoded {} tokens", sess.encoded_tokens());
         sess.flush()?
-    } else if flag(&args, "--stream") {
+    } else if flag(&args, "--tokens") {
         let mut shown = 0usize;
         diagnostics::transcribe_with_dump_streaming(
             &asr,
@@ -170,6 +170,21 @@ fn main() -> Result<()> {
                 }
             },
         )?
+    } else if flag(&args, "--stream") {
+        let samples = qwen3_asr_wgpu::load_audio_wav(&wav, 16_000)?;
+        let mut shown = 0usize;
+        let mut sess = asr.create_live_session(opts.clone(), |u| {
+            if u.stable.len() > shown {
+                eprint!("{}", &u.stable[shown..]);
+                shown = u.stable.len();
+            }
+        })?;
+        for part in samples.chunks(32_000) {
+            sess.push_samples(part)?;
+        }
+        let r = sess.flush()?;
+        eprintln!();
+        r
     } else {
         diagnostics::transcribe_with_dump(&asr, &wav, &opts, dump.as_deref(), compare_enc)?
     };

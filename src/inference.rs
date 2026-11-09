@@ -216,21 +216,21 @@ pub(crate) enum TextBackend {
 }
 
 impl TextBackend {
-    fn prefill(&mut self, hidden_words: &[u8], s: usize, kv_start: usize) -> Result<i32> {
+    pub(crate) fn prefill(&mut self, hidden_words: &[u8], s: usize, kv_start: usize) -> Result<i32> {
         match self {
             Self::Gpu(d) => d.prefill(hidden_words, s, kv_start),
             Self::Cpu(d) => d.prefill(hidden_words, s, kv_start),
         }
     }
 
-    fn step(&mut self) -> Result<i32> {
+    pub(crate) fn step(&mut self) -> Result<i32> {
         match self {
             Self::Gpu(d) => d.step(),
             Self::Cpu(d) => d.step(),
         }
     }
 
-    fn max_seq(&self) -> usize {
+    pub(crate) fn max_seq(&self) -> usize {
         match self {
             Self::Gpu(d) => d.max_seq,
             Self::Cpu(d) => d.max_seq,
@@ -239,7 +239,7 @@ impl TextBackend {
 
     /// Make sure the KV cache holds `need` positions — a no-op when it already
     /// does, which is the common case (the capacity is grow-only).
-    fn ensure_capacity(&mut self, need: usize) -> usize {
+    pub(crate) fn ensure_capacity(&mut self, need: usize) -> usize {
         match self {
             Self::Gpu(d) => d.ensure_capacity(need),
             Self::Cpu(d) => d.ensure_capacity(need),
@@ -542,6 +542,23 @@ impl AsrInference {
         let forced = opts.forced_language().ok().flatten();
         let guard = self.lock()?;
         Ok(crate::AsrStreamingSession::new(guard, opts, forced))
+    }
+
+    /// Start a live session that decodes as audio arrives and emits committed
+    /// text through `on_update` (see [`crate::AsrLiveSession`]).
+    ///
+    /// Unlike [`Self::create_streaming_session`] — which encodes incrementally
+    /// but reproduces the offline result exactly at `flush` — this trades a
+    /// little accuracy for text-while-listening and bounded memory on long
+    /// input.  The session holds this instance's lock until dropped.
+    pub fn create_live_session<F: FnMut(crate::LiveUpdate)>(
+        &self,
+        opts: TranscribeOptions,
+        on_update: F,
+    ) -> crate::Result<crate::AsrLiveSession<'_, F>> {
+        let forced = check_options(&opts)?;
+        let guard = self.lock()?;
+        Ok(crate::AsrLiveSession::new(guard, opts, forced, on_update))
     }
 }
 

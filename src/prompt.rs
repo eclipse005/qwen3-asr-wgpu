@@ -41,7 +41,7 @@ pub(crate) fn build_prompt(
     nat: usize,
     language: Option<&str>,
     context: &str,
-    prefix_text: Option<&str>,
+    prefix_ids: Option<&[i64]>,
 ) -> anyhow::Result<(Vec<i64>, usize)> {
     let mut tokens: Vec<i64> = vec![TOK_IM_START, TOK_SYSTEM, TOK_NEWLINE];
     if !context.is_empty() {
@@ -68,13 +68,8 @@ pub(crate) fn build_prompt(
         tokens.push(TOK_ASSISTANT);
         tokens.push(TOK_NEWLINE);
     }
-    if let Some(prefix) = prefix_text {
-        if !prefix.is_empty() {
-            let enc = tokenizer
-                .encode(prefix, false)
-                .map_err(|e| anyhow::anyhow!("encode prefix: {}", e))?;
-            tokens.extend(enc.get_ids().iter().map(|&id| id as i64));
-        }
+    if let Some(ids) = prefix_ids {
+        tokens.extend_from_slice(ids);
     }
     Ok((tokens, asp))
 }
