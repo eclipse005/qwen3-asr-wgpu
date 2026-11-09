@@ -530,35 +530,35 @@ impl AsrInference {
     }
 
     /// Start a session that takes audio incrementally and returns text at
-    /// [`crate::AsrStreamingSession::flush`].
+    /// [`crate::AsrBufferedSession::flush`].
     ///
     /// The session holds this instance's lock until it is dropped, so the two
     /// cannot be used at once.
-    pub fn create_streaming_session(
+    pub fn create_buffered_session(
         &self,
         opts: TranscribeOptions,
-    ) -> crate::Result<crate::AsrStreamingSession<'_>> {
+    ) -> crate::Result<crate::AsrBufferedSession<'_>> {
         check_options(&opts)?;
         let forced = opts.forced_language().ok().flatten();
         let guard = self.lock()?;
-        Ok(crate::AsrStreamingSession::new(guard, opts, forced))
+        Ok(crate::AsrBufferedSession::new(guard, opts, forced))
     }
 
     /// Start a live session that decodes as audio arrives and emits committed
-    /// text through `on_update` (see [`crate::AsrLiveSession`]).
+    /// text through `on_update` (see [`crate::AsrStreamSession`]).
     ///
-    /// Unlike [`Self::create_streaming_session`] — which encodes incrementally
+    /// Unlike [`Self::create_buffered_session`] — which encodes incrementally
     /// but reproduces the offline result exactly at `flush` — this trades a
     /// little accuracy for text-while-listening and bounded memory on long
     /// input.  The session holds this instance's lock until dropped.
-    pub fn create_live_session<F: FnMut(crate::LiveUpdate)>(
+    pub fn create_stream_session<F: FnMut(crate::StreamUpdate)>(
         &self,
         opts: TranscribeOptions,
         on_update: F,
-    ) -> crate::Result<crate::AsrLiveSession<'_, F>> {
+    ) -> crate::Result<crate::AsrStreamSession<'_, F>> {
         let forced = check_options(&opts)?;
         let guard = self.lock()?;
-        Ok(crate::AsrLiveSession::new(guard, opts, forced, on_update))
+        Ok(crate::AsrStreamSession::new(guard, opts, forced, on_update))
     }
 }
 

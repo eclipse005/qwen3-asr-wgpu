@@ -148,7 +148,7 @@ fn main() -> Result<()> {
         diagnostics::transcribe_from_embeds(&asr, &embeds, &opts, dump.as_deref())?
     } else if flag(&args, "--session") {
         let samples = qwen3_asr_wgpu::load_audio_wav(&wav, 16_000)?;
-        let mut sess = asr.create_streaming_session(opts.clone())?;
+        let mut sess = asr.create_buffered_session(opts.clone())?;
         let chunk = 16_000;
         for part in samples.chunks(chunk) {
             sess.push_samples(part)?;
@@ -173,7 +173,7 @@ fn main() -> Result<()> {
     } else if flag(&args, "--stream") {
         let samples = qwen3_asr_wgpu::load_audio_wav(&wav, 16_000)?;
         let mut shown = 0usize;
-        let mut sess = asr.create_live_session(opts.clone(), |u| {
+        let mut sess = asr.create_stream_session(opts.clone(), |u| {
             if u.stable.len() > shown {
                 eprint!("{}", &u.stable[shown..]);
                 shown = u.stable.len();

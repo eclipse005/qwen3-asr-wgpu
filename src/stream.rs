@@ -18,7 +18,9 @@
 //!   rows are prefilled; the prefill causal mask honours `kv_start`);
 //! * text is committed token-wise against the previous candidate (longest common
 //!   prefix + overlap de-duplication), so committed output never retracts;
-//! * degenerate / stagnant streams re-anchor to a short committed tail.
+//! * degenerate / stagnant streams re-anchor their **text** state to a short
+//!   committed tail; the audio window ring is never touched by recovery, so a
+//!   recovery cannot cost audio context.
 
 use std::collections::VecDeque;
 use std::sync::MutexGuard;
@@ -54,15 +56,18 @@ const DEGEN_MAX_PERIOD: usize = 6;
 const DEGEN_MIN_REPEATS: usize = 4;
 /// Consecutive stagnant rounds before a recovery re-anchor.
 const STALE_CHUNKS: usize = 4;
-/// Periodic re-anchor cadence (rounds) and committed-tail carry.
-const RESET_INTERVAL: usize = 45;
-const RESET_CARRY: usize = 24;
+/// 恢复性 re-anchor 保留的已提交尾部长度。
+///
+/// 只用于**恢复**（退化 / 停滞），不能用于任何周期性重置：`raw` 的文本前缀本来
+/// 就被 [`MAX_PREFIX_TOKENS`] 截断，跨越任意长流的漂移在结构上已经被封住，
+/// 周期性重置换不来有界性，只会把已经正确的上下文丢掉。
+const RECOVERY_CARRY: usize = 24;
 
 /// One incremental streaming update, emitted after each decode round that
 /// changes the visible text.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
-pub struct LiveUpdate {
+pub struct StreamUpdate {
     /// Cumulative committed text.  Grows monotonically — once emitted it is
     /// never taken back.
     pub stable: String,
@@ -76,24 +81,24 @@ pub struct LiveUpdate {
 /// [`Self::flush`] once at end of audio for the final [`TranscribeResult`].
 ///
 /// Holds the engine lock for its whole lifetime (like
-/// [`crate::AsrStreamingSession`]), so it is `!Send` and stays on its thread.
-pub struct AsrLiveSession<'a, F: FnMut(LiveUpdate)> {
+/// [`crate::AsrBufferedSession`]), so it is `!Send` and stays on its thread.
+pub struct AsrStreamSession<'a, F: FnMut(StreamUpdate)> {
     guard: MutexGuard<'a, Inner>,
     opts: TranscribeOptions,
     forced: Option<String>,
     on_update: F,
-    state: LiveState,
+    state: StreamRoundState,
     finished: bool,
 }
 
-impl<'a, F: FnMut(LiveUpdate)> AsrLiveSession<'a, F> {
+impl<'a, F: FnMut(StreamUpdate)> AsrStreamSession<'a, F> {
     pub(crate) fn new(
         guard: MutexGuard<'a, Inner>,
         opts: TranscribeOptions,
         forced: Option<String>,
         on_update: F,
     ) -> Self {
-        let state = LiveState::new(&guard);
+        let state = StreamRoundState::new(&guard);
         Self {
             guard,
             opts,
@@ -105,7 +110,7 @@ impl<'a, F: FnMut(LiveUpdate)> AsrLiveSession<'a, F> {
     }
 
     /// Feed more audio; every complete 2 s grid point runs a decode round and
-    /// may emit a [`LiveUpdate`].  Output depends only on the audio, not on how
+    /// may emit a [`StreamUpdate`].  Output depends only on the audio, not on how
     /// it is chunked across calls.
     pub fn push_samples(&mut self, samples: &[f32]) -> Result<()> {
         self.ensure_open()?;
@@ -156,7 +161,7 @@ impl<'a, F: FnMut(LiveUpdate)> AsrLiveSession<'a, F> {
     }
 }
 
-struct LiveState {
+struct StreamRoundState {
     samples: Vec<f32>,
     base: usize,
     frame: usize,
@@ -164,6 +169,10 @@ struct LiveState {
     win_frames: usize,
     n_mels: usize,
     no_cache: bool,
+    /// 保留的编码窗口数（`QASR_STREAM_MAX_WIN` 可覆盖，用于上下文/显存 A/B）。
+    max_win: usize,
+    /// `QASR_STREAM_STALE_CHUNKS`（0 = 禁用停滞恢复）。
+    stale_limit: usize,
 
     raw: Vec<u32>,
     stable: Vec<u32>,
@@ -179,15 +188,24 @@ struct LiveState {
     language: String,
 }
 
-impl LiveState {
+impl StreamRoundState {
     fn new(inner: &Inner) -> Self {
         let ac = &inner.config.thinker_config.audio_config;
         let cs = ac.n_window * 2;
         let win_frames = cs * (ac.n_window_infer / cs).max(1);
-        let no_cache = std::env::var("QASR_LIVE_NO_ENC_CACHE")
+        let no_cache = std::env::var("QASR_STREAM_NO_ENC_CACHE")
             .map(|v| v != "0")
             .unwrap_or(false);
-        let kv_reuse = std::env::var("QASR_LIVE_NO_KV_REUSE").map(|v| v != "1").unwrap_or(true);
+        let kv_reuse = std::env::var("QASR_STREAM_NO_KV_REUSE").map(|v| v != "1").unwrap_or(true);
+        let max_win = std::env::var("QASR_STREAM_MAX_WIN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(MAX_ENC_WINDOWS);
+        let stale_limit = std::env::var("QASR_STREAM_STALE_CHUNKS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(STALE_CHUNKS);
         Self {
             samples: Vec::new(),
             base: 0,
@@ -196,6 +214,8 @@ impl LiveState {
             win_frames,
             n_mels: ac.num_mel_bins,
             no_cache,
+            max_win,
+            stale_limit,
             raw: Vec::new(),
             stable: Vec::new(),
             emitted: Vec::new(),
@@ -211,7 +231,7 @@ impl LiveState {
         }
     }
 
-    fn push<F: FnMut(LiveUpdate)>(
+    fn push<F: FnMut(StreamUpdate)>(
         &mut self,
         inner: &mut Inner,
         samples: &[f32],
@@ -229,7 +249,7 @@ impl LiveState {
         Ok(())
     }
 
-    fn flush<F: FnMut(LiveUpdate)>(
+    fn flush<F: FnMut(StreamUpdate)>(
         &mut self,
         inner: &mut Inner,
         opts: &TranscribeOptions,
@@ -260,7 +280,7 @@ impl LiveState {
         })
     }
 
-    fn round<F: FnMut(LiveUpdate)>(
+    fn round<F: FnMut(StreamUpdate)>(
         &mut self,
         inner: &mut Inner,
         opts: &TranscribeOptions,
@@ -381,7 +401,7 @@ impl LiveState {
         let cand_len = candidate_len(n_text, self.chunk_idx, is_final);
         let candidate = &self.raw[text_start..text_start + cand_len];
 
-        if std::env::var("QASR_LIVE_DEBUG").is_ok() {
+        if std::env::var("QASR_STREAM_DEBUG").is_ok() {
             eprintln!(
                 "[live] chunk={} final={} cursor={} nat={} reuse={} prefix={} new={} raw={} tstart={} cand={} emit={} eos={} lang={}",
                 self.chunk_idx, is_final, cursor, nat, reuse, prefix_full,
@@ -397,10 +417,10 @@ impl LiveState {
             self.stagnant = 0;
         }
         let recovery = (period > 0 && reps >= DEGEN_MIN_REPEATS)
-            || self.stagnant >= STALE_CHUNKS
+            || (self.stale_limit > 0 && self.stagnant >= self.stale_limit)
             || dropped >= 8;
 
-        let mut did_reset = recovery;
+        let did_reset = recovery;
         if recovery {
             self.reanchor(forced.is_some());
         } else {
@@ -409,14 +429,6 @@ impl LiveState {
             self.stable.extend_from_slice(candidate);
             let emit_start = overlap_skip(&self.emitted, candidate, l);
             self.emitted.extend_from_slice(&candidate[emit_start..]);
-
-            if !is_final
-                && self.chunk_idx >= UNFIXED_CHUNKS
-                && (self.chunk_idx + 1) % RESET_INTERVAL == 0
-            {
-                self.reanchor(forced.is_some());
-                did_reset = true;
-            }
         }
 
         if !did_reset {
@@ -427,7 +439,7 @@ impl LiveState {
                 decode_ids(inner, &self.raw[text_start + cand_len..])?
             };
             if self.emitted.len() != self.last_emitted_len || partial != self.last_partial {
-                on_update(LiveUpdate {
+                on_update(StreamUpdate {
                     stable: stable_text,
                     partial: partial.clone(),
                 });
@@ -493,7 +505,7 @@ impl LiveState {
             )?;
             self.windows.push_back(e);
             self.frame += self.win_frames;
-            while self.windows.len() > MAX_ENC_WINDOWS {
+            while self.windows.len() > self.max_win {
                 self.windows.pop_front();
             }
         }
@@ -522,7 +534,7 @@ impl LiveState {
     }
 
     fn reanchor(&mut self, forced: bool) {
-        let carry = self.emitted.len().min(RESET_CARRY);
+        let carry = self.emitted.len().min(RECOVERY_CARRY);
         let tail = self.emitted[self.emitted.len() - carry..].to_vec();
         self.raw.clear();
         if !forced {
@@ -531,7 +543,9 @@ impl LiveState {
         self.raw.extend_from_slice(&tail);
         self.stable.clear();
         self.stable.extend_from_slice(&tail);
-        self.windows.clear();
+        // 音频窗口**不动**：它的生命周期只由 [`MAX_ENC_WINDOWS`] 的淘汰决定。
+        // 以前这里连同窗口一起清空，等于在一次退化恢复里把仅有的 32 s 声学上下文
+        // 也丢掉；实测 13.8 min 音频因此每 45 轮丢一段，累计 1292 字。
         self.prev_hidden.clear();
         self.stagnant = 0;
     }

@@ -123,18 +123,18 @@ impl StreamState {
 /// A streaming ASR session: audio in via [`Self::push_samples`], text at
 /// [`Self::flush`].
 ///
-/// Created by [`crate::AsrInference::create_streaming_session`].  It holds the
+/// Created by [`crate::AsrInference::create_buffered_session`].  It holds the
 /// engine's lock for its whole lifetime — the parent [`crate::AsrInference`]
 /// must not be used until the session is dropped — so it is `!Send` and stays
 /// on the thread that made it.
-pub struct AsrStreamingSession<'a> {
+pub struct AsrBufferedSession<'a> {
     guard: MutexGuard<'a, Inner>,
     opts: TranscribeOptions,
     forced: Option<String>,
     state: StreamState,
 }
 
-impl<'a> AsrStreamingSession<'a> {
+impl<'a> AsrBufferedSession<'a> {
     pub(crate) fn new(
         guard: MutexGuard<'a, Inner>,
         opts: TranscribeOptions,

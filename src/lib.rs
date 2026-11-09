@@ -27,7 +27,7 @@
 //!
 //! * [`AsrInference`] plus its types ([`TranscribeOptions`],
 //!   [`TranscribeResult`] (with [`StopReason`]), [`StreamToken`],
-//!   [`AsrStreamingSession`], [`AsrLiveSession`] (with [`LiveUpdate`]),
+//!   [`AsrBufferedSession`], [`AsrStreamSession`] (with [`StreamUpdate`]),
 //!   [`AsrError`]) — the library API.
 //! * [`processor`] — the reference processor's own three steps
 //!   (`apply_transcription_request` → `generate` → `decode`).
@@ -41,7 +41,7 @@
 
 mod backend;
 mod error;
-mod live;
+mod stream;
 mod streaming;
 #[cfg(feature = "hub")]
 mod hub;
@@ -75,5 +75,5 @@ pub use inference::{
 pub use mel::load_audio_wav;
 pub use processor::{AsrTranscription, Decoded, ReturnFormat, TranscriptionRequest};
 pub use prompt::{StopReason, TranscribeResult};
-pub use streaming::AsrStreamingSession;
-pub use live::{AsrLiveSession, LiveUpdate};
+pub use streaming::AsrBufferedSession;
+pub use stream::{AsrStreamSession, StreamUpdate};
