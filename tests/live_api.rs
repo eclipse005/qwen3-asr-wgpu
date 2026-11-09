@@ -46,8 +46,9 @@ fn live_streaming_invariants() {
     let samples = qwen3_asr_wgpu::load_audio_wav(&wav, 16_000).expect("wav");
     let opts = TranscribeOptions::default().with_max_new_tokens(512);
 
-    // Baseline: encoder window cache on, 2 s pushes.
+    // Baseline: encoder window cache on, KV prefix reuse on, 2 s pushes.
     std::env::remove_var("QASR_LIVE_NO_ENC_CACHE");
+    std::env::remove_var("QASR_LIVE_NO_KV_REUSE");
     let (base, updates, max_windows) = run_live(&asr, &samples, 32_000, &opts);
     assert!(!base.text.is_empty(), "live produced no text");
     assert!(
@@ -89,6 +90,15 @@ fn live_streaming_invariants() {
     assert_eq!(
         no_cache.text, cache_short.text,
         "encoder cache changed the transcript (no eviction)"
+    );
+
+    // KV-prefix reuse must be numerically equivalent to a full re-prefill.
+    std::env::set_var("QASR_LIVE_NO_KV_REUSE", "1");
+    let (no_reuse, _, _) = run_live(&asr, &samples, 32_000, &opts);
+    std::env::remove_var("QASR_LIVE_NO_KV_REUSE");
+    assert_eq!(
+        no_reuse.text, base.text,
+        "KV prefix reuse changed the transcript"
     );
 
     // Informational: how close the live transcript is to the offline one.

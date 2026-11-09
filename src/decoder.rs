@@ -325,6 +325,7 @@ struct GDims {
     beta: u32,
     row0: u32,
     lda: u32,
+    q_off: u32,
 }
 
 #[repr(C)]
@@ -358,6 +359,7 @@ struct SoftmaxCfg {
     scale: f32,
     gx: u32,
     row0: u32,
+    q_off: u32,
 }
 
 #[repr(C)]
@@ -371,6 +373,7 @@ struct SlabStatsCfg {
     row0: u32,
     gx: u32,
     rows: u32,
+    q_off: u32,
 }
 
 #[repr(C)]
@@ -1479,11 +1482,29 @@ impl WgpuTextDecoder {
         let t0 = std::time::Instant::now();
         let prev = self.cap;
         let kv_words = (self.cfg.num_key_value_heads * target * self.cfg.head_dim / 2) as u64;
+        // Preserve the rows already written: a KV-prefix reuse prefill only
+        // rewrites its delta, so losing the old cache on growth would corrupt
+        // every cached position.  The head stride changes with capacity, so copy
+        // each head's valid prefix separately.
+        let nkvh = self.cfg.num_key_value_heads;
+        let hd = self.cfg.head_dim;
+        let copy_rows = self.pos.min(prev);
+        let mut copy = (copy_rows > 0 && target > prev)
+            .then(|| self.gpu.device.create_command_encoder(&Default::default()));
         {
             let Self { gpu, layers, pipes, scratch, .. } = self;
             for layer in layers.iter_mut() {
                 let k_cache = gpu.storage("k_cache", kv_words * 4);
                 let v_cache = gpu.storage("v_cache", kv_words * 4);
+                if let Some(cp) = copy.as_mut() {
+                    let bytes = (copy_rows * hd * 2) as u64;
+                    for h in 0..nkvh {
+                        let src = (h * prev * hd * 2) as u64;
+                        let dst = (h * target * hd * 2) as u64;
+                        cp.copy_buffer_to_buffer(&layer.k_cache, src, &k_cache, dst, bytes);
+                        cp.copy_buffer_to_buffer(&layer.v_cache, src, &v_cache, dst, bytes);
+                    }
+                }
                 let (bg_extract, bg_gqa, bg_gqa_split) = {
                     let (qn_w, kn_w) = (&layer.qn_w, &layer.kn_w);
                     kv_bind_groups(gpu, pipes, scratch, qn_w, kn_w, &k_cache, &v_cache)
@@ -1494,6 +1515,9 @@ impl WgpuTextDecoder {
                 layer.bg_gqa = bg_gqa;
                 layer.bg_gqa_split = bg_gqa_split;
             }
+        }
+        if let Some(cp) = copy {
+            self.gpu.queue.submit([cp.finish()]);
         }
         self.cap = target;
         let mib = (2 * self.cfg.num_hidden_layers as u64 * kv_words * 4) as f64 / (1024.0 * 1024.0);
@@ -2714,6 +2738,7 @@ impl WgpuTextDecoder {
                         beta: 0,
                         row0: 0,
                         lda: $k as u32,
+                        q_off: kv_start as u32,
                     },
                     $gx, $gy, $gz
                 );
@@ -2740,6 +2765,7 @@ impl WgpuTextDecoder {
                     beta: 0,
                     row0: 0,
                     lda: $k as u32,
+                    q_off: kv_start as u32,
                 }));
                 let bg = gemm_w8_bg($pipe, $a, $w, $s, $c, 0u64, &u_gd);
                 $cp.set_pipeline($pipe);
@@ -2781,6 +2807,7 @@ impl WgpuTextDecoder {
                         scale: cfg.scale(),
                         gx: softmax_grid.0,
                         row0: t0 as u32,
+                        q_off: kv_start as u32,
                     }),
                 );
                 gpu.write_at(
@@ -2795,6 +2822,7 @@ impl WgpuTextDecoder {
                         row0: t0 as u32,
                         gx: softmax_grid.0,
                         rows: (nqh * mp) as u32,
+                        q_off: kv_start as u32,
                     }),
                 );
             }
@@ -2831,6 +2859,7 @@ impl WgpuTextDecoder {
                     scale: cfg.scale(),
                     gx: softmax_grid.0,
                     row0: 0,
+                    q_off: kv_start as u32,
                 }),
             );
         }
@@ -2958,6 +2987,7 @@ impl WgpuTextDecoder {
                         beta: 0,
                         row0: t0 as u32,
                         lda: hd as u32,
+                        q_off: kv_start as u32,
                     };
                     let sgrid = ((slab_t / 128) as u32, (mp / 128) as u32, nqh as u32);
                     gemm_at!(
@@ -2984,7 +3014,7 @@ impl WgpuTextDecoder {
                                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                                     buffer: &u_sl,
                                     offset: 0,
-                                    size: std::num::NonZeroU64::new(32),
+                                    size: std::num::NonZeroU64::new(40),
                                 }),
                             },
                         ],
@@ -3004,7 +3034,7 @@ impl WgpuTextDecoder {
                                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                                     buffer: &u_sl,
                                     offset: 0,
-                                    size: std::num::NonZeroU64::new(32),
+                                    size: std::num::NonZeroU64::new(40),
                                 }),
                             },
                         ],
@@ -3027,6 +3057,7 @@ impl WgpuTextDecoder {
                         beta: 0,
                         row0: t0 as u32,
                         lda: slab_t as u32,
+                        q_off: kv_start as u32,
                     };
                     gemm_at!(
                         &mut cp, &self.pipes.gemm_av_causal, &attn, &v_rep, spart,
@@ -3053,7 +3084,7 @@ impl WgpuTextDecoder {
                             resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                                 buffer: &u_sl,
                                 offset: (2 * MAX_SLAB * 256) as u64,
-                                size: std::num::NonZeroU64::new(32),
+                                size: std::num::NonZeroU64::new(40),
                             }),
                         },
                     ],
@@ -3074,7 +3105,7 @@ impl WgpuTextDecoder {
                             resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                                 buffer: &u_sl,
                                 offset: ((2 * MAX_SLAB + 1) * 256) as u64,
-                                size: std::num::NonZeroU64::new(32),
+                                size: std::num::NonZeroU64::new(40),
                             }),
                         },
                     ],
@@ -3116,7 +3147,7 @@ impl WgpuTextDecoder {
                             resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                                 buffer: &u_sl,
                                 offset: 0,
-                                size: std::num::NonZeroU64::new(32),
+                                size: std::num::NonZeroU64::new(40),
                             }),
                         },
                     ],

@@ -2186,7 +2186,7 @@ fn prefill_gemm_impl(
     assert_eq!(n_bs, 8, "the v4 B store assumes two chunks per thread");
     let mut s = String::new();
     s.push_str(
-        "struct GDims { m: u32, n: u32, k: u32, ldc: u32, bsa: u32, bsb: u32, bsc: u32, beta: u32, row0: u32, lda: u32 };\n\
+        "struct GDims { m: u32, n: u32, k: u32, ldc: u32, bsa: u32, bsb: u32, bsc: u32, beta: u32, row0: u32, lda: u32, q_off: u32 };\n\
          @group(0) @binding(0) var<storage, read>       A: array<u32>;\n\
          @group(0) @binding(1) var<storage, read>       W: array<u32>;\n\
          @group(0) @binding(2) var<storage, read_write> C: array<u32>;\n\
@@ -2248,8 +2248,8 @@ fn prefill_gemm_impl(
          let alda = gd.lda / 2u;\n\
          let abase = wid.z * gd.bsa;\n let wb = wid.z * gd.bsb;\n\
          let cbase = wid.z * gd.bsc;\n\
-         if (CAUSAL == 1u && n0 + gd.row0 > m0 + BM - 1u) {{ return; }}\n\
-         let klim = select(gd.k, min(gd.k, max(m0 + BM, gd.row0) - gd.row0), CAUSAL_K == 1u);\n",
+         if (CAUSAL == 1u && n0 + gd.row0 > gd.q_off + m0 + BM - 1u) {{ return; }}\n\
+         let klim = select(gd.k, min(gd.k, max(gd.q_off + m0 + BM, gd.row0) - gd.row0), CAUSAL_K == 1u);\n",
         kkd = if w8 { 4 } else { 2 },
     ));
     if v4 {
@@ -2884,7 +2884,7 @@ pub fn softmax_causal_tree(bp: usize, bt: usize, subgroup: bool) -> String {
         )
     };
     format!(
-        "{enable}struct Cfg {{ n_w: u32, n_x: u32, valid: u32, m: u32, mp: u32, scale: f32, gx: u32, row0: u32 }};
+        "{enable}struct Cfg {{ n_w: u32, n_x: u32, valid: u32, m: u32, mp: u32, scale: f32, gx: u32, row0: u32, q_off: u32 }};
 
 @group(0) @binding(0) var<storage, read>       X:   array<u32>;
 @group(0) @binding(1) var<storage, read_write> Out: array<u32>;
@@ -2909,7 +2909,7 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
     let row_in_head = pos;
     // causal bound inside this dispatch's column window; row0 == 0 (flat path)
     // leaves `min(row_in_head + 1, valid)` exactly as it was
-    let valid = min(cfg.valid, max(row_in_head + 1u, cfg.row0) - cfg.row0);
+    let valid = min(cfg.valid, max(row_in_head + 1u + cfg.q_off, cfg.row0) - cfg.row0);
     let scale = cfg.scale;
 
     // A row left of the whole slab has no live column there, but the AV GEMM of
@@ -2991,7 +2991,7 @@ pub fn slab_stats(bs: usize, t: usize) -> String {
     assert!(t.is_power_of_two(), "slab_stats: the slab width must be a power of two");
     assert!(bs.is_power_of_two() && bs <= t, "slab_stats: block size");
     format!(
-        "struct StatsCfg {{ n_x: u32, valid: u32, m: u32, mp: u32, scale: f32, row0: u32, gx: u32, rows: u32 }};
+        "struct StatsCfg {{ n_x: u32, valid: u32, m: u32, mp: u32, scale: f32, row0: u32, gx: u32, rows: u32, q_off: u32 }};
 
 @group(0) @binding(0) var<storage, read>       X:     array<u32>;
 @group(0) @binding(1) var<storage, read_write> Stats: array<f32>;
@@ -3013,7 +3013,7 @@ fn slab_stats(@builtin(workgroup_id) wgid: vec3<u32>,
     let head = row / cfg.m;
     let pos = row % cfg.m;
     let base_x = (head * cfg.mp + pos) * cfg.n_x;
-    let valid = min(cfg.valid, max(pos + 1u, cfg.row0) - cfg.row0);
+    let valid = min(cfg.valid, max(pos + 1u + cfg.q_off, cfg.row0) - cfg.row0);
     // rows are the head-major `head·mp + pos` of the score buffer, not the
     // dispatch's flat row index (those differ: the grid spans `nqh · s`)
     let r = head * cfg.mp + pos;

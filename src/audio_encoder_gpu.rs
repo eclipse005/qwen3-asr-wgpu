@@ -70,6 +70,7 @@ struct GDims {
     beta: u32,
     row0: u32,
     lda: u32,
+    q_off: u32,
 }
 
 #[repr(C)]
@@ -1688,6 +1689,7 @@ impl GpuAudioEncoder {
                 beta: 0,
                 row0: 0,
                 lda: k as u32,
+                q_off: 0,
             }),
         );
         let bg = match bias {

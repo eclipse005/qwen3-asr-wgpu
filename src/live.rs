@@ -14,7 +14,8 @@
 //! * completed encoder windows are encoded once and cached (sliding eviction
 //!   keeps the last few); only the partial tail window is re-encoded per round;
 //! * the decoder is re-prefilled each round with the previous raw tokens minus a
-//!   short rollback (a full re-prefill, matching the official streaming re-feed);
+//!   short rollback, reusing the longest unchanged KV prefix (only the delta
+//!   rows are prefilled; the prefill causal mask honours `kv_start`);
 //! * text is committed token-wise against the previous candidate (longest common
 //!   prefix + overlap de-duplication), so committed output never retracts;
 //! * degenerate / stagnant streams re-anchor to a short committed tail.
@@ -167,6 +168,8 @@ struct LiveState {
     raw: Vec<u32>,
     stable: Vec<u32>,
     emitted: Vec<u32>,
+    prev_hidden: Vec<u8>,
+    kv_reuse: bool,
     chunk_idx: usize,
     next_cursor: usize,
     stagnant: usize,
@@ -184,6 +187,7 @@ impl LiveState {
         let no_cache = std::env::var("QASR_LIVE_NO_ENC_CACHE")
             .map(|v| v != "0")
             .unwrap_or(false);
+        let kv_reuse = std::env::var("QASR_LIVE_NO_KV_REUSE").map(|v| v != "1").unwrap_or(true);
         Self {
             samples: Vec::new(),
             base: 0,
@@ -195,6 +199,8 @@ impl LiveState {
             raw: Vec::new(),
             stable: Vec::new(),
             emitted: Vec::new(),
+            prev_hidden: Vec::new(),
+            kv_reuse,
             chunk_idx: 0,
             next_cursor: CHUNK_SAMPLES,
             stagnant: 0,
@@ -317,12 +323,19 @@ impl LiveState {
             et.append_f16_row_le(id as usize, hs, &mut hidden)?;
         }
 
-        // Full re-prefill each round, matching the official streaming re-feed.
-        // KV-prefix reuse (skip the unchanged leading rows via `kv_start > 0`)
-        // is a separate kernel change: the prefill causal softmax and the gemm
-        // tile-skip test the diagonal against the *relative* delta row, so they
-        // mask out the cached prefix whenever `kv_start > 0`.
-        let first = inner.decoder.prefill(&hidden, s, 0)?;
+        // Reuse the longest unchanged prefill prefix: the cached KV rows are
+        // identical to what a full re-prefill would recompute, so only the delta
+        // rows are prefilled (`kv_start > 0`).
+        let row = hs * 2;
+        let reuse = if self.kv_reuse {
+            common_rows(&self.prev_hidden, &hidden, row).min(s - 1)
+        } else {
+            0
+        };
+        let first = inner.decoder.prefill(&hidden[reuse * row..], s - reuse, reuse)?;
+        if self.kv_reuse {
+            self.prev_hidden = hidden;
+        }
 
         let eos = [ENDOFTEXT_TOKEN_ID as i32, IM_END_TOKEN_ID as i32];
         let mut token = first;
@@ -370,8 +383,8 @@ impl LiveState {
 
         if std::env::var("QASR_LIVE_DEBUG").is_ok() {
             eprintln!(
-                "[live] chunk={} final={} cursor={} nat={} prefix={} new={} raw={} tstart={} cand={} emit={} eos={} lang={}",
-                self.chunk_idx, is_final, cursor, nat, prefix_full,
+                "[live] chunk={} final={} cursor={} nat={} reuse={} prefix={} new={} raw={} tstart={} cand={} emit={} eos={} lang={}",
+                self.chunk_idx, is_final, cursor, nat, reuse, prefix_full,
                 new_tokens.len(), self.raw.len(), text_start, cand_len, self.emitted.len(), hit_eos, self.language
             );
         }
@@ -519,6 +532,7 @@ impl LiveState {
         self.stable.clear();
         self.stable.extend_from_slice(&tail);
         self.windows.clear();
+        self.prev_hidden.clear();
         self.stagnant = 0;
     }
 }
@@ -563,6 +577,19 @@ fn decode_ids(inner: &Inner, ids: &[u32]) -> anyhow::Result<String> {
         .tokenizer
         .decode(ids, true)
         .map_err(|e| anyhow::anyhow!("decode: {e}"))
+}
+
+/// Longest common prefix of two equal-width byte buffers, counted in rows.
+fn common_rows(a: &[u8], b: &[u8], row: usize) -> usize {
+    if row == 0 {
+        return 0;
+    }
+    let n = (a.len() / row).min(b.len() / row);
+    let mut i = 0;
+    while i < n && a[i * row..(i + 1) * row] == b[i * row..(i + 1) * row] {
+        i += 1;
+    }
+    i
 }
 
 /// Longest common prefix of two token slices.
@@ -678,6 +705,15 @@ mod tests {
         assert_eq!(lcp(&[1, 2, 3], &[1, 2, 4]), 2);
         assert_eq!(lcp(&[], &[1]), 0);
         assert_eq!(lcp(&[1, 2], &[1, 2, 3]), 2);
+    }
+
+    #[test]
+    fn common_rows_counts_whole_rows() {
+        let a = [1u8, 2, 3, 4, 5, 6];
+        let b = [1u8, 2, 3, 4, 9, 9];
+        assert_eq!(common_rows(&a, &b, 2), 2);
+        assert_eq!(common_rows(&a, &a, 2), 3);
+        assert_eq!(common_rows(&[], &a, 2), 0);
     }
 
     #[test]
