@@ -5,7 +5,7 @@ use std::time::Instant;
 use anyhow::{anyhow, bail, Context, Result};
 use safetensors::Dtype;
 
-use crate::gpu::{BulkUpload, Gpu};
+use crate::gpu::{BulkUpload, Gpu, PipeJob};
 use crate::shaders;
 use crate::weights::{self, PackedWeight};
 
@@ -923,12 +923,6 @@ impl WgpuTextDecoder {
         let vocab = cfg.vocab_size;
         let nl = cfg.num_hidden_layers;
 
-        let build =
-            |label: &str, src: &str, entry: &str, pl: Option<&wgpu::PipelineLayout>| -> Result<wgpu::ComputePipeline> {
-                gpu.pipeline(label, src, entry, pl)
-                    .with_context(|| format!("build pipeline {label}"))
-            };
-
         let t_pipes = std::time::Instant::now();
         let gqa_pl = family_layout(
             &gpu,
@@ -963,125 +957,185 @@ impl WgpuTextDecoder {
         let subgroup = gpu.features.contains(wgpu::Features::SUBGROUP)
             && gpu.info.subgroup_min_size == 32
             && gpu.info.subgroup_max_size == 32;
-        let pipes = Pipes {
-            gemv_qkv: build("gemv_qkv", &shaders::gemv(cfg.fused_qkv_cols(), hs, false, subgroup, gemv_rpw()), "gemv", None)?,
-            gemv_o: build("gemv_o", &shaders::gemv(hs, q_dim, true, subgroup, gemv_rpw()), "gemv", None)?,
-            gemv_o_rpwr2: build("gemv_o_rpwr2", &shaders::gemv_rpwr(hs, q_dim, true, subgroup, gemv_rpw(), 2), "gemv", None)?,
-            gemv_gu: build("gemv_gu", &shaders::gemv(2 * inter, hs, false, subgroup, gemv_rpw()), "gemv", None)?,
-            gemv_dp: build("gemv_dp", &shaders::gemv(hs, inter, true, subgroup, gemv_rpw()), "gemv", None)?,
-            gemv_dp_rpwr2: build("gemv_dp_rpwr2", &shaders::gemv_rpwr(hs, inter, true, subgroup, gemv_rpw(), 2), "gemv", None)?,
-            gemv_lm: build("gemv_lm", &shaders::gemv(vocab, hs, false, subgroup, gemv_rpw()), "gemv", None)?,
-            gemv_qkv_norm: build(
+        // The three `slab_*` layouts are named here rather than inline in the
+        // batch below: a job outlives the expression that made it.
+        let slab_stats_pl =
+            family_layout_dyn(&gpu, "slab_stats", &[(0, true), (1, false)], 2, true);
+        let slab_weights_pl = family_layout(&gpu, "slab_weights", &[(0, true), (1, false)], 2);
+        let slab_merge_pl =
+            family_layout(&gpu, "slab_merge", &[(0, true), (1, true), (2, false)], 3);
+        // One list, built on every core (see [`Gpu::pipelines`]): on DX12 this
+        // stage is the driver compiling 48 pipelines and it dominates the load.
+        let jobs = [
+            PipeJob::new("gemv_qkv", shaders::gemv(cfg.fused_qkv_cols(), hs, false, subgroup, gemv_rpw()), "gemv", None),
+            PipeJob::new("gemv_o", shaders::gemv(hs, q_dim, true, subgroup, gemv_rpw()), "gemv", None),
+            PipeJob::new("gemv_o_rpwr2", shaders::gemv_rpwr(hs, q_dim, true, subgroup, gemv_rpw(), 2), "gemv", None),
+            PipeJob::new("gemv_gu", shaders::gemv(2 * inter, hs, false, subgroup, gemv_rpw()), "gemv", None),
+            PipeJob::new("gemv_dp", shaders::gemv(hs, inter, true, subgroup, gemv_rpw()), "gemv", None),
+            PipeJob::new("gemv_dp_rpwr2", shaders::gemv_rpwr(hs, inter, true, subgroup, gemv_rpw(), 2), "gemv", None),
+            PipeJob::new("gemv_lm", shaders::gemv(vocab, hs, false, subgroup, gemv_rpw()), "gemv", None),
+            PipeJob::new(
                 "gemv_qkv_norm",
-                &shaders::gemv_norm(cfg.fused_qkv_cols(), hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
+                shaders::gemv_norm(cfg.fused_qkv_cols(), hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
                 "gemv",
                 None,
-            )?,
-            gemv_gu_norm: build(
+            ),
+            PipeJob::new(
                 "gemv_gu_norm",
-                &shaders::gemv_norm(2 * inter, hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
+                shaders::gemv_norm(2 * inter, hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
                 "gemv",
                 None,
-            )?,
-            gemv_lm_norm: build(
+            ),
+            PipeJob::new(
                 "gemv_lm_norm",
-                &shaders::gemv_norm(vocab, hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
+                shaders::gemv_norm(vocab, hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
                 "gemv",
                 None,
-            )?,
-            gemv_w8_o: build("gemv_w8_o", &shaders::gemv_w8(hs, q_dim, true, subgroup, gemv_rpw()), "gemv", None)?,
-            gemv_w8_o_rpwr2: build(
+            ),
+            PipeJob::new("gemv_w8_o", shaders::gemv_w8(hs, q_dim, true, subgroup, gemv_rpw()), "gemv", None),
+            PipeJob::new(
                 "gemv_w8_o_rpwr2",
-                &shaders::gemv_w8_rpwr(hs, q_dim, true, subgroup, gemv_rpw(), 2),
+                shaders::gemv_w8_rpwr(hs, q_dim, true, subgroup, gemv_rpw(), 2),
                 "gemv",
                 None,
-            )?,
-            gemv_w8_dp: build("gemv_w8_dp", &shaders::gemv_w8(hs, inter, true, subgroup, gemv_rpw()), "gemv", None)?,
-            gemv_w8_dp_rpwr2: build(
+            ),
+            PipeJob::new("gemv_w8_dp", shaders::gemv_w8(hs, inter, true, subgroup, gemv_rpw()), "gemv", None),
+            PipeJob::new(
                 "gemv_w8_dp_rpwr2",
-                &shaders::gemv_w8_rpwr(hs, inter, true, subgroup, gemv_rpw(), 2),
+                shaders::gemv_w8_rpwr(hs, inter, true, subgroup, gemv_rpw(), 2),
                 "gemv",
                 None,
-            )?,
+            ),
             // The plain (norm-not-folded) qkv/gu forms exist only so the
             // per-op debug probes keep their exact f16 shape on an int8 model;
             // the shipped decode loop uses the `_norm` fused forms above.
-            gemv_w8_qkv: build("gemv_w8_qkv", &shaders::gemv_w8(cfg.fused_qkv_cols(), hs, false, subgroup, gemv_rpw()), "gemv", None)?,
-            gemv_w8_gu: build("gemv_w8_gu", &shaders::gemv_w8(2 * inter, hs, false, subgroup, gemv_rpw()), "gemv", None)?,
-            gemv_w8_qkv_norm: build(
+            PipeJob::new("gemv_w8_qkv", shaders::gemv_w8(cfg.fused_qkv_cols(), hs, false, subgroup, gemv_rpw()), "gemv", None),
+            PipeJob::new("gemv_w8_gu", shaders::gemv_w8(2 * inter, hs, false, subgroup, gemv_rpw()), "gemv", None),
+            PipeJob::new(
                 "gemv_w8_qkv_norm",
-                &shaders::gemv_norm_w8(cfg.fused_qkv_cols(), hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
+                shaders::gemv_norm_w8(cfg.fused_qkv_cols(), hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
                 "gemv",
                 None,
-            )?,
-            gemv_w8_gu_norm: build(
+            ),
+            PipeJob::new(
                 "gemv_w8_gu_norm",
-                &shaders::gemv_norm_w8(2 * inter, hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
+                shaders::gemv_norm_w8(2 * inter, hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
                 "gemv",
                 None,
-            )?,
-            gemm_w8: build("gemm_w8", &shaders::prefill_gemm_w8(false), "gemm", Some(&gemm_w8_pl))?,
-            gemm_w8_acc: build("gemm_w8_acc", &shaders::prefill_gemm_w8(true), "gemm", Some(&gemm_w8_pl))?,
-            rms_norm: build("rms_norm", &shaders::rms_norm(hs, rms_bs), "rms_norm", None)?,
-            extract: build("qkv_extract", &shaders::qkv_extract(nqh, nkvh, hd), "qkv_extract", None)?,
-            gqa256: build("gqa256", &shaders::gqa_decode_single(nqh, nkvh, hd, 256, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl))?,
-            gqa512: build("gqa512", &shaders::gqa_decode_single(nqh, nkvh, hd, 512, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl))?,
-            gqa_split128: build("gqa_split128", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 128), "gqa_split_p1", Some(&split_pl))?,
-            gqa_split_pair256: build("gqa_split_pair256", &pair_split_src(nqh, nkvh, hd, 256, false, subgroup && gqa_coop()  , gqa_pf(), false, gqa_depth()), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
-            gqa_split_pair512: build("gqa_split_pair512", &pair_split_src(nqh, nkvh, hd, 512, false, subgroup && gqa_coop()  , gqa_pf(), false, gqa_depth()), pair_split_entry(nqh, nkvh), Some(&split_pl))?,
-            gqa_split_pair256_row0: build("gqa_split_pair256_row0", &shaders::gqa_decode_split_p1_pair(hd, 256, 2, true, false, false, false, 1), "gqa_split_p1_pair", Some(&split_pl))?,
-            gqa_split_pair256_coal: build("gqa_split_pair256_coal", &shaders::gqa_decode_split_p1_pair(hd, 256, 2, false, false, false, true, 1), "gqa_split_p1_pair", Some(&split_pl))?,
-            gqa_split256: build("gqa_split256", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 256), "gqa_split_p1", Some(&split_pl))?,
-            gqa_split512: build("gqa_split512", &shaders::gqa_decode_split_p1(nqh, nkvh, hd, 512), "gqa_split_p1", Some(&split_pl))?,
-            gqa_merge: build("gqa_merge", &shaders::gqa_split_merge(hd), "gqa_merge", None)?,
-            silu: build("silu30", &shaders::silu_mul_split(inter), "silu_mul_split", None)?,
-            argmax: build("argmax", &shaders::argmax_into_slot(), "argmax", None)?,
-            embed: build("embed", &shaders::embed_lookup_single(), "embed", None)?,
-            gemm: build("gemm", &shaders::prefill_gemm(false, false), "gemm", Some(&gemm_pl))?,
-            gemm_acc: build("gemm_acc", &shaders::prefill_gemm(false, true), "gemm", Some(&gemm_pl))?,
-            gemm_av: build("gemm_av", &shaders::prefill_gemm(true, false), "gemm", Some(&gemm_pl))?,
-            gemm_causal: build("gemm_causal", &shaders::prefill_gemm_causal(), "gemm", Some(&gemm_pl))?,
-            gemm_av_causal: build("gemm_av_causal", &shaders::prefill_gemm_causal_av(), "gemm", Some(&gemm_pl))?,
+            ),
+            PipeJob::new("gemm_w8", shaders::prefill_gemm_w8(false), "gemm", Some(&gemm_w8_pl)),
+            PipeJob::new("gemm_w8_acc", shaders::prefill_gemm_w8(true), "gemm", Some(&gemm_w8_pl)),
+            PipeJob::new("rms_norm", shaders::rms_norm(hs, rms_bs), "rms_norm", None),
+            PipeJob::new("qkv_extract", shaders::qkv_extract(nqh, nkvh, hd), "qkv_extract", None),
+            PipeJob::new("gqa256", shaders::gqa_decode_single(nqh, nkvh, hd, 256, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl)),
+            PipeJob::new("gqa512", shaders::gqa_decode_single(nqh, nkvh, hd, 512, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl)),
+            PipeJob::new("gqa_split128", shaders::gqa_decode_split_p1(nqh, nkvh, hd, 128), "gqa_split_p1", Some(&split_pl)),
+            PipeJob::new("gqa_split_pair256", pair_split_src(nqh, nkvh, hd, 256, false, subgroup && gqa_coop()  , gqa_pf(), false, gqa_depth()), pair_split_entry(nqh, nkvh), Some(&split_pl)),
+            PipeJob::new("gqa_split_pair512", pair_split_src(nqh, nkvh, hd, 512, false, subgroup && gqa_coop()  , gqa_pf(), false, gqa_depth()), pair_split_entry(nqh, nkvh), Some(&split_pl)),
+            PipeJob::new("gqa_split_pair256_row0", shaders::gqa_decode_split_p1_pair(hd, 256, 2, true, false, false, false, 1), "gqa_split_p1_pair", Some(&split_pl)),
+            PipeJob::new("gqa_split_pair256_coal", shaders::gqa_decode_split_p1_pair(hd, 256, 2, false, false, false, true, 1), "gqa_split_p1_pair", Some(&split_pl)),
+            PipeJob::new("gqa_split256", shaders::gqa_decode_split_p1(nqh, nkvh, hd, 256), "gqa_split_p1", Some(&split_pl)),
+            PipeJob::new("gqa_split512", shaders::gqa_decode_split_p1(nqh, nkvh, hd, 512), "gqa_split_p1", Some(&split_pl)),
+            PipeJob::new("gqa_merge", shaders::gqa_split_merge(hd), "gqa_merge", None),
+            PipeJob::new("silu30", shaders::silu_mul_split(inter), "silu_mul_split", None),
+            PipeJob::new("argmax", shaders::argmax_into_slot(), "argmax", None),
+            PipeJob::new("embed", shaders::embed_lookup_single(), "embed", None),
+            PipeJob::new("gemm", shaders::prefill_gemm(false, false), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm_acc", shaders::prefill_gemm(false, true), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm_av", shaders::prefill_gemm(true, false), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm_causal", shaders::prefill_gemm_causal(), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm_av_causal", shaders::prefill_gemm_causal_av(), "gemm", Some(&gemm_pl)),
+            PipeJob::new("softmax32", shaders::softmax_causal(32, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax64", shaders::softmax_causal(64, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax128", shaders::softmax_causal(128, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax256", shaders::softmax_causal(256, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax512", shaders::softmax_causal(512, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax1024", shaders::softmax_causal(1024, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax64x256", shaders::softmax_causal_tree(64, 256, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax64x512", shaders::softmax_causal_tree(64, 512, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax64x1024", shaders::softmax_causal_tree(64, 1024, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax128x256", shaders::softmax_causal_tree(128, 256, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax128x512", shaders::softmax_causal_tree(128, 512, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax128x1024", shaders::softmax_causal_tree(128, 1024, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax256x512", shaders::softmax_causal_tree(256, 512, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax256x1024", shaders::softmax_causal_tree(256, 1024, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
+            PipeJob::new("repeat_kv", shaders::repeat_kv(nqh / nkvh), "repeat_kv", Some(&rk_pl)),
+            PipeJob::new("slab_stats", shaders::slab_stats(SLAB_BS, SLAB_T), "slab_stats", Some(&slab_stats_pl)),
+            PipeJob::new("slab_weights", shaders::slab_weights(256), "slab_weights", Some(&slab_weights_pl)),
+            PipeJob::new("slab_merge", shaders::slab_merge(nqh, hd), "slab_merge", Some(&slab_merge_pl)),
+        ];
+        let mut built = gpu.pipelines(&jobs)?;
+        let mut take = |name: &str| -> Result<wgpu::ComputePipeline> {
+            built
+                .remove(name)
+                .with_context(|| format!("pipeline {name} was not built"))
+        };
+        let pipes = Pipes {
+            gemv_qkv: take("gemv_qkv")?,
+            gemv_o: take("gemv_o")?,
+            gemv_o_rpwr2: take("gemv_o_rpwr2")?,
+            gemv_gu: take("gemv_gu")?,
+            gemv_dp: take("gemv_dp")?,
+            gemv_dp_rpwr2: take("gemv_dp_rpwr2")?,
+            gemv_lm: take("gemv_lm")?,
+            gemv_qkv_norm: take("gemv_qkv_norm")?,
+            gemv_gu_norm: take("gemv_gu_norm")?,
+            gemv_lm_norm: take("gemv_lm_norm")?,
+            gemv_w8_o: take("gemv_w8_o")?,
+            gemv_w8_o_rpwr2: take("gemv_w8_o_rpwr2")?,
+            gemv_w8_dp: take("gemv_w8_dp")?,
+            gemv_w8_dp_rpwr2: take("gemv_w8_dp_rpwr2")?,
+            gemv_w8_qkv: take("gemv_w8_qkv")?,
+            gemv_w8_gu: take("gemv_w8_gu")?,
+            gemv_w8_qkv_norm: take("gemv_w8_qkv_norm")?,
+            gemv_w8_gu_norm: take("gemv_w8_gu_norm")?,
+            gemm_w8: take("gemm_w8")?,
+            gemm_w8_acc: take("gemm_w8_acc")?,
+            rms_norm: take("rms_norm")?,
+            extract: take("qkv_extract")?,
+            gqa256: take("gqa256")?,
+            gqa512: take("gqa512")?,
+            gqa_split128: take("gqa_split128")?,
+            gqa_split_pair256: take("gqa_split_pair256")?,
+            gqa_split_pair512: take("gqa_split_pair512")?,
+            gqa_split_pair256_row0: take("gqa_split_pair256_row0")?,
+            gqa_split_pair256_coal: take("gqa_split_pair256_coal")?,
+            gqa_split256: take("gqa_split256")?,
+            gqa_split512: take("gqa_split512")?,
+            gqa_merge: take("gqa_merge")?,
+            silu: take("silu30")?,
+            argmax: take("argmax")?,
+            embed: take("embed")?,
+            gemm: take("gemm")?,
+            gemm_acc: take("gemm_acc")?,
+            gemm_av: take("gemm_av")?,
+            gemm_causal: take("gemm_causal")?,
+            gemm_av_causal: take("gemm_av_causal")?,
             softmax: std::collections::HashMap::from([
-                (32, build("softmax32", &shaders::softmax_causal(32, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
-                (64, build("softmax64", &shaders::softmax_causal(64, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
-                (128, build("softmax128", &shaders::softmax_causal(128, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
-                (256, build("softmax256", &shaders::softmax_causal(256, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
-                (512, build("softmax512", &shaders::softmax_causal(512, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
-                (1024, build("softmax1024", &shaders::softmax_causal(1024, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
+                (32, take("softmax32")?),
+                (64, take("softmax64")?),
+                (128, take("softmax128")?),
+                (256, take("softmax256")?),
+                (512, take("softmax512")?),
+                (1024, take("softmax1024")?),
             ]),
             // Every `(phys, tree)` the shipped `SOFTMAX_BS_PHYS` can meet must be
             // here: `tree` is the row-length ladder (256/512/1024), and a physical
             // width that lands on a missing pair is a panic, not a fallback.
             softmax_wide: std::collections::HashMap::from([
-                ((64, 256), build("softmax64x256", &shaders::softmax_causal_tree(64, 256, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
-                ((64, 512), build("softmax64x512", &shaders::softmax_causal_tree(64, 512, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
-                ((64, 1024), build("softmax64x1024", &shaders::softmax_causal_tree(64, 1024, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
-                ((128, 256), build("softmax128x256", &shaders::softmax_causal_tree(128, 256, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
-                ((128, 512), build("softmax128x512", &shaders::softmax_causal_tree(128, 512, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
-                ((128, 1024), build("softmax128x1024", &shaders::softmax_causal_tree(128, 1024, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
-                ((256, 512), build("softmax256x512", &shaders::softmax_causal_tree(256, 512, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
-                ((256, 1024), build("softmax256x1024", &shaders::softmax_causal_tree(256, 1024, subgroup && sg_reduce()), "softmax", Some(&sm_pl))?),
+                ((64, 256), take("softmax64x256")?),
+                ((64, 512), take("softmax64x512")?),
+                ((64, 1024), take("softmax64x1024")?),
+                ((128, 256), take("softmax128x256")?),
+                ((128, 512), take("softmax128x512")?),
+                ((128, 1024), take("softmax128x1024")?),
+                ((256, 512), take("softmax256x512")?),
+                ((256, 1024), take("softmax256x1024")?),
             ]),
-            repeat_kv: build("repeat_kv", &shaders::repeat_kv(nqh / nkvh), "repeat_kv", Some(&rk_pl))?,
-            slab_stats: build(
-                "slab_stats",
-                &shaders::slab_stats(SLAB_BS, SLAB_T),
-                "slab_stats",
-                Some(&family_layout_dyn(&gpu, "slab_stats", &[(0, true), (1, false)], 2, true)),
-            )?,
-            slab_weights: build(
-                "slab_weights",
-                &shaders::slab_weights(256),
-                "slab_weights",
-                Some(&family_layout(&gpu, "slab_weights", &[(0, true), (1, false)], 2)),
-            )?,
-            slab_merge: build(
-                "slab_merge",
-                &shaders::slab_merge(nqh, hd),
-                "slab_merge",
-                Some(&family_layout(&gpu, "slab_merge", &[(0, true), (1, true), (2, false)], 3)),
-            )?,
+            repeat_kv: take("repeat_kv")?,
+            slab_stats: take("slab_stats")?,
+            slab_weights: take("slab_weights")?,
+            slab_merge: take("slab_merge")?,
         };
         crate::load_trace::note("decoder: pipelines", t_pipes);
 
