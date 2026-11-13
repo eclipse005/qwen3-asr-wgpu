@@ -165,7 +165,7 @@ fn diagnostics_and_streaming_agree_with_the_one_call_path() {
     .expect("transcribe from mel");
     assert_eq!(from_mel.text, one_call.text, "mel-in path drifted");
 
-    let mut session = asr.create_streaming_session(opts).expect("session");
+    let mut session = asr.create_buffered_session(opts).expect("session");
     for part in samples.chunks(16_000) {
         session.push_samples(part).expect("push");
     }

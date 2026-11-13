@@ -1,7 +1,7 @@
 //! True streaming decoding: audio goes in, committed text comes out while the
 //! audio is still arriving.
 //!
-//! This is the live counterpart to [`crate::AsrStreamingSession`] (which only
+//! This is the live counterpart to [`crate::AsrBufferedSession`] (which only
 //! encodes incrementally and decodes once at `flush`, reproducing the offline
 //! result exactly).  Here every ~2 s of audio triggers a decode round whose
 //! committed text is emitted through a callback; memory stays bounded on

@@ -186,7 +186,11 @@ impl MelExtractor {
         }
     }
 
-    pub(crate) fn extract(&self, samples: &[f32]) -> Result<(Vec<f32>, usize, usize)> {
+    /// Log-mel without the utterance-level normalisation.  Split out of
+    /// [`Self::extract`] so a streaming caller can collect every window's raw
+    /// values first and normalise them against the whole clip's maximum at the
+    /// end — the same scalar the one-shot path uses.
+    pub(crate) fn extract_log_mel(&self, samples: &[f32]) -> Result<(Vec<f32>, usize, usize)> {
         anyhow::ensure!(!samples.is_empty(), "empty audio");
         let pad = self.n_fft / 2;
         let padded_signal = reflection_pad(samples, pad);
@@ -217,18 +221,27 @@ impl MelExtractor {
         }
 
         let log10_factor = 1.0 / 10.0f32.ln();
-        let mut max_val = f32::NEG_INFINITY;
         for v in mel_spec.iter_mut() {
             *v = v.max(1e-10f32).ln() * log10_factor;
-            if *v > max_val { max_val = *v; }
-        }
-
-        let min_val = max_val - 8.0;
-        for v in mel_spec.iter_mut() {
-            *v = (v.max(min_val) + 4.0) / 4.0;
         }
 
         Ok((mel_spec, self.num_mel_bins, n_frames))
+    }
+
+    /// The utterance-level normalisation, with `max_val` supplied by the caller
+    /// (the whole clip's log-mel maximum).
+    pub(crate) fn normalize_mel_in_place(&self, mel: &mut [f32], max_val: f32) {
+        let min_val = max_val - 8.0;
+        for v in mel.iter_mut() {
+            *v = (v.max(min_val) + 4.0) / 4.0;
+        }
+    }
+
+    pub(crate) fn extract(&self, samples: &[f32]) -> Result<(Vec<f32>, usize, usize)> {
+        let (mut mel, n_mels, n_frames) = self.extract_log_mel(samples)?;
+        let max_val = mel.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        self.normalize_mel_in_place(&mut mel, max_val);
+        Ok((mel, n_mels, n_frames))
     }
 }
 
@@ -324,6 +337,60 @@ mod tests {
         assert!(shift > 0.0, "fixture should have a window max below the whole-clip max");
         assert!(dmax.abs() < 1e-6, "slice values must never exceed the whole-clip ones: {dmax}");
         assert!((dmin + shift).abs() < 1e-5, "delta floor {dmin} != -shift {}", -shift);
+    }
+
+    /// The property the buffered streaming session relies on: a window's raw
+    /// log-mel, normalised with the *whole clip's* maximum, is bit-identical to
+    /// the same frames of a one-shot extraction.  The window slice mirrors
+    /// `streaming::StreamState::encode_window` (800 frames, 2 hops of left
+    /// context, no right reflection).
+    #[test]
+    fn window_renormalised_with_the_whole_clip_max_is_bit_exact() {
+        let hop = HOP_LENGTH;
+        let n = hop * 3000;
+        let mut x: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / MEL_SAMPLE_RATE as f32;
+                0.1 * (2.0 * std::f32::consts::PI * 220.0 * t).sin()
+                    * (1.0 + 0.5 * (2.0 * std::f32::consts::PI * 0.7 * t).sin())
+            })
+            .collect();
+        // A loud burst after the window under test: the clip maximum is then
+        // outside it, which is exactly when per-window normalisation drifts.
+        for v in &mut x[n * 3 / 4..] {
+            *v *= 8.0;
+        }
+
+        let ex = MelExtractor::new(N_FFT, HOP_LENGTH, 128, MEL_SAMPLE_RATE);
+        let (whole_raw, n_mels, frames_w) = ex.extract_log_mel(&x).unwrap();
+        let max_all = whole_raw.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let (whole, _, _) = ex.extract(&x).unwrap();
+        assert!(whole.iter().all(|v| v.is_finite()));
+
+        let (win, drop, f0) = (800usize, 2usize, 800usize);
+        let lo = f0 * hop - drop * hop;
+        let hi = (f0 + win - 1) * hop + N_FFT / 2;
+        let (raw, _, frames_s) = ex.extract_log_mel(&x[lo..hi]).unwrap();
+        assert!(frames_s >= drop + win);
+
+        let mut slice = vec![0.0f32; n_mels * win];
+        for m in 0..n_mels {
+            let src = m * frames_s + drop;
+            slice[m * win..(m + 1) * win].copy_from_slice(&raw[src..src + win]);
+        }
+        // Sanity: the window's own maximum is below the clip's, so the two
+        // normalisations really differ.
+        let win_max = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert!(win_max < max_all, "burst must be outside the window");
+        ex.normalize_mel_in_place(&mut slice, max_all);
+
+        for m in 0..n_mels {
+            for j in 0..win {
+                let got = slice[m * win + j].to_bits();
+                let want = whole[m * frames_w + f0 + j].to_bits();
+                assert_eq!(got, want, "bin {m} frame {} differs", f0 + j);
+            }
+        }
     }
 }
 

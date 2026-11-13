@@ -88,7 +88,7 @@ println!("[{}] {}", out.language, out.text);
 
 A model is loaded once and reused across calls; one instance can be shared by several threads (calls are queued internally). Also available:
 
-* Streaming — `transcribe_streaming(path, opts, cb)` and `create_streaming_session()` for feed-as-you-go input; `create_live_session()` (CLI `--stream`) commits text while listening, with bounded memory on arbitrarily long audio
+* Streaming — `transcribe_streaming(path, opts, cb)` for per-token callbacks; `create_buffered_session()` encodes as audio arrives and returns the exact offline transcript at `flush`; `create_stream_session()` (CLI `--stream`) commits text while listening, with bounded memory on arbitrarily long audio
 * Context / hot words — `TranscribeOptions::default().with_language("English").with_context("Vocabulary: Quilter, apostle, gospel.")`
 * Device introspection — `AsrInference::devices()`, `device_description()`, `supported_languages()`
 * The official three-step flow — `apply_transcription_request` → `generate` → `decode`, with `ReturnFormat::Raw | Parsed | TranscriptionOnly`

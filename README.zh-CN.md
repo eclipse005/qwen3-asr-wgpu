@@ -88,7 +88,7 @@ println!("[{}] {}", out.language, out.text);
 
 模型只需加载一次，之后可反复调用；一个实例可被多个线程共享（内部排队执行）。此外还提供：
 
-* 流式推理 —— `transcribe_streaming(path, opts, cb)` 与 `create_streaming_session()`，支持边喂音频边出结果；`create_live_session()`（CLI `--stream`）在喂音频的同时增量输出已稳定文本，长音频内存有界
+* 流式推理 —— `transcribe_streaming(path, opts, cb)` 逐 token 回调；`create_buffered_session()` 边收边编码、`flush` 时给出与整段离线完全一致的转写；`create_stream_session()`（CLI `--stream`）在喂音频的同时增量输出已稳定文本，长音频内存有界
 * 上下文 / 热词 —— `TranscribeOptions::default().with_language("English").with_context("Vocabulary: Quilter, apostle, gospel.")`
 * 设备查询 —— `AsrInference::devices()`、`device_description()`、`supported_languages()`
 * 官方三段式调用 —— `apply_transcription_request` → `generate` → `decode`，配合 `ReturnFormat::Raw | Parsed | TranscriptionOnly`
