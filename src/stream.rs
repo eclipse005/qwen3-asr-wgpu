@@ -11,8 +11,11 @@
 //! the official vLLM streaming policy (`unfixed_chunk_num=2`,
 //! `unfixed_token_num=5`):
 //!
-//! * completed encoder windows are encoded once and cached (sliding eviction
-//!   keeps the last few); only the partial tail window is re-encoded per round;
+//! * completed encoder windows are cached with their raw log-mel; the frontend
+//!   normalises against the whole stream seen so far (the official policy
+//!   re-normalises the accumulated audio every round), so a window is re-encoded
+//!   only when that maximum rises.  Sliding eviction keeps the last few
+//!   windows, and the partial tail is re-encoded per round;
 //! * the decoder is re-prefilled each round with the previous raw tokens minus a
 //!   short rollback, reusing the longest unchanged KV prefix (only the delta
 //!   rows are prefilled; the prefill causal mask honours `kv_start`);
@@ -161,13 +164,29 @@ impl<'a, F: FnMut(StreamUpdate)> AsrStreamSession<'a, F> {
     }
 }
 
+/// One cached encoder window: raw log-mel plus the embeddings produced from it.
+///
+/// The frontend normalises against the whole stream's maximum, which can rise
+/// after a window was encoded; keeping the raw frames lets that window be
+/// re-encoded against the new maximum.
+struct EncWindow {
+    /// `n_mels * n`, bin-major, left-context frames already stripped.
+    mel: Vec<f32>,
+    n: usize,
+    /// The maximum these embeddings were normalised with.
+    used_max: f32,
+    embeds: Vec<f32>,
+}
+
 struct StreamRoundState {
     samples: Vec<f32>,
     base: usize,
     frame: usize,
-    windows: VecDeque<Vec<f32>>,
+    windows: VecDeque<EncWindow>,
     win_frames: usize,
     n_mels: usize,
+    /// Whole-stream log-mel maximum seen so far (grows monotonically).
+    max_val: f32,
     no_cache: bool,
     /// 保留的编码窗口数（`QASR_STREAM_MAX_WIN` 可覆盖，用于上下文/显存 A/B）。
     max_win: usize,
@@ -213,6 +232,7 @@ impl StreamRoundState {
             windows: VecDeque::new(),
             win_frames,
             n_mels: ac.num_mel_bins,
+            max_val: f32::NEG_INFINITY,
             no_cache,
             max_win,
             stale_limit,
@@ -455,16 +475,16 @@ impl StreamRoundState {
     fn encode(&mut self, inner: &mut Inner, cursor: usize) -> anyhow::Result<Vec<f32>> {
         if self.no_cache {
             // Debug fallback: recompute the same windows + partial every round
-            // with the identical per-window frontend (no caching, no eviction),
-            // so cache on/off is numerically — not merely textually — equivalent.
-            let mut enc = Vec::new();
+            // (no caching, no eviction), normalised against the whole slice's
+            // maximum — the same scalar the cache path ends up using.
+            let mut spans = Vec::new();
             let mut f = 0;
             loop {
                 let need_end = (f + self.win_frames - 1) * HOP_LENGTH + N_FFT / 2;
                 if need_end > cursor {
                     break;
                 }
-                enc.extend_from_slice(&encode_span(
+                spans.push(extract_span_mel(
                     inner,
                     &self.samples,
                     0,
@@ -476,7 +496,7 @@ impl StreamRoundState {
                 f += self.win_frames;
             }
             if cursor > f * HOP_LENGTH {
-                enc.extend_from_slice(&encode_span(
+                spans.push(extract_span_mel(
                     inner,
                     &self.samples,
                     0,
@@ -486,6 +506,14 @@ impl StreamRoundState {
                     self.n_mels,
                 )?);
             }
+            let max_val = spans
+                .iter()
+                .flat_map(|(mel, _)| mel.iter().copied())
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mut enc = Vec::new();
+            for (mel, n) in &spans {
+                enc.extend_from_slice(&encode_normalized(inner, mel, *n, self.n_mels, max_val)?);
+            }
             return Ok(enc);
         }
         loop {
@@ -494,7 +522,7 @@ impl StreamRoundState {
             if need_end > cursor {
                 break;
             }
-            let e = encode_span(
+            let (mel, n) = extract_span_mel(
                 inner,
                 &self.samples,
                 self.base,
@@ -503,7 +531,14 @@ impl StreamRoundState {
                 Some(self.win_frames),
                 self.n_mels,
             )?;
-            self.windows.push_back(e);
+            let chunk_max = mel.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            self.max_val = self.max_val.max(chunk_max);
+            self.windows.push_back(EncWindow {
+                mel,
+                n,
+                used_max: f32::NEG_INFINITY,
+                embeds: Vec::new(),
+            });
             self.frame += self.win_frames;
             while self.windows.len() > self.max_win {
                 self.windows.pop_front();
@@ -514,12 +549,10 @@ impl StreamRoundState {
             self.samples.drain(..keep_from - self.base);
             self.base = keep_from;
         }
-        let mut enc = Vec::new();
-        for w in &self.windows {
-            enc.extend_from_slice(w);
-        }
-        if cursor > self.frame * HOP_LENGTH {
-            let p = encode_span(
+        // The partial tail is re-encoded every round anyway; take its raw frames
+        // first so its own maximum participates in this round's normalisation.
+        let tail = if cursor > self.frame * HOP_LENGTH {
+            let (mel, n) = extract_span_mel(
                 inner,
                 &self.samples,
                 self.base,
@@ -528,7 +561,30 @@ impl StreamRoundState {
                 None,
                 self.n_mels,
             )?;
-            enc.extend_from_slice(&p);
+            let tail_max = mel.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            self.max_val = self.max_val.max(tail_max);
+            Some((mel, n))
+        } else {
+            None
+        };
+        for w in self.windows.iter_mut() {
+            if w.used_max != self.max_val {
+                w.embeds = encode_normalized(inner, &w.mel, w.n, self.n_mels, self.max_val)?;
+                w.used_max = self.max_val;
+            }
+        }
+        let mut enc = Vec::new();
+        for w in &self.windows {
+            enc.extend_from_slice(&w.embeds);
+        }
+        if let Some((mel, n)) = tail {
+            enc.extend_from_slice(&encode_normalized(
+                inner,
+                &mel,
+                n,
+                self.n_mels,
+                self.max_val,
+            )?);
         }
         Ok(enc)
     }
@@ -551,24 +607,24 @@ impl StreamRoundState {
     }
 }
 
-/// Encode `[f0, end_abs)` mel frames (with the 2-hop left context the conv stem
-/// needs) into audio embeddings.  `n_frames = Some` pins a complete window;
-/// `None` takes whatever the slice yields (the partial tail).
-fn encode_span(
-    inner: &mut Inner,
+/// Extract `[f0, end_abs)` mel frames (with the 2-hop left context the conv stem
+/// needs) as raw log-mel, not yet normalised.  `n_frames = Some` pins a complete
+/// window; `None` takes whatever the slice yields (the partial tail).
+fn extract_span_mel(
+    inner: &Inner,
     samples: &[f32],
     base: usize,
     f0: usize,
     end_abs: usize,
     n_frames: Option<usize>,
     n_mels: usize,
-) -> anyhow::Result<Vec<f32>> {
+) -> anyhow::Result<(Vec<f32>, usize)> {
     let want_from = f0 * HOP_LENGTH;
     let slice_start = want_from.saturating_sub(2 * HOP_LENGTH);
     let drop = (want_from - slice_start) / HOP_LENGTH;
     let lo = slice_start - base;
     let hi = end_abs - base;
-    let (mel, nm, frames) = inner.mel.extract(&samples[lo..hi])?;
+    let (mel, nm, frames) = inner.mel.extract_log_mel(&samples[lo..hi])?;
     anyhow::ensure!(nm == n_mels, "mel bins {nm} != {n_mels}");
     let n = match n_frames {
         Some(n) => n,
@@ -583,7 +639,20 @@ fn encode_span(
         let src = m * frames + drop;
         win[m * n..(m + 1) * n].copy_from_slice(&mel[src..src + n]);
     }
-    inner.run_encoder(&win, n_mels, n, false)
+    Ok((win, n))
+}
+
+/// Normalise raw log-mel against `max_val` and run the audio tower.
+fn encode_normalized(
+    inner: &mut Inner,
+    mel: &[f32],
+    n: usize,
+    n_mels: usize,
+    max_val: f32,
+) -> anyhow::Result<Vec<f32>> {
+    let mut norm = mel.to_vec();
+    inner.mel.normalize_mel_in_place(&mut norm, max_val);
+    inner.run_encoder(&norm, n_mels, n, false)
 }
 
 fn decode_ids(inner: &Inner, ids: &[u32]) -> anyhow::Result<String> {
