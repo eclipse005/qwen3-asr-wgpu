@@ -82,8 +82,19 @@ transcribe --model ./Qwen3-ASR-0.6B-hf --wav ./audio.wav
 用 `transcribe_batch` 一次喂一个列表，返回**同序**的文本：
 
 ```bash
-transcribe_batch --model ./Qwen3-ASR-1.7B-hf --batch 16                  --wav segs/part000.wav segs/part001.wav ... --out texts.txt
+transcribe_batch --model ./Qwen3-ASR-1.7B-hf --batch 16 \
+                 --wav segs/part000.wav segs/part001.wav ... --out texts.txt
 ```
+
+| 参数 | 说明 |
+|------|------|
+| `--wav <file...>` | 音频列表，顺序即输出顺序 |
+| `--batch <n>` | 同时解码几段，默认 `1`（逐段路径） |
+| `--max-new <n>` | 每段生成上限，默认 256 |
+| `--compare` | 再跑一遍 `--batch 1` 并逐段 diff，有差异即非零退出 |
+| `--timings` | 打印 `mel / encoder / prefill / decode` 四段耗时 |
+| `--out <file>` | 把文本按行写入文件（与输入同序） |
+| `--model` / `--device` | 同 `transcribe` |
 
 `--batch N` 指同时解码几段：默认 1 走逐段路径；`N>1` 时每一步的权重只读一次、喂给 N 段，
 显存随 N 线性增长（每段一份 KV），按自己显卡显存选即可。
@@ -95,7 +106,7 @@ buffer（`binding_array` 按 `wgpu.z` 索引），batch 只改变"一次 dispatc
 
 | 限制 | 值 |
 |---|---|
-| 每批槽位上限 | 32（`binding_array` 宽度），实测甜点随段数在 8–24 之间 |
+| 每批槽位上限 | 32（`binding_array` 宽度）；再大不会更快，只多占显存 |
 | 批量路径的单段长度 | `prompt + max_new ≤ 4096`（受每槽 KV 显存限制）；超出的段自动退回逐段路径，不会失败 |
 | 显存 | 约 `模型 4.8 GiB + 0.2 GiB × N`（60 s 段的典型值） |
 

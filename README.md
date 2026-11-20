@@ -83,8 +83,19 @@ at silence midpoints, 3 min per segment at most), `transcribe_batch` takes the l
 returns the transcripts **in the same order**:
 
 ```bash
-transcribe_batch --model ./Qwen3-ASR-1.7B-hf --batch 16                  --wav segs/part000.wav segs/part001.wav ... --out texts.txt
+transcribe_batch --model ./Qwen3-ASR-1.7B-hf --batch 16 \
+                 --wav segs/part000.wav segs/part001.wav ... --out texts.txt
 ```
+
+| Flag | Meaning |
+|------|---------|
+| `--wav <file...>` | the audio list; its order is the output order |
+| `--batch <n>` | segments decoded at once, default `1` (the per-segment path) |
+| `--max-new <n>` | generation cap per segment, default 256 |
+| `--compare` | also run `--batch 1` and diff segment by segment, non-zero exit on any difference |
+| `--timings` | print the `mel / encoder / prefill / decode` breakdown |
+| `--out <file>` | write one transcript per line, in input order |
+| `--model` / `--device` | as in `transcribe` |
 
 `--batch N` decodes N segments at once: the default `1` is the per-segment path, and
 `N>1` reads each weight once per step for all N slots. VRAM grows linearly with N (one
@@ -98,7 +109,7 @@ non-zero on any difference.
 
 | Limit | Value |
 |---|---|
-| Slots per batch | 32 (`binding_array` width); the sweet spot was 8–24 depending on the segment count |
+| Slots per batch | 32 (`binding_array` width); more is not faster, it only costs VRAM |
 | Segment length on the batched path | `prompt + max_new <= 4096` (KV memory); longer segments fall back to the per-segment path instead of failing |
 | VRAM | roughly `4.8 GiB model + 0.2 GiB × N` for 60 s segments |
 
