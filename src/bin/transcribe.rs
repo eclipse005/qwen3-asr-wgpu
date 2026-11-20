@@ -207,16 +207,13 @@ fn run_list(
         // segment by segment, or a "faster" run changed a transcript.
         let (one, _) = asr.transcribe_specs_timed(specs, opts, 1)?;
         let mut bad = 0usize;
-        let mut chars = (0usize, 0usize);
         for (a, b) in one.iter().zip(rs.iter()) {
-            chars.0 += a.text.chars().count();
             if a.text != b.text {
                 bad += 1;
                 println!("  DIFF {}", a.text.chars().take(40).collect::<String>());
                 println!("   vs {}", b.text.chars().take(40).collect::<String>());
             }
         }
-        let _ = chars;
         println!(
             "vs b=1: {bad} of {} segments differ{}",
             rs.len(),
@@ -264,17 +261,16 @@ pub fn run(args: Vec<String>) -> Result<()> {
         manifest.is_some() || !wavs.is_empty(),
         "--wav <file...> or --manifest <jsonl> is required"
     );
+    anyhow::ensure!(
+        !(manifest.is_some() && !wavs.is_empty()),
+        "give either --manifest or --wav, not both"
+    );
     let list_mode = manifest.is_some() || wavs.len() > 1;
     let wav = wavs
         .first()
         .cloned()
         .or_else(|| std::env::var("QASR_WAV").ok().filter(|s| !s.is_empty()).map(PathBuf::from))
         .unwrap_or_default();
-    if !list_mode {
-        let diag = ["--stream", "--session", "--tokens", "--mel", "--embeds", "--diag-enc",
-                    "--baseline", "--compare-enc"];
-        let _ = diag;
-    }
     // `--cpu-dec` is the whole host path. Otherwise `auto` may fall back,
     // `gpu` must open a GPU, and a runtime or name is that adapter or an error.
     let spec = if flag(&args, "--cpu-dec") {
@@ -337,13 +333,24 @@ pub fn run(args: Vec<String>) -> Result<()> {
                 })
                 .collect(),
         };
+        // The list's shared defaults: the per-item specs already carry the
+        // resolved language/context, so only the knobs that stay global (here:
+        // nothing yet, but the options are what `--compare` reruns with) ride on
+        // this struct.
         let mut opts = TranscribeOptions::default().with_max_new_tokens(max_new);
-        opts = opts
-            .with_language(default_lang.as_deref().unwrap_or(""))
-            .with_context(&default_ctx);
+        if let Some(l) = default_lang.as_deref() {
+            opts = opts.with_language(l);
+        }
+        opts = opts.with_context(&default_ctx);
         return run_list(
             &asr, &opts, &specs, batch.max(1), want_compare, want_timings,
             out_path.as_deref(), jsonl,
+        );
+    }
+    if batch > 1 || want_compare {
+        eprintln!(
+            "{}",
+            "note: --batch/--compare need a list (two or more --wav, or --manifest); running the single-file path"
         );
     }
     let mut opts = TranscribeOptions::default().with_max_new_tokens(max_new);
@@ -460,6 +467,10 @@ pub fn run(args: Vec<String>) -> Result<()> {
         None => println!("elapsed={elapsed:.3}s lang={} stop={stop}", r.language),
     }
     println!("{}", r.text);
+    if let Some(p) = &out_path {
+        std::fs::write(p, format!("{}{NL}", r.text))
+            .map_err(|e| anyhow::anyhow!("{}: {e}", p.display()))?;
+    }
 
     if let Some(base) = arg(&args, "--baseline") {
         let raw = std::fs::read_to_string(&base)?.replace("\r\n", "\n");
