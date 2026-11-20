@@ -76,6 +76,32 @@ transcribe --model ./Qwen3-ASR-0.6B-hf --wav ./audio.wav
 | `--device <name>` | `auto`（默认：先独显再集显，都打不开才用 CPU）、`cpu`、`gpu`（先独显再集显，没有或打不开就报错），或 `vulkan[:i]` / `dx12` / 适配器名子串 |
 | `--list-devices` | 列出本机可用设备 |
 
+### 批量转写（多段并发解码）
+
+上游已经用 VAD 分好段（比如 FireRedVAD：60 s 目标块、在静音中点切、单段上限 3 分钟）时，
+用 `transcribe_batch` 一次喂一个列表，返回**同序**的文本：
+
+```bash
+transcribe_batch --model ./Qwen3-ASR-1.7B-hf --batch 16                  --wav segs/part000.wav segs/part001.wav ... --out texts.txt
+```
+
+`--batch N` 指同时解码几段：默认 1 走逐段路径；`N>1` 时每一步的权重只读一次、喂给 N 段，
+显存随 N 线性增长（每段一份 KV），按自己显卡显存选即可。
+
+**输出与 `--batch 1` 逐字节相同** —— 不是近似，是构造上保证：每个 slot 读的是它自己那块
+buffer（`binding_array` 按 `wgpu.z` 索引），batch 只改变"一次 dispatch 覆盖几段"，不改变
+任何一段的累加顺序。加 `--compare` 会自己再跑一遍 `--batch 1` 并逐段 diff，任何一段不同
+即非零退出。
+
+| 限制 | 值 |
+|---|---|
+| 每批槽位上限 | 32（`binding_array` 宽度），实测甜点随段数在 8–24 之间 |
+| 批量路径的单段长度 | `prompt + max_new ≤ 4096`（受每槽 KV 显存限制）；超出的段自动退回逐段路径，不会失败 |
+| 显存 | 约 `模型 4.8 GiB + 0.2 GiB × N`（60 s 段的典型值） |
+
+库里的等价入口是 `AsrInference::transcribe_wavs_batch(wavs, opts, batch)`（以及带阶段
+计时的 `transcribe_wavs_batch_timed`）。
+
 ### 作为库使用
 
 ```rust

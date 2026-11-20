@@ -76,6 +76,35 @@ The run prints the device in use (GPU or CPU), timings and the recognized langua
 | `--device <name>` | `auto` (default: discrete GPU, then integrated, else CPU), `cpu`, `gpu` (discrete then integrated, error if none opens), or `vulkan[:i]` / `dx12` / a name substring |
 | `--list-devices` | List the devices usable on this machine |
 
+### Batch transcription
+
+When the audio is already segmented upstream (e.g. FireRedVAD: 60 s target blocks cut
+at silence midpoints, 3 min per segment at most), `transcribe_batch` takes the list and
+returns the transcripts **in the same order**:
+
+```bash
+transcribe_batch --model ./Qwen3-ASR-1.7B-hf --batch 16                  --wav segs/part000.wav segs/part001.wav ... --out texts.txt
+```
+
+`--batch N` decodes N segments at once: the default `1` is the per-segment path, and
+`N>1` reads each weight once per step for all N slots. VRAM grows linearly with N (one
+KV cache per slot), so pick it against your card.
+
+**The output is byte-identical to `--batch 1`** — by construction, not by luck: every
+slot reads its own buffers (`binding_array` indexed by `wgpu.z`), so batching changes
+only how many segments one dispatch covers, never the order a segment accumulates in.
+`--compare` re-runs the list at `--batch 1` and diffs it segment by segment, exiting
+non-zero on any difference.
+
+| Limit | Value |
+|---|---|
+| Slots per batch | 32 (`binding_array` width); the sweet spot was 8–24 depending on the segment count |
+| Segment length on the batched path | `prompt + max_new <= 4096` (KV memory); longer segments fall back to the per-segment path instead of failing |
+| VRAM | roughly `4.8 GiB model + 0.2 GiB × N` for 60 s segments |
+
+The library entry point is `AsrInference::transcribe_wavs_batch(wavs, opts, batch)`
+(plus `transcribe_wavs_batch_timed` for a per-phase breakdown).
+
 ### Library
 
 ```rust
