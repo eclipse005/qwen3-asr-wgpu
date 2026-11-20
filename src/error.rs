@@ -13,6 +13,12 @@ pub enum AsrError {
 
     #[error("Invalid options: {0}")]
     InvalidOptions(String),
+
+    /// `BatchEvents::should_stop` asked for the remaining items to be abandoned.
+    /// Only the items that had not finished get this; the ones already delivered
+    /// keep their transcript.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 /// [`AsrError`]-typed result — the return of every public entry point.

@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use qwen3_asr_wgpu::{
-    diagnostics, AsrInference, AudioSpec, Backend, DeviceSelector, EncoderBackend,
+    diagnostics, AsrInference, AudioSpec, Backend, DeviceSelector, EncoderBackend, ItemOutcome,
     TranscribeOptions,
 };
 
@@ -137,6 +137,10 @@ fn load_manifest(
 }
 
 /// The list half: one call, one transcript per item, in input order.
+///
+/// An item that fails is printed to stderr and left out of `--out`; the items
+/// that succeeded are still written.  The exit code is the count-independent
+/// "something failed" signal, so a script can tell the difference.
 fn run_list(
     asr: &AsrInference,
     opts: &TranscribeOptions,
@@ -149,12 +153,12 @@ fn run_list(
 ) -> Result<()> {
     let mut audio = 0.0f64;
     for sp in specs {
-        let rd = hound::WavReader::open(&sp.audio)
-            .map_err(|e| anyhow::anyhow!("{}: {e}", sp.audio.display()))?;
-        audio += rd.duration() as f64 / rd.spec().sample_rate as f64;
+        if let Ok(rd) = hound::WavReader::open(&sp.audio) {
+            audio += rd.duration() as f64 / rd.spec().sample_rate as f64;
+        }
     }
     let t = Instant::now();
-    let (rs, ph) = asr.transcribe_specs_timed(specs, opts, batch)?;
+    let (items, ph) = asr.transcribe_specs_timed(specs, opts, batch);
     let secs = t.elapsed().as_secs_f64();
     if timings {
         println!(
@@ -165,38 +169,61 @@ fn run_list(
             ph.decode.as_secs_f64()
         );
     }
+    let ok: Vec<&ItemOutcome> = items.iter().filter(|i| i.result.is_ok()).collect();
+    let bad: Vec<&ItemOutcome> = items.iter().filter(|i| i.result.is_err()).collect();
     println!(
-        "batch={batch} files={} audio={audio:.1}s elapsed={secs:.2}s RTFx={:.2}",
+        "batch={batch} files={} ok={} failed={} audio={audio:.1}s elapsed={secs:.2}s RTFx={:.2}",
         specs.len(),
+        ok.len(),
+        bad.len(),
         audio / secs
     );
+    for item in &bad {
+        let e = item.result.as_ref().err().expect("filtered to errors");
+        eprintln!("failed  {}: {e}", item.audio.display());
+    }
     if !jsonl {
-        for (sp, r) in specs.iter().zip(rs.iter()) {
-            let name = sp.audio.display().to_string();
-            println!("  {name} : {}", r.text.chars().take(40).collect::<String>());
+        for item in &ok {
+            let text = item.result.as_ref().expect("filtered to ok");
+            println!(
+                "  {} : {}",
+                item.audio.display(),
+                text.text.chars().take(40).collect::<String>()
+            );
         }
     }
     if let Some(p) = out_path {
         let body = if jsonl {
             let mut v = String::new();
-            for (sp, r) in specs.iter().zip(rs.iter()) {
-                let stop = match r.stop_reason {
-                    qwen3_asr_wgpu::StopReason::Eos => "eos",
-                    qwen3_asr_wgpu::StopReason::MaxTokens => "max-tokens",
+            for item in &items {
+                let value = match &item.result {
+                    Ok(r) => {
+                        let stop = match r.stop_reason {
+                            qwen3_asr_wgpu::StopReason::Eos => "eos",
+                            qwen3_asr_wgpu::StopReason::MaxTokens => "max-tokens",
+                        };
+                        serde_json::json!({
+                            "audio": item.audio.display().to_string(),
+                            "language": r.language,
+                            "stop": stop,
+                            "text": r.text,
+                        })
+                    }
+                    Err(e) => serde_json::json!({
+                        "audio": item.audio.display().to_string(),
+                        "error": e.to_string(),
+                    }),
                 };
-                v.push_str(&serde_json::json!({
-                    "audio": sp.audio.display().to_string(),
-                    "language": r.language,
-                    "stop": stop,
-                    "text": r.text,
-                })
-                .to_string());
+                v.push_str(&value.to_string());
                 v.push(NL);
             }
             v
         } else {
-            let mut v: String =
-                rs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join(&NL.to_string());
+            let mut v: String = ok
+                .iter()
+                .map(|i| i.result.as_ref().expect("filtered to ok").text.as_str())
+                .collect::<Vec<_>>()
+                .join(&NL.to_string());
             v.push(NL);
             v
         };
@@ -204,24 +231,34 @@ fn run_list(
     }
     if compare {
         // The batched path's own gate: the same list at `--batch 1` has to match
-        // segment by segment, or a "faster" run changed a transcript.
-        let (one, _) = asr.transcribe_specs_timed(specs, opts, 1)?;
-        let mut bad = 0usize;
-        for (a, b) in one.iter().zip(rs.iter()) {
+        // segment by segment, or a "faster" run changed a transcript.  Items that
+        // failed on either side are not comparable and are counted separately.
+        let (one, _) = asr.transcribe_specs_timed(specs, opts, 1);
+        let mut bad_diff = 0usize;
+        let mut compared = 0usize;
+        for (a, b) in one.iter().zip(items.iter()) {
+            let (Ok(a), Ok(b)) = (&a.result, &b.result) else { continue };
+            compared += 1;
             if a.text != b.text {
-                bad += 1;
+                bad_diff += 1;
                 println!("  DIFF {}", a.text.chars().take(40).collect::<String>());
                 println!("   vs {}", b.text.chars().take(40).collect::<String>());
             }
         }
         println!(
-            "vs b=1: {bad} of {} segments differ{}",
-            rs.len(),
-            if bad == 0 { ", transcripts identical" } else { "" }
+            "vs b=1: {bad_diff} of {compared} comparable segments differ{}",
+            if bad_diff == 0 { ", transcripts identical" } else { "" }
         );
-        if bad > 0 {
+        if bad_diff > 0 {
             std::process::exit(1);
         }
+    }
+    if !bad.is_empty() {
+        return Err(anyhow::anyhow!(
+            "{} of {} items failed",
+            bad.len(),
+            items.len()
+        ));
     }
     Ok(())
 }

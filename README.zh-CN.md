@@ -124,17 +124,26 @@ transcribe --model ./Qwen3-ASR-1.7B-hf --manifest items.jsonl --batch 16 \
 （`binding_array` 按 `wgpu.z` 索引），batch 只改变"一次 dispatch 覆盖几段"，不改变任何一段的
 累加顺序。`--compare` 就是这条保证的自检。
 
+**一条坏掉只赔一条。** 文件解不开、`language` 不支持、prompt 拼不出来、解码报错，都只记在那一条上；
+列表里其余段照常跑，`--out` 照常写出成功的那几条（按输入顺序，失败的不写），失败逐条打到 stderr，
+进程退出码非零。如果真的失败在槽位本身（开不出这么多槽、设备丢了），会先把宽度减半、再退到
+逐段重跑，跑不出来的那条才记错——所以 `--batch 32` 在不支持 32 槽的卡上是降级，不是整批报废。
+
 | 限制 | 值 |
 |---|---|
 | 每批槽位上限 | 32（`binding_array` 宽度）；再大不会更快，只多占显存 |
-| 批量路径的单段长度 | `prompt + max_new ≤ 4096`（每槽 KV 显存）；超出的段自动退回逐段路径，不会失败 |
-| 显存 | 约 `模型 4.8 GiB + 0.2 GiB × N`（60 s 段的典型值） |
+| 批量路径的单段长度 | `prompt + max_new ≤ 4096`（每槽 KV 显存）；超出的段自动退回逐段路径，不会失败。`--max-new 2048` 时相当于单段约 163 s |
+| 显存 | 约 `模型 + 0.5 GiB × N`（60 s 段、`--max-new 2048` 的典型值；每槽 KV 由 `prompt + max_new` 决定，想省显存就调小 `--max-new`） |
 
 `--stream` / `--session` / `--mel` / `--embeds` 等诊断模式只对单文件有意义，给列表会直接报错。
 旧的 `transcribe_batch` 仍可用，会打一行弃用提示然后转发到同一份实现。
 
 库里的入口是 `AsrInference::transcribe_wavs_batch(wavs, opts, batch)`；
 需要逐项参数时用 `transcribe_specs(&[AudioSpec], opts, batch)`（两者都有 `_timed` 变体）。
+两者都返回 `Vec<ItemOutcome>`：每条一个、顺序同输入、各带自己的 `Result`——一条失败不会遮住其它条。
+要进度与取消用 `transcribe_specs_with(specs, opts, batch, &mut events)`：
+`BatchEvents::on_item` 在每条定稿时回调（管线可以按段落盘，不用等整批返回），
+`BatchEvents::should_stop` 返回 `true` 就放弃没跑完的，它们以 `AsrError::Cancelled` 回来。
 
 ### 作为库使用
 

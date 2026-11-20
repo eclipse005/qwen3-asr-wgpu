@@ -126,19 +126,32 @@ buffers (`binding_array` indexed by `wgpu.z`), so batching changes only how many
 dispatch covers, never the order a segment accumulates in. `--compare` is that guarantee's
 self-check.
 
+**One bad item costs one item.** A file that will not decode, an unsupported `language`, a
+prompt that cannot be built and a decode that errors are all recorded against that entry; the
+rest of the list still runs, `--out` still gets what succeeded (in input order, failures left
+out), and the failures are printed to stderr with the process exiting non-zero. A failure that
+belongs to the slots themselves (no VRAM for them, a lost device) is retried at half the width,
+then one segment at a time, before it is charged to the items it blocks — so `--batch 32` on a
+card that cannot hold 32 slots degrades instead of failing the run.
+
 | Limit | Value |
 |---|---|
 | Slots per batch | 32 (`binding_array` width); more is not faster, it only costs VRAM |
-| Segment length on the batched path | `prompt + max_new <= 4096` (KV memory); longer segments fall back to the per-segment path instead of failing |
-| VRAM | roughly `4.8 GiB model + 0.2 GiB × N` for 60 s segments |
+| Segment length on the batched path | `prompt + max_new <= 4096` (KV memory); longer segments fall back to the per-segment path instead of failing. At `--max-new 2048` that is about 163 s of audio per segment |
+| VRAM | roughly `model + 0.5 GiB × N` for 60 s segments at `--max-new 2048` (the per-slot KV is sized by `prompt + max_new`, so a smaller `--max-new` is the knob that shrinks it) |
 
 Diagnostic modes (`--stream`, `--session`, `--mel`, `--embeds`, ...) need a single file and say
 so when given a list. The old `transcribe_batch` still runs: it prints one deprecation line and
 forwards to the same implementation.
 
-Library entry points: `AsrInference::transcribe_wavs_batch(wavs, opts, batch)`, and
+Library entry points: `AsrInference::transcribe_wavs_batch(wavs, opts, batch)` and
 `transcribe_specs(&[AudioSpec], opts, batch)` when items need their own settings (both have
-`_timed` variants).
+`_timed` variants). All of them return one `ItemOutcome` per input, in input order, each with
+its own `Result` — a failed item never hides the others. For progress and cancellation, use
+`transcribe_specs_with(specs, opts, batch, &mut events)`: `BatchEvents::on_item` fires as each
+transcript becomes final (so a pipeline can commit per segment instead of per call), and
+`BatchEvents::should_stop` abandons what has not finished, which comes back as
+`AsrError::Cancelled`.
 
 ### Library
 

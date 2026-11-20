@@ -441,27 +441,34 @@ impl AsrInference {
         self.lock().map(|g| g.gpu_encoder_active()).unwrap_or(false)
     }
 
-    /// Transcribe a wav file (any sample rate; it is resampled to 16 kHz).
+    /// Transcribe a list of wavs, `batch` of them decoding at a time.
     ///
-    /// Returns the parsed transcript plus the language — either the one the
-    /// model named in its output, or, when the caller forced one, the caller's
-    /// (see [`TranscribeOptions::language`]).
-    /// Transcribe `wavs` with `batch` sequences decoding at a time.
+    /// One entry per input, in input order.  An item's own failure -- a file that
+    /// will not decode, an unsupported `language`, a prompt that cannot be built,
+    /// a decode that errors, a cancellation -- is recorded in that item's entry
+    /// and the rest still run.  Only a batch-wide failure (no VRAM for the slots,
+    /// a lost device) costs more: it is retried at half the width, then one
+    /// segment at a time, and whatever still cannot run comes back as that item's
+    /// error.
     ///
     /// `batch = 1` is the shipped single-sequence path.  `batch > 1` decodes
     /// several segments together: the projections read their weights once for the
     /// whole batch, which is where the throughput comes from.  The transcripts are
     /// identical to calling [`Self::transcribe`] on each file -- the batch only
-    /// changes when a dispatch reaches the GPU, never what it computes.
+    /// changes when a dispatch reaches the GPU, never what it computes.  So the
+    /// width is a throughput/VRAM knob, not a grouping directive: pass the whole
+    /// list and let a freed slot take the next pending segment.
     ///
-    /// Requires the GPU text decoder and `seq + max_new <= 1024` per segment
-    /// (the single-block attention path).
+    /// `batch > 1` needs the GPU text decoder; a CPU decoder decodes the list one
+    /// segment at a time.  A segment longer than the batched path's KV ceiling
+    /// (`prompt + max_new > 4096`) is decoded by the per-segment path rather than
+    /// failing.
     pub fn transcribe_wavs_batch(
         &self,
         wavs: &[std::path::PathBuf],
         opts: &TranscribeOptions,
         batch: usize,
-    ) -> crate::Result<Vec<TranscribeResult>> {
+    ) -> Vec<ItemOutcome> {
         let specs: Vec<AudioSpec> = wavs
             .iter()
             .map(|w| AudioSpec::from_options(w.clone(), opts))
@@ -471,25 +478,47 @@ impl AsrInference {
 
     /// [`Self::transcribe_wavs_batch`] with per-item options: each item's
     /// `language`, `context` and `max_new_tokens` win over `opts`, which supplies
-    /// everything a call shares (streaming knobs, decoder choice).
+    /// everything a call shares (streaming knobs, decoder choice) and the
+    /// fallback for a field an item leaves empty.
     pub fn transcribe_specs(
         &self,
         specs: &[AudioSpec],
         opts: &TranscribeOptions,
         batch: usize,
-    ) -> crate::Result<Vec<TranscribeResult>> {
-        let mut g = self.lock()?;
-        g.transcribe_specs_inner(specs, opts, batch, &mut BatchTimings::default())
-            .map_err(crate::AsrError::Inference)
+    ) -> Vec<ItemOutcome> {
+        self.transcribe_specs_with(specs, opts, batch, &mut ())
     }
 
-    /// [`Self::transcribe_wavs_batch_inner`] with a phase breakdown.
+    /// [`Self::transcribe_specs`] with per-item progress and cancellation.
+    ///
+    /// [`BatchEvents::on_item`] fires exactly once per input, as each transcript
+    /// becomes final (completion order, not input order); failures are reported
+    /// the same way, so a caller can stream results and commit them one by one
+    /// instead of waiting for the whole list.  [`BatchEvents::should_stop`] is
+    /// polled between decode steps: `true` abandons what has not finished, and
+    /// those items come back as [`crate::AsrError::Cancelled`].
+    ///
+    /// `events` runs under the instance lock, on the decode thread: push to a
+    /// queue rather than blocking, and do not call back into this instance.
+    pub fn transcribe_specs_with(
+        &self,
+        specs: &[AudioSpec],
+        opts: &TranscribeOptions,
+        batch: usize,
+        events: &mut dyn BatchEvents,
+    ) -> Vec<ItemOutcome> {
+        let mut t = BatchTimings::default();
+        let (items, _) = self.transcribe_specs_timed_with(specs, opts, batch, &mut t, events);
+        items
+    }
+
+    /// [`Self::transcribe_wavs_batch`] with a phase breakdown.
     pub fn transcribe_wavs_batch_timed(
         &self,
         wavs: &[std::path::PathBuf],
         opts: &TranscribeOptions,
         batch: usize,
-    ) -> crate::Result<(Vec<TranscribeResult>, BatchTimings)> {
+    ) -> (Vec<ItemOutcome>, BatchTimings) {
         let specs: Vec<AudioSpec> = wavs
             .iter()
             .map(|w| AudioSpec::from_options(w.clone(), opts))
@@ -503,15 +532,32 @@ impl AsrInference {
         specs: &[AudioSpec],
         opts: &TranscribeOptions,
         batch: usize,
-    ) -> crate::Result<(Vec<TranscribeResult>, BatchTimings)> {
+    ) -> (Vec<ItemOutcome>, BatchTimings) {
         let mut t = BatchTimings::default();
-        let mut g = self.lock()?;
-        let out = g
-            .transcribe_specs_inner(specs, opts, batch, &mut t)
-            .map_err(crate::AsrError::Inference)?;
-        Ok((out, t))
+        self.transcribe_specs_timed_with(specs, opts, batch, &mut t, &mut ())
     }
 
+    /// [`Self::transcribe_specs_with`] with a phase breakdown.
+    pub fn transcribe_specs_timed_with(
+        &self,
+        specs: &[AudioSpec],
+        opts: &TranscribeOptions,
+        batch: usize,
+        t: &mut BatchTimings,
+        events: &mut dyn BatchEvents,
+    ) -> (Vec<ItemOutcome>, BatchTimings) {
+        let items = match self.lock() {
+            Ok(mut g) => g.transcribe_specs_inner(specs, opts, batch, t, events),
+            Err(e) => all_failed(specs, format!("{e:#}")),
+        };
+        (items, *t)
+    }
+
+    /// Transcribe a wav file (any sample rate; it is resampled to 16 kHz).
+    ///
+    /// Returns the parsed transcript plus the language — either the one the
+    /// model named in its output, or, when the caller forced one, the caller's
+    /// (see [`TranscribeOptions::language`]).
     pub fn transcribe(
         &self,
         audio_path: &str,
@@ -757,18 +803,135 @@ pub struct BatchTimings {
 }
 
 
-/// `opts` with one item's manifest fields applied, for the shipped
-/// single-sequence path (which reads all three out of the options struct).
-fn item_opts(
-    opts: &TranscribeOptions,
-    i: usize,
-    langs: &[Option<String>],
-    specs: &[AudioSpec],
-) -> TranscribeOptions {
+/// One item's result from a list run.
+///
+/// The `result` belongs to this item alone: a failure here never means the other
+/// items of the same call failed.  `index` is the position in the `specs` the
+/// call was made with, so a caller can line the outcomes up with its own list
+/// without relying on completion order.
+#[derive(Debug)]
+pub struct ItemOutcome {
+    pub index: usize,
+    pub audio: std::path::PathBuf,
+    pub result: crate::Result<TranscribeResult>,
+}
+
+/// Per-item progress and cancellation for a list run.
+///
+/// Both methods have defaults, so implementing only the one you need is enough.
+/// See [`AsrInference::transcribe_specs_with`] for the threading contract.
+pub trait BatchEvents {
+    /// One item's transcript is final, `Ok` or the error that belongs to that
+    /// item.  Called exactly once per input, in completion order (the longest
+    /// prompt is admitted first, so this is not input order).
+    fn on_item(&mut self, index: usize, result: &crate::Result<TranscribeResult>) {
+        let _ = (index, result);
+    }
+
+    /// Polled between decode steps.  `true` abandons the items that have not
+    /// finished; they come back as [`crate::AsrError::Cancelled`].
+    fn should_stop(&mut self) -> bool {
+        false
+    }
+}
+
+impl BatchEvents for () {}
+
+/// One item that made it past mel, encoder and prompt building: its index in
+/// the input, its audio, its encoder output and its resolved options.
+struct Work {
+    orig: usize,
+    embeds: Vec<f32>,
+    lang: Option<String>,
+}
+
+/// Rows of the decode stage, dense over the items that are still runnable.
+struct RunCtx<'a> {
+    plans: &'a [(usize, Vec<u8>)],
+    orig: &'a [usize],
+    max_news: &'a [usize],
+    options: &'a [TranscribeOptions],
+}
+
+/// How one slot batch ended.
+enum Attempt {
+    All,
+    /// A batch-wide failure (VRAM, device); the caller retries narrower.
+    Failed(anyhow::Error),
+    /// `BatchEvents::should_stop` said so.
+    Stopped,
+}
+
+/// Filled one entry per input, emitting each item as soon as it is final.
+struct Outcomes {
+    audios: Vec<std::path::PathBuf>,
+    results: Vec<Option<crate::Result<TranscribeResult>>>,
+    emitted: Vec<bool>,
+}
+
+impl Outcomes {
+    fn new(specs: &[AudioSpec]) -> Self {
+        Self {
+            audios: specs.iter().map(|s| s.audio.clone()).collect(),
+            results: (0..specs.len()).map(|_| None).collect(),
+            emitted: vec![false; specs.len()],
+        }
+    }
+
+    fn done(&mut self, index: usize, r: crate::Result<TranscribeResult>, ev: &mut dyn BatchEvents) {
+        if self.emitted[index] {
+            return;
+        }
+        self.emitted[index] = true;
+        ev.on_item(index, &r);
+        self.results[index] = Some(r);
+    }
+
+    fn is_done(&self, index: usize) -> bool {
+        self.emitted[index]
+    }
+
+    fn finish(mut self, ev: &mut dyn BatchEvents) -> Vec<ItemOutcome> {
+        for i in 0..self.results.len() {
+            if !self.emitted[i] {
+                self.done(i, Err(not_decoded()), ev);
+            }
+        }
+        self.results
+            .into_iter()
+            .zip(self.audios)
+            .enumerate()
+            .map(|(index, (result, audio))| ItemOutcome {
+                index,
+                audio,
+                result: result.unwrap_or_else(|| Err(not_decoded())),
+            })
+            .collect()
+    }
+}
+
+fn not_decoded() -> crate::AsrError {
+    crate::AsrError::Inference(anyhow::anyhow!("item was not decoded"))
+}
+
+fn all_failed(specs: &[AudioSpec], msg: String) -> Vec<ItemOutcome> {
+    (0..specs.len())
+        .map(|index| ItemOutcome {
+            index,
+            audio: specs[index].audio.clone(),
+            result: Err(crate::AsrError::Inference(anyhow::anyhow!("{msg}"))),
+        })
+        .collect()
+}
+
+/// `opts` with one item's own fields applied, for the shipped single-sequence
+/// path (which reads all three out of the options struct).  An empty field falls
+/// back to the call's, so a spec only has to fill in what it overrides.
+fn item_options(opts: &TranscribeOptions, spec: &AudioSpec, lang: Option<String>) -> TranscribeOptions {
     let mut o = opts.clone();
-    o.max_new_tokens = specs[i].max_new_tokens;
-    o.language = langs[i].clone();
-    o.context = specs[i].context.clone();
+    o.max_new_tokens = spec.max_new_tokens;
+    o.language = lang;
+    o.context = if spec.context.is_empty() { opts.context.clone() } else { spec.context.clone() };
     o
 }
 
@@ -1523,15 +1686,22 @@ impl Inner {
     /// tokens can share one pass ([`crate::audio_encoder_gpu::GpuAudioEncoder::encode_batch`]).
     /// Groups are bounded by `MAX_TOKENS` and by a slot-sized count: the pass'
     /// scratch grows with the token count, not with the group size.
+    /// `Ok(None)` means `events.should_stop` asked to stop before the list was
+    /// encoded; the caller charges the items it could not reach.
     pub(crate) fn run_encoder_batch(
         &mut self,
         mels: &[(Vec<f32>, usize, usize)],
-    ) -> Result<Vec<Vec<f32>>> {
+        events: &mut dyn BatchEvents,
+    ) -> Result<Option<Vec<Vec<f32>>>> {
         if !matches!(self.decoder, TextBackend::Gpu(_)) || self.gpu_encoder.is_none() {
-            return mels
-                .iter()
-                .map(|(mel, nm, nf)| self.cpu_tower()?.forward(mel, *nm, *nf))
-                .collect();
+            let mut out = Vec::with_capacity(mels.len());
+            for (mel, nm, nf) in mels {
+                if events.should_stop() {
+                    return Ok(None);
+                }
+                out.push(self.cpu_tower()?.forward(mel, *nm, *nf)?);
+            }
+            return Ok(Some(out));
         }
         // The encoder's own ceiling is 16384 tokens of scratch; stop short of it
         // so a group never fails the encoder's own check.
@@ -1539,6 +1709,9 @@ impl Inner {
         let mut out = Vec::with_capacity(mels.len());
         let mut i = 0usize;
         while i < mels.len() {
+            if events.should_stop() {
+                return Ok(None);
+            }
             // Grow the group until the token budget or the utterance count says
             // stop; `encode_batch` lays the group out and runs one pass.
             let mut j = i;
@@ -1564,7 +1737,7 @@ impl Inner {
             }
             i = j;
         }
-        Ok(out)
+        Ok(Some(out))
     }
 
     pub fn transcribe_from_embeds(
@@ -1683,101 +1856,173 @@ impl Inner {
     /// and every projection reads its weight once for all of them.  The token
     /// streams are the ones the b=1 path produces -- the batch only changes when
     /// a dispatch reaches the GPU (see [`crate::decoder::BatchProjections`]).
+    ///
+    /// Every stage above the slots fails per item, so one unreadable file, one
+    /// unsupported language or one bad prompt costs only its own entry; a failure
+    /// that belongs to the slots themselves (no VRAM for them, a lost device) is
+    /// retried narrower before it is charged to the items it blocks.
     pub(crate) fn transcribe_specs_inner(
         &mut self,
         specs: &[AudioSpec],
         opts: &TranscribeOptions,
         batch: usize,
         t: &mut BatchTimings,
-    ) -> Result<Vec<TranscribeResult>> {
+        ev: &mut dyn BatchEvents,
+    ) -> Vec<ItemOutcome> {
+        let mut items = Outcomes::new(specs);
+        let n = specs.len();
+
         // Every mel first, then every encoder: the encoder's transformer takes a
         // group as one pass, so it must not be called per segment.
-        let mut mels = Vec::with_capacity(specs.len());
-        for w in specs.iter().map(|sp| &sp.audio) {
+        let mut mels: Vec<Option<(Vec<f32>, usize, usize)>> = (0..n).map(|_| None).collect();
+        let mut langs: Vec<Option<String>> = vec![None; n];
+        for (i, sp) in specs.iter().enumerate() {
+            if ev.should_stop() {
+                items.done(i, Err(crate::AsrError::Cancelled), ev);
+                continue;
+            }
+            let want = sp.language.as_deref().or(opts.language.as_deref());
+            if let Some(l) = want.map(str::trim).filter(|l| !l.is_empty()) {
+                match prompt::resolve_language(l) {
+                    Ok(name) => langs[i] = Some(name),
+                    Err(e) => {
+                        items.done(i, Err(crate::AsrError::InvalidOptions(e.to_string())), ev);
+                        continue;
+                    }
+                }
+            }
             let t0 = std::time::Instant::now();
-            let samples = crate::mel::load_audio_wav(w, MEL_SAMPLE_RATE)?;
-            let (mel, n_mels, n_frames) = self.mel.extract(&samples)?;
+            let loaded: Result<(Vec<f32>, usize, usize)> =
+                crate::mel::load_audio_wav(&sp.audio, MEL_SAMPLE_RATE)
+                    .map_err(|e| anyhow::anyhow!("{e:#}"))
+                    .and_then(|samples| self.mel.extract(&samples));
             t.mel += t0.elapsed();
-            mels.push((mel, n_mels, n_frames));
+            match loaded {
+                Ok(mel) => mels[i] = Some(mel),
+                Err(e) => items.done(i, Err(crate::AsrError::Inference(e)), ev),
+            }
         }
+
+        let alive: Vec<usize> = (0..n).filter(|&i| mels[i].is_some()).collect();
+        if alive.is_empty() {
+            return items.finish(ev);
+        }
+        let alive_mels: Vec<(Vec<f32>, usize, usize)> = alive
+            .iter()
+            .map(|&i| mels[i].take().expect("alive means a mel was extracted"))
+            .collect();
+
         let t0 = std::time::Instant::now();
-        let embeds = self.run_encoder_batch(&mels)?;
+        let embeds = match self.run_encoder_batch(&alive_mels, ev) {
+            Ok(Some(e)) => e,
+            Ok(None) => {
+                for &i in &alive {
+                    items.done(i, Err(crate::AsrError::Cancelled), ev);
+                }
+                return items.finish(ev);
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                for &i in &alive {
+                    items.done(i, Err(crate::AsrError::Inference(anyhow::anyhow!("{msg}"))), ev);
+                }
+                return items.finish(ev);
+            }
+        };
         t.encoder += t0.elapsed();
-        self.decode_batch_embeds(&embeds, specs, opts, batch, t)
+
+        let work: Vec<Work> = alive
+            .into_iter()
+            .zip(embeds)
+            .map(|(orig, embeds)| Work { orig, embeds, lang: langs[orig].clone() })
+            .collect();
+        self.decode_batch_embeds(&work, specs, opts, batch, t, ev, &mut items);
+        items.finish(ev)
     }
 
-
-    /// The decode half of [`Self::transcribe_wavs_batch_inner`].
-    pub(crate) fn decode_batch_embeds(
+    /// The decode half of [`Self::transcribe_specs_inner`].
+    fn decode_batch_embeds(
         &mut self,
-        embeds: &[Vec<f32>],
+        work: &[Work],
         specs: &[AudioSpec],
         opts: &TranscribeOptions,
         batch: usize,
         t: &mut BatchTimings,
-    ) -> Result<Vec<TranscribeResult>> {
-        use crate::decoder::{BatchProjections, WgpuTextDecoder};
+        ev: &mut dyn BatchEvents,
+        items: &mut Outcomes,
+    ) {
         let hs = self.config.thinker_config.text_config.hidden_size;
-        anyhow::ensure!(embeds.len() == specs.len(), "spec/embed count mismatch");
-        // Per item: the manifest's language and context, or the call's.
-        let langs: Vec<Option<String>> = specs
-            .iter()
-            .map(|sp| match sp.language.as_deref().map(str::trim) {
-                Some(l) if !l.is_empty() => Ok(Some(prompt::resolve_language(l)?)),
-                _ => Ok(None),
-            })
-            .collect::<Result<_>>()?;
-        let max_news: Vec<usize> = specs.iter().map(|sp| sp.max_new_tokens).collect();
-        let eos = [ENDOFTEXT_TOKEN_ID as i32, IM_END_TOKEN_ID as i32];
-        let batch = batch.max(1);
-        let mut out: Vec<Option<TranscribeResult>> = (0..embeds.len()).map(|_| None).collect();
-        if embeds.is_empty() {
-            return Ok(Vec::new());
-        }
+        let Some(et) = self.tensors.get("thinker.model.embed_tokens.weight") else {
+            for w in work {
+                items.done(
+                    w.orig,
+                    Err(crate::AsrError::Inference(anyhow::anyhow!("missing embed table"))),
+                    ev,
+                );
+            }
+            return;
+        };
 
-        // Prompt + hidden rows for every segment, once: admission below only
-        // picks the next one.
-        let et = self
-            .tensors
-            .get("thinker.model.embed_tokens.weight")
-            .ok_or_else(|| anyhow::anyhow!("missing embed table"))?;
-        let mut plans: Vec<(usize, Vec<u8>)> = Vec::with_capacity(embeds.len());
-        for (i, emb) in embeds.iter().enumerate() {
-            let nat = emb.len() / hs;
-            let (input_ids, asp) = prompt::build_prompt(
+        // Prompt rows for every segment, once: admission below only picks the
+        // next one.  A segment whose prompt cannot be built fails alone.
+        let mut plans: Vec<(usize, Vec<u8>)> = Vec::with_capacity(work.len());
+        let mut run_orig: Vec<usize> = Vec::with_capacity(work.len());
+        let mut run_options: Vec<TranscribeOptions> = Vec::with_capacity(work.len());
+        for w in work {
+            let nat = w.embeds.len() / hs;
+            let built = prompt::build_prompt(
                 &self.tokenizer,
                 self.config.thinker_config.audio_start_token_id,
                 self.config.thinker_config.audio_token_id,
                 self.config.thinker_config.audio_end_token_id,
                 nat,
-                langs[i].as_deref(),
-                &specs[i].context,
+                w.lang.as_deref(),
+                &specs[w.orig].context,
                 None,
-            )?;
+            );
+            let (input_ids, asp) = match built {
+                Ok(p) => p,
+                Err(e) => {
+                    items.done(w.orig, Err(crate::AsrError::Inference(e)), ev);
+                    continue;
+                }
+            };
             let mut hidden: Vec<u8> = Vec::with_capacity(input_ids.len() * hs * 2);
-            for &id in &input_ids[..asp] {
-                et.append_f16_row_le(id as usize, hs, &mut hidden)?;
+            let row = (|hidden: &mut Vec<u8>| -> Result<()> {
+                for &id in &input_ids[..asp] {
+                    et.append_f16_row_le(id as usize, hs, hidden)?;
+                }
+                for v in &w.embeds {
+                    hidden.extend_from_slice(&f16::from_f32(*v).to_le_bytes());
+                }
+                for &id in &input_ids[asp + nat..] {
+                    et.append_f16_row_le(id as usize, hs, hidden)?;
+                }
+                anyhow::ensure!(hidden.len() == input_ids.len() * hs * 2, "hidden size");
+                Ok(())
+            })(&mut hidden);
+            match row {
+                Ok(()) => {
+                    plans.push((input_ids.len(), hidden));
+                    run_orig.push(w.orig);
+                    run_options.push(item_options(opts, &specs[w.orig], w.lang.clone()));
+                }
+                Err(e) => items.done(w.orig, Err(crate::AsrError::Inference(e)), ev),
             }
-            for v in emb {
-                hidden.extend_from_slice(&f16::from_f32(*v).to_le_bytes());
-            }
-            for &id in &input_ids[asp + nat..] {
-                et.append_f16_row_le(id as usize, hs, &mut hidden)?;
-            }
-            anyhow::ensure!(hidden.len() == input_ids.len() * hs * 2, "hidden size");
-            plans.push((input_ids.len(), hidden));
         }
+        if plans.is_empty() {
+            return;
+        }
+        let max_news: Vec<usize> = run_options.iter().map(|o| o.max_new_tokens).collect();
 
         // A batched slot's attention is the decode kernel, which is bounded by
-        // `GQA_SINGLE_CAP`; a segment whose prompt plus generation does not fit
-        // is decoded by the shipped path instead of failing the whole set.  With
-        // `max_new` at 256 that leaves ~60 s of audio per segment, which is what
-        // the VAD pipeline targets anyway.
+        // `BATCH_SEQ_CAP`; a segment whose prompt plus generation does not fit is
+        // decoded by the shipped path instead of failing the whole set, and it is
+        // charged to itself if that path fails too.
         let step = crate::decoder::KV_STEP;
         let cap_of = |i: usize| (plans[i].0 + max_news[i] + 8).div_ceil(step) * step;
-        let fits = |i: usize| cap_of(i) <= crate::decoder::BATCH_SEQ_CAP;
         let (long, batchable): (Vec<usize>, Vec<usize>) =
-            (0..plans.len()).partition(|&i| !fits(i));
+            (0..plans.len()).partition(|&i| cap_of(i) > crate::decoder::BATCH_SEQ_CAP);
         if std::env::var("QASR_BATCH_DEBUG").is_ok() {
             eprintln!(
                 "[batch] segments={} long={} batchable={} max_len_batchable={}",
@@ -1790,48 +2035,113 @@ impl Inner {
         if !long.is_empty() {
             let t0 = std::time::Instant::now();
             for &i in &long {
-                let gen = self.generate_from_embeds(&embeds[i], max_news[i], &item_opts(opts, i, &langs, &specs), None)?;
-                out[i] = Some(prompt::decode_result(&self.tokenizer, &gen.ids, gen.stop_reason)?);
+                let r = if ev.should_stop() {
+                    Err(crate::AsrError::Cancelled)
+                } else {
+                    self.decode_one(&work[run_orig[i]], &run_options[i])
+                };
+                items.done(run_orig[i], r, ev);
             }
             t.decode += t0.elapsed();
         }
 
-        // Fewer than two slots means there is nothing to share a weight read
-        // with, so the shipped single-sequence path is the right one (and the
-        // same arithmetic).
-        let nslots = batch.min(batchable.len());
-        if nslots < 2 {
+        let ctx = RunCtx {
+            plans: &plans,
+            orig: &run_orig,
+            max_news: &max_news,
+            options: &run_options,
+        };
+        let mut pending = batchable;
+        let mut width = batch.max(1);
+        while !pending.is_empty() {
             let t0 = std::time::Instant::now();
-            for &i in &batchable {
-                let gen = self.generate_from_embeds(&embeds[i], max_news[i], &item_opts(opts, i, &langs, &specs), None)?;
-                out[i] = Some(prompt::decode_result(&self.tokenizer, &gen.ids, gen.stop_reason)?);
+            // Fewer than two slots means there is nothing to share a weight read
+            // with, so the shipped single-sequence path is the right one (and the
+            // same arithmetic) -- and it charges each failure to its own item.
+            if width < 2 {
+                for &i in &pending {
+                    let r = if ev.should_stop() {
+                        Err(crate::AsrError::Cancelled)
+                    } else {
+                        self.decode_one(&work[ctx.orig[i]], &ctx.options[i])
+                    };
+                    items.done(ctx.orig[i], r, ev);
+                }
+                t.decode += t0.elapsed();
+                break;
             }
+            let ended = self.run_batch_attempt(&ctx, &pending, width, t, ev, items);
             t.decode += t0.elapsed();
-            return Ok(out.into_iter().map(|r| r.expect("every segment filled")).collect());
+            match ended {
+                Attempt::All => pending.clear(),
+                Attempt::Stopped => {
+                    for &i in &pending {
+                        items.done(ctx.orig[i], Err(crate::AsrError::Cancelled), ev);
+                    }
+                    pending.clear();
+                }
+                Attempt::Failed(e) => {
+                    // The slots could not hold this group; halving keeps the
+                    // items that already finished and re-runs only the rest.
+                    // Width 1 is the per-item path above, so this terminates.
+                    eprintln!("[batch] width {width} failed ({e:#}); retrying narrower");
+                    width = (width / 2).max(1);
+                    pending.retain(|&i| !items.is_done(ctx.orig[i]));
+                }
+            }
         }
+    }
 
-        // One capacity for every slot, rounded here rather than left to
-        // `ensure_capacity`: the batched kernels take `max_seq` from a single
-        // uniform, so a slot that rounded further would put its K rows where its
-        // neighbours do not look.
-        let cap = batchable.iter().map(|&i| cap_of(i)).max().unwrap_or(step);
-        anyhow::ensure!(
-            cap <= crate::decoder::BATCH_SEQ_CAP,
-            "batch decode needs seq + max_new <= {} (got {cap}); use shorter segments",
-            crate::decoder::BATCH_SEQ_CAP
-        );
+    /// The shipped single-sequence path for one item, failures included.
+    fn decode_one(
+        &mut self,
+        work: &Work,
+        opts: &TranscribeOptions,
+    ) -> crate::Result<TranscribeResult> {
+        let gen = self
+            .generate_from_embeds(&work.embeds, opts.max_new_tokens, opts, None)
+            .map_err(|e| crate::AsrError::Inference(anyhow::anyhow!("{e:#}")))?;
+        prompt::decode_result(&self.tokenizer, &gen.ids, gen.stop_reason)
+            .map_err(|e| crate::AsrError::Inference(anyhow::anyhow!("{e:#}")))
+    }
+
+    /// Decode `run` with `width` slots, emitting every segment as it finishes so
+    /// a failure partway still leaves the finished ones delivered.
+    fn run_batch_attempt(
+        &mut self,
+        ctx: &RunCtx<'_>,
+        run: &[usize],
+        width: usize,
+        t: &mut BatchTimings,
+        ev: &mut dyn BatchEvents,
+        items: &mut Outcomes,
+    ) -> Attempt {
+        use crate::decoder::{BatchProjections, WgpuTextDecoder};
+        let nslots = width.min(run.len());
+        let cap = run
+            .iter()
+            .map(|&i| {
+                (ctx.plans[i].0 + ctx.max_news[i] + 8).div_ceil(crate::decoder::KV_STEP)
+                    * crate::decoder::KV_STEP
+            })
+            .max()
+            .unwrap_or(crate::decoder::KV_STEP);
 
         let mut slots: Vec<WgpuTextDecoder> = {
             let base = match &self.decoder {
                 TextBackend::Gpu(d) => d,
-                TextBackend::Cpu(_) => anyhow::bail!("batch decode needs the GPU decoder"),
+                TextBackend::Cpu(_) => {
+                    return Attempt::Failed(anyhow::anyhow!("batch decode needs the GPU decoder"));
+                }
             };
-            (0..nslots)
-                .map(|_| base.fork_capped(cap))
-                .collect::<Result<_>>()?
+            match (0..nslots).map(|_| base.fork_capped(cap)).collect::<Result<Vec<_>>>() {
+                Ok(s) => s,
+                Err(e) => return Attempt::Failed(e),
+            }
         };
-        let mut gen: Vec<Vec<u32>> = vec![Vec::new(); plans.len()];
-        let mut stop: Vec<StopReason> = vec![StopReason::MaxTokens; plans.len()];
+        let eos = [ENDOFTEXT_TOKEN_ID as i32, IM_END_TOKEN_ID as i32];
+        let mut gen: Vec<Vec<u32>> = vec![Vec::new(); ctx.plans.len()];
+        let mut stop: Vec<StopReason> = vec![StopReason::MaxTokens; ctx.plans.len()];
         // Which segment each slot is decoding, if any.
         let mut active: Vec<Option<usize>> = vec![None; nslots];
         let mut frontier = 0usize;
@@ -1843,35 +2153,52 @@ impl Inner {
         // token count plus a fixed prefix, i.e. the best predictor of how long a
         // slot will stay busy.
         let order: Vec<usize> = {
-            let mut o = batchable.clone();
-            o.sort_by_key(|&i| std::cmp::Reverse(plans[i].0));
+            let mut o = run.to_vec();
+            o.sort_by_key(|&i| std::cmp::Reverse(ctx.plans[i].0));
             o
         };
         let fill = |slots: &mut [WgpuTextDecoder],
-                        active: &mut [Option<usize>],
-                        frontier: &mut usize,
-                        gen: &mut [Vec<u32>],
-                        stop: &mut [StopReason],
-                        t: &mut BatchTimings|
-         -> Result<()> {
-            fill_slots(slots, active, frontier, &plans, &order, gen, stop, &eos, t)
-        };
+                    active: &mut [Option<usize>],
+                    frontier: &mut usize,
+                    gen: &mut [Vec<u32>],
+                    stop: &mut [StopReason],
+                    t: &mut BatchTimings|
+         -> Result<()> { fill_slots(slots, active, frontier, ctx.plans, &order, gen, stop, &eos, t) };
 
         let t0 = std::time::Instant::now();
-        fill(&mut slots, &mut active, &mut frontier, &mut gen, &mut stop, t)?;
+        if let Err(e) = fill(&mut slots, &mut active, &mut frontier, &mut gen, &mut stop, t) {
+            t.decode += t0.elapsed();
+            return Attempt::Failed(e);
+        }
         if active.iter().any(Option::is_some) {
             // Built once for the whole run: the slots keep their buffers for the
             // entire job, so their bind groups stay valid across admissions.
-            let proj = BatchProjections::new(&slots)?;
+            let proj = match BatchProjections::new(&slots) {
+                Ok(p) => p,
+                Err(e) => {
+                    t.decode += t0.elapsed();
+                    return Attempt::Failed(e);
+                }
+            };
             loop {
-                let toks = proj.step(&mut slots)?;
+                if ev.should_stop() {
+                    t.decode += t0.elapsed();
+                    return Attempt::Stopped;
+                }
+                let toks = match proj.step(&mut slots) {
+                    Ok(toks) => toks,
+                    Err(e) => {
+                        t.decode += t0.elapsed();
+                        return Attempt::Failed(e);
+                    }
+                };
                 for s in 0..nslots {
                     let Some(seg) = active[s] else { continue };
                     let tok = toks[s];
                     if eos.contains(&tok) {
                         stop[seg] = StopReason::Eos;
                         active[s] = None;
-                    } else if gen[seg].len() >= max_news[seg] {
+                    } else if gen[seg].len() >= ctx.max_news[seg] {
                         stop[seg] = StopReason::MaxTokens;
                         active[s] = None;
                     } else {
@@ -1879,7 +2206,15 @@ impl Inner {
                         slots[s].set_input_token(tok);
                     }
                     if active[s].is_none() {
-                        fill(&mut slots, &mut active, &mut frontier, &mut gen, &mut stop, t)?;
+                        let r = prompt::decode_result(&self.tokenizer, &gen[seg], stop[seg])
+                            .map_err(|e| crate::AsrError::Inference(anyhow::anyhow!("{e:#}")));
+                        items.done(ctx.orig[seg], r, ev);
+                        if let Err(e) =
+                            fill(&mut slots, &mut active, &mut frontier, &mut gen, &mut stop, t)
+                        {
+                            t.decode += t0.elapsed();
+                            return Attempt::Failed(e);
+                        }
                     }
                 }
                 if active.iter().all(Option::is_none) {
@@ -1888,14 +2223,7 @@ impl Inner {
             }
         }
         t.decode += t0.elapsed();
-
-        // Only the segments that went through a slot: the ones the batched path
-        // could not hold were already decoded above, and their `gen` entry is
-        // empty -- overwriting them here would erase a correct transcript.
-        for &i in &order {
-            out[i] = Some(prompt::decode_result(&self.tokenizer, &gen[i], stop[i])?);
-        }
-        Ok(out.into_iter().map(|r| r.expect("every segment filled")).collect())
+        Attempt::All
     }
 
     pub(crate) fn generate_from_embeds(
@@ -2314,4 +2642,115 @@ fn print_embed_diff(cpu: &[f32], gpu: &[f32], mel_frames: usize) {
         "encoder compare: {n} elements, max|d| {max_abs:.5}, rms {rms:.6}, max_rel {max_rel:.4}, \
          outside 0.0625+|x|*2^-9: {over}"
     );
+}
+
+#[cfg(test)]
+mod outcomes_tests {
+    use super::*;
+
+    fn spec(audio: &str) -> AudioSpec {
+        AudioSpec {
+            audio: std::path::PathBuf::from(audio),
+            language: None,
+            context: String::new(),
+            max_new_tokens: 16,
+        }
+    }
+
+    #[derive(Default)]
+    struct Recorder {
+        seen: Vec<(usize, bool)>,
+    }
+
+    impl BatchEvents for Recorder {
+        fn on_item(&mut self, index: usize, result: &crate::Result<TranscribeResult>) {
+            self.seen.push((index, result.is_ok()));
+        }
+    }
+
+    fn ok_result() -> crate::Result<TranscribeResult> {
+        Ok(TranscribeResult {
+            text: "x".to_string(),
+            language: "English".to_string(),
+            raw_output: "x".to_string(),
+            stop_reason: StopReason::Eos,
+        })
+    }
+
+    #[test]
+    fn one_failure_does_not_drop_the_others() {
+        let specs = vec![spec("a.wav"), spec("b.wav"), spec("c.wav")];
+        let mut items = Outcomes::new(&specs);
+        let mut rec = Recorder::default();
+        items.done(0, ok_result(), &mut rec);
+        items.done(
+            1,
+            Err(crate::AsrError::InvalidOptions("unsupported language".to_string())),
+            &mut rec,
+        );
+        items.done(2, ok_result(), &mut rec);
+        let out = items.finish(&mut rec);
+
+        assert_eq!(out.len(), 3);
+        assert!(out[0].result.is_ok());
+        assert!(out[1].result.is_err(), "the bad item keeps its own error");
+        assert!(out[2].result.is_ok(), "a failure in the middle must not cost c");
+        assert_eq!(out[1].audio, std::path::PathBuf::from("b.wav"));
+        assert_eq!(rec.seen, vec![(0, true), (1, false), (2, true)]);
+    }
+
+    #[test]
+    fn an_unfinished_item_is_an_error_not_a_panic() {
+        let specs = vec![spec("a.wav"), spec("b.wav")];
+        let mut items = Outcomes::new(&specs);
+        let mut rec = Recorder::default();
+        items.done(0, ok_result(), &mut rec);
+        let out = items.finish(&mut rec);
+        assert!(out[0].result.is_ok());
+        assert!(matches!(out[1].result, Err(crate::AsrError::Inference(_))));
+        assert_eq!(rec.seen, vec![(0, true), (1, false)]);
+    }
+
+    #[test]
+    fn an_item_is_reported_once_even_if_it_finishes_twice() {
+        let specs = vec![spec("a.wav")];
+        let mut items = Outcomes::new(&specs);
+        let mut rec = Recorder::default();
+        items.done(0, ok_result(), &mut rec);
+        items.done(0, Err(crate::AsrError::Cancelled), &mut rec);
+        let out = items.finish(&mut rec);
+        assert!(out[0].result.is_ok(), "a retry must not overwrite a transcript");
+        assert_eq!(rec.seen, vec![(0, true)]);
+    }
+
+    #[test]
+    fn stopping_charges_the_remaining_items_and_keeps_the_finished_ones() {
+        let specs = vec![spec("a.wav"), spec("b.wav")];
+        let mut items = Outcomes::new(&specs);
+        let mut rec = Recorder::default();
+        items.done(0, ok_result(), &mut rec);
+        items.done(1, Err(crate::AsrError::Cancelled), &mut rec);
+        let out = items.finish(&mut rec);
+        assert!(out[0].result.is_ok());
+        assert!(matches!(out[1].result, Err(crate::AsrError::Cancelled)));
+    }
+
+    #[test]
+    fn an_item_only_has_to_fill_in_what_it_overrides() {
+        let call = TranscribeOptions::default()
+            .with_language("English")
+            .with_context("Vocabulary: Quilter")
+            .with_max_new_tokens(512);
+        let plain = spec("a.wav");
+        let mut o = item_options(&call, &plain, Some("Chinese".to_string()));
+        assert_eq!(o.context, "Vocabulary: Quilter", "empty context falls back");
+        assert_eq!(o.language.as_deref(), Some("Chinese"), "resolved language wins");
+        assert_eq!(o.max_new_tokens, 16, "the item's cap wins");
+
+        let mut own = plain.clone();
+        own.context = "own".to_string();
+        o = item_options(&call, &own, None);
+        assert_eq!(o.context, "own");
+        assert_eq!(o.language, None, "a None language is not a silent English");
+    }
 }
