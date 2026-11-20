@@ -26,7 +26,14 @@ fn main() -> Result<()> {
         arg(&args, "--model").unwrap_or_else(|| "/workspace/Qwen3-ASR-1.7B-hf".into()),
     );
     let batch: usize = arg(&args, "--batch").and_then(|v| v.parse().ok()).unwrap_or(1);
-    let max_new: usize = arg(&args, "--max-new").and_then(|v| v.parse().ok()).unwrap_or(256);
+    // Same default as `transcribe` and `TranscribeOptions::default()`: the cap
+    // must not be smaller than the shipped path's, or a batched run would
+    // truncate transcripts the single-file path keeps.  It also sizes each
+    // slot's KV (`cap = prompt + max_new + 8`), so a caller running many slots
+    // on a small card lowers it explicitly.
+    let max_new: usize = arg(&args, "--max-new")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| TranscribeOptions::default().max_new_tokens);
     let compare = args.iter().any(|a| a == "--compare");
     let timings = args.iter().any(|a| a == "--timings");
     let out_path = arg(&args, "--out").map(PathBuf::from);

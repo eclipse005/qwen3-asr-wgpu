@@ -91,7 +91,7 @@ transcribe_batch --model ./Qwen3-ASR-1.7B-hf --batch 16 \
 |------|---------|
 | `--wav <file...>` | the audio list; its order is the output order |
 | `--batch <n>` | segments decoded at once, default `1` (the per-segment path) |
-| `--max-new <n>` | **token** cap per segment (not seconds), default 256; a 60 s segment needs ~150–260, and `stop=max-tokens` in the output means it was not enough |
+| `--max-new <n>` | token cap per segment, default as in `transcribe` (2048); `stop=max-tokens` in the output means it truncated. It also sizes each slot's KV (`prompt + max_new + 8`), so lower it when running many slots on a small card |
 | `--compare` | also run `--batch 1` and diff segment by segment, non-zero exit on any difference |
 | `--timings` | print the `mel / encoder / prefill / decode` breakdown |
 | `--out <file>` | write one transcript per line, in input order |

@@ -90,7 +90,7 @@ transcribe_batch --model ./Qwen3-ASR-1.7B-hf --batch 16 \
 |------|------|
 | `--wav <file...>` | 音频列表，顺序即输出顺序 |
 | `--batch <n>` | 同时解码几段，默认 `1`（逐段路径） |
-| `--max-new <n>` | 每段生成的 **token** 上限（不是秒），默认 256；60 s 段约需 150–260，跑完看 `stop=max-tokens` 判断是否够用 |
+| `--max-new <n>` | 每段生成的 token 上限，默认与 `transcribe` 相同（2048）；跑完看 `stop=max-tokens` 判断是否截断。 它也决定每槽 KV 大小（`prompt + max_new + 8`），槽位多或显存紧时调小即可 |
 | `--compare` | 再跑一遍 `--batch 1` 并逐段 diff，有差异即非零退出 |
 | `--timings` | 打印 `mel / encoder / prefill / decode` 四段耗时 |
 | `--out <file>` | 把文本按行写入文件（与输入同序） |
