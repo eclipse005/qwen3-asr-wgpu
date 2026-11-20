@@ -25,3 +25,4 @@ exp_probe/*.bin
 
 # python bytecode from the eval drivers
 /scripts/__pycache__/
+.tmp/
