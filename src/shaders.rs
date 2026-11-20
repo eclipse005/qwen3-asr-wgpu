@@ -60,6 +60,69 @@ fn rms_norm(@builtin(workgroup_id) wgid: vec3<u32>,
     )
 }
 
+/// [`rms_norm`] over `batch` sequences in one dispatch, `wgid.z` = the slot.
+///
+/// `X` and `Out` are `[slot, ...]` rows of one allocation, so the slot is an
+/// address, not a branch: `base = wgid.z * SLOT` and every index is the shipped
+/// kernel's plus that base.  The reduction tree, the rounding and the write are
+/// unchanged, which is what keeps a batched norm bit-identical to a lone one.
+///
+/// Why: at b=8 the step issued 456 one-workgroup norm dispatches (two per layer
+/// per slot plus the final one).
+pub fn rms_norm_slots(last: usize, bs: usize, slot_words: usize, batch: usize) -> String {
+    assert!(last % 2 == 0 && last >= bs, "rms_norm_slots: last must be even and >= bs");
+    assert!((1..=16).contains(&batch), "rms_norm_slots: batch must be 1..=16");
+    assert_eq!(slot_words, last / 2, "rms_norm_slots: slot stride must be last/2 words");
+    format!(
+        "{HALF_AT}
+struct Cfg {{ eps: f32, _a: f32, _b: f32, _c: f32 }};
+
+@group(0) @binding(0) var<storage, read>       Wt:  array<u32>;
+@group(0) @binding(1) var<storage, read>       X:   array<u32>;
+@group(0) @binding(2) var<storage, read_write> Out: array<u32>;
+@group(0) @binding(3) var<uniform>             cfg: Cfg;
+
+const LAST: u32 = {last}u;
+const BS: u32 = {bs}u;
+const LAST2: u32 = {last2}u;
+const SLOT: u32 = {slot}u;
+
+var<workgroup> red: array<f32, {bs}>;
+
+@compute @workgroup_size({bs})
+fn rms_norm_slots(@builtin(workgroup_id) wgid: vec3<u32>,
+                  @builtin(local_invocation_id) lid: vec3<u32>) {{
+    // row = workgroup id, offset by the slot: one row per (slot, row) pair.
+    let row = wgid.z * SLOT + wgid.x * LAST2;
+    var local = 0.0;
+    for (var j = lid.x; j < LAST2; j = j + BS) {{
+        let v = unpack2x16float(X[row + j]);
+        local = local + (v.x * v.x + v.y * v.y);
+    }}
+    red[lid.x] = local;
+    workgroupBarrier();
+    for (var sh = BS >> 1u; sh > 0u; sh = sh >> 1u) {{
+        if (lid.x < sh) {{ red[lid.x] = red[lid.x] + red[lid.x + sh]; }}
+        workgroupBarrier();
+    }}
+    let inv_rms = inverseSqrt(red[0] / f32(LAST) + cfg.eps);
+    workgroupBarrier();
+    for (var j = lid.x; j < LAST2; j = j + BS) {{
+        let xv = unpack2x16float(X[row + j]);
+        let wv = unpack2x16float(Wt[j]);
+        Out[row + j] = pack2x16float(vec2<f32>(
+            xv.x * inv_rms * wv.x,
+            xv.y * inv_rms * wv.y));
+    }}
+}}
+",
+        last = last,
+        bs = bs,
+        last2 = last / 2,
+        slot = slot_words,
+    )
+}
+
 /// [`gemv`] with a split-K dimension: `splits` workgroups (distinguished by
 /// `wgid.z`) each own a contiguous range of the row's K granules and write an f32
 /// partial, which [`gemv_merge`] combines.
@@ -490,6 +553,341 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
     )
 }
 
+/// Batched GEMV: one weight read, `batch` activation vectors.
+///
+/// [`gemv`] streams `n * k * 2` bytes of weights per dispatch and produces one
+/// token's projection, so at b=1 the step is a single weight stream and the
+/// hardware has nothing else to overlap.  This kernel keeps [`gemv`]'s granule,
+/// lane map, accumulator order and xor butterfly -- value `j` of a granule is
+/// still consumed by the same `fma` chain in the same order -- but each warp
+/// holds `batch` accumulator quads and multiplies every weight word against
+/// every vector's word before moving to the next one.  Weight traffic per
+/// *step* is unchanged while `batch` tokens come out of it, which is the whole
+/// arithmetic of decode batching.
+///
+/// Layout follows [`gemv`]: `Wt` is `[n, k/8]` words of four f16 with row `r` at
+/// word `r*KG`; `X` is `batch` rows of those same `KG` words; `Y` is `batch`
+/// rows of `n` f16, row `b` starting at word `b * (n/2)`.  `n` must be a
+/// multiple of `RPW*2 = 16` so each workgroup writes whole f16 pairs, and `k` a
+/// multiple of 256 so the x4 unroll closes evenly.
+pub fn gemv_batch(n: usize, k: usize, batch: usize) -> String {
+    const RPW: usize = 8;
+    const THREADS: usize = RPW * 32;
+    let kg = k / 8;
+    assert_eq!(k % 256, 0, "gemv_batch: k must be a multiple of 256");
+    assert_eq!(kg % 32, 0, "gemv_batch: k/8 must be a multiple of 32");
+    let tiles = kg / 32;
+    assert_eq!(tiles % 4, 0, "gemv_batch: k/256 must be a multiple of 4");
+    assert_eq!(n % (RPW * 2), 0, "gemv_batch: rows must be a multiple of 16");
+    assert!((1..=16).contains(&batch), "gemv_batch: batch must be 1..=16");
+    let rowsw = RPW / 2;
+    let rowsn = batch * THREADS;
+
+    let mut accs = String::new();
+    let mut body = String::new();
+    for b in 0..batch {
+        for c in 0..4 {
+            accs.push_str(&format!("    var a{b}_{c} = 0.0;\n"));
+        }
+    }
+    // The weight words of one tile first: they are what every batch shares.
+    for t in 0..4 {
+        let off = ["", " + 32u", " + 64u", " + 96u"][t];
+        body.push_str(&format!("        let wv{t} = Wt[wbase + i{off}];\n"));
+    }
+    for t in 0..4 {
+        for (wi, comp) in ["x", "y", "z", "w"].iter().enumerate() {
+            body.push_str(&format!("        let w{t}{wi} = unpack2x16float(wv{t}.{comp});\n"));
+        }
+    }
+    for b in 0..batch {
+        let xb = b * kg;
+        for t in 0..4 {
+            let off = ["", " + 32u", " + 64u", " + 96u"][t];
+            body.push_str(&format!("        let x{b}_{t} = X[{xb}u + i{off}];\n"));
+        }
+        for t in 0..4 {
+            for (wi, comp) in ["x", "y", "z", "w"].iter().enumerate() {
+                body.push_str(&format!(
+                    "        let x{b}{t}{wi} = unpack2x16float(x{b}_{t}.{comp});\n"
+                ));
+            }
+        }
+        for t in 0..4 {
+            for c in 0..4 {
+                body.push_str(&format!(
+                    "        a{b}_{c} = fma(w{t}{c}.x, x{b}{t}{c}.x, fma(w{t}{c}.y, x{b}{t}{c}.y, a{b}_{c}));\n"
+                ));
+            }
+        }
+    }
+    body.push_str("        i = i + 128u;\n");
+
+    let mut reduce = String::new();
+    for b in 0..batch {
+        reduce.push_str(&format!(
+            "    let acc{b} = (a{b}_0 + a{b}_1) + (a{b}_2 + a{b}_3);\n    let r{b} = bfly(acc{b}, lid.x, lane);\n    if (lane == 0u) {{ rows_out[{o}u + warp] = r{b}; }}\n",
+            o = b * THREADS
+        ));
+    }
+    let mut epilogue = String::new();
+    for b in 0..batch {
+        let base = b * THREADS;
+        epilogue.push_str(&format!(
+            "        let wb{b} = {b}u * (N >> 1u) + (wgid.x * {rowsw}u);\n"
+        ));
+        for w in 0..rowsw {
+            epilogue.push_str(&format!(
+                "        Y[wb{b} + {w}u] = pack2x16float(vec2<f32>(rows_out[{a}u], rows_out[{c}u]));\n",
+                a = base + 2 * w,
+                c = base + 2 * w + 1
+            ));
+        }
+    }
+
+    format!(
+        "@group(0) @binding(0) var<storage, read>       Wt: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read>       X:  array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read_write> Y:  array<u32>;
+
+const KG: u32 = {kg}u;
+const TILES: u32 = {tiles}u;
+const THREADS: u32 = {threads}u;
+const RPW: u32 = {rpw}u;
+const N: u32 = {n}u;
+
+var<workgroup> bt0: array<f32, THREADS>;
+var<workgroup> bt1: array<f32, THREADS>;
+var<workgroup> rows_out: array<f32, {rowsn}>;
+
+/// The same 5-round xor butterfly [`gemv`] uses, through shared memory: the
+/// reduction tree has to stay bit-identical for b=1 to be a regression-free
+/// reference.
+fn bfly(v: f32, lid: u32, lane: u32) -> f32 {{
+    let wb = lid & 0xFFFFFFE0u;
+    bt0[lid] = v;
+    workgroupBarrier();
+    var t = bt0[lid] + bt0[wb + (lane ^ 16u)];
+    bt1[lid] = t;
+    workgroupBarrier();
+    t = bt1[lid] + bt1[wb + (lane ^ 8u)];
+    bt0[lid] = t;
+    workgroupBarrier();
+    t = bt0[lid] + bt0[wb + (lane ^ 4u)];
+    bt1[lid] = t;
+    workgroupBarrier();
+    t = bt1[lid] + bt1[wb + (lane ^ 2u)];
+    bt0[lid] = t;
+    workgroupBarrier();
+    t = bt0[lid] + bt0[wb + (lane ^ 1u)];
+    return t;
+}}
+
+@compute @workgroup_size({threads})
+fn gemv_batch(@builtin(workgroup_id) wgid: vec3<u32>,
+              @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let lane = lid.x & 31u;
+    let warp = lid.x >> 5u;
+    let row = wgid.x * RPW + warp;
+    let wbase = row * KG;
+{accs}    var i = lane;
+    // x4 unroll with the four weight words prefetched: the fma chain still
+    // consumes tiles in ascending order, so the reduction bits are unchanged.
+    for (var g = 0u; g < TILES; g = g + 4u) {{
+{body}    }}
+{reduce}    workgroupBarrier();
+    if (lid.x == 0u) {{
+{epilogue}    }}
+}}
+",
+        kg = kg,
+        tiles = tiles,
+        threads = THREADS,
+        rpw = RPW,
+        n = n,
+        rowsn = rowsn,
+        accs = accs,
+        body = body,
+        reduce = reduce,
+        epilogue = epilogue,
+    )
+}
+
+/// Batched GEMV over **separate per-slot buffers**: one weight read, `batch`
+/// dot products, no change to any slot's buffer layout.
+///
+/// [`gemv_batch`] takes its activations as one `[batch, k]` buffer, which would
+/// force every per-slot tensor to become a slice of a shared allocation.  This
+/// form takes one binding per slot instead, so a batch can run on the buffers
+/// the single-sequence path already allocates -- the per-slot kernels
+/// (`extract`, `gqa`, `silu`, `argmax`, `rms_norm`) never learn about batching.
+///
+/// The arithmetic per slot is [`gemv`]'s: same granule walk, same four
+/// accumulators, same `(a0+a1)+(a2+a3)`, same xor butterfly, same epilogue.  The
+/// only thing that moves is where the weight word is loaded -- once per tile for
+/// all slots instead of once per slot -- so a batched token is bit-identical to a
+/// lone one.
+///
+/// Bindings: `0` = W, `1..=batch` = each slot's activation, `1+batch..` = each
+/// slot's output.
+pub fn gemv_batch_slots(n: usize, k: usize, batch: usize, accum: bool) -> String {
+    const RPW: usize = 8;
+    const THREADS: usize = RPW * 32;
+    let kg = k / 8;
+    assert_eq!(k % 256, 0, "gemv_batch_slots: k must be a multiple of 256");
+    assert_eq!(kg % 32, 0, "gemv_batch_slots: k/8 must be a multiple of 32");
+    let tiles = kg / 32;
+    assert_eq!(tiles % 4, 0, "gemv_batch_slots: k/256 must be a multiple of 4");
+    assert_eq!(n % (RPW * 2), 0, "gemv_batch_slots: rows must be a multiple of 16");
+    assert!((2..=32).contains(&batch), "gemv_batch_slots: batch must be 2..=32");
+    let rowsw = RPW / 2;
+    let rowsn = batch * THREADS;
+    let accum_lit = if accum { 1u32 } else { 0u32 };
+
+    // One binding covers every slot: the slot picks *which buffer*, not an offset
+    // into a shared one.  `wgid.z` indexes the binding array, so a slot reads
+    // exactly the bytes its lone run reads and no kernel carries a stride.
+    let decl = String::from(
+        "\
+@group(0) @binding(0) var<storage, read>       Wt: array<vec4<u32>>;\
+@group(0) @binding(1) var<storage, read>       Xs: binding_array<Arr4, 32>;\
+@group(0) @binding(2) var<storage, read_write> Ys: binding_array<Arr32, 32>;\
+",
+    );
+
+    let mut accs = String::new();
+    let mut body = String::new();
+    for s in 0..batch {
+        for c in 0..4 {
+            accs.push_str(&format!("    var a{s}_{c} = 0.0;\n"));
+        }
+    }
+    for t in 0..4 {
+        let off = ["", " + 32u", " + 64u", " + 96u"][t];
+        body.push_str(&format!("        let wv{t} = Wt[wbase + i{off}];\n"));
+    }
+    for t in 0..4 {
+        for (wi, comp) in ["x", "y", "z", "w"].iter().enumerate() {
+            body.push_str(&format!("        let w{t}{wi} = unpack2x16float(wv{t}.{comp});\n"));
+        }
+    }
+    for s in 0..batch {
+        for t in 0..4 {
+            let off = ["", " + 32u", " + 64u", " + 96u"][t];
+            body.push_str(&format!("        let x{s}_{t} = Xs[{s}].v[i{off}];\n"));
+        }
+        for t in 0..4 {
+            for (wi, comp) in ["x", "y", "z", "w"].iter().enumerate() {
+                body.push_str(&format!(
+                    "        let x{s}{t}{wi} = unpack2x16float(x{s}_{t}.{comp});\n"
+                ));
+            }
+        }
+        for t in 0..4 {
+            for c in 0..4 {
+                body.push_str(&format!(
+                    "        a{s}_{c} = fma(w{t}{c}.x, x{s}{t}{c}.x, fma(w{t}{c}.y, x{s}{t}{c}.y, a{s}_{c}));\n"
+                ));
+            }
+        }
+    }
+    body.push_str("        i = i + 128u;\n");
+
+    let mut reduce = String::new();
+    for s in 0..batch {
+        reduce.push_str(&format!(
+            "    let acc{s} = (a{s}_0 + a{s}_1) + (a{s}_2 + a{s}_3);\n    let r{s} = bfly(acc{s}, lid.x, lane);\n    if (lane == 0u) {{ rows_out[{o}u + warp] = r{s}; }}\n",
+            o = s * THREADS
+        ));
+    }
+    let mut epilogue = String::new();
+    for s in 0..batch {
+        let base = s * THREADS;
+        for w in 0..rowsw {
+            epilogue.push_str(&format!(
+                "        var va{s}_{w} = rows_out[{a}u];\n        var vb{s}_{w} = rows_out[{c}u];\n",
+                a = base + 2 * w,
+                c = base + 2 * w + 1
+            ));
+            epilogue.push_str(&format!(
+                "        if (ACCUM == 1u) {{ let old = unpack2x16float(Ys[{s}].v[wb + {w}u]); va{s}_{w} = va{s}_{w} + old.x; vb{s}_{w} = vb{s}_{w} + old.y; }}\n"
+            ));
+            epilogue.push_str(&format!(
+                "        Ys[{s}].v[wb + {w}u] = pack2x16float(vec2<f32>(va{s}_{w}, vb{s}_{w}));\n"
+            ));
+        }
+    }
+
+    format!(
+        "enable wgpu_binding_array;
+/// naga requires the binding-array element to be a struct; one struct per word
+/// shape keeps the bodies the same `array<...>` the lone kernels use.
+struct Arr4  {{ v: array<vec4<u32>> }};
+struct Arr32 {{ v: array<u32> }};
+{decl}
+const KG: u32 = {kg}u;
+const TILES: u32 = {tiles}u;
+const THREADS: u32 = {threads}u;
+const RPW: u32 = {rpw}u;
+const ACCUM: u32 = {accum}u;
+
+var<workgroup> bt0: array<f32, THREADS>;
+var<workgroup> bt1: array<f32, THREADS>;
+var<workgroup> rows_out: array<f32, {rowsn}>;
+
+/// [`gemv`]'s 5-round xor butterfly, through shared memory: the reduction tree
+/// is what makes a batched slot's sum bit-identical to its lone sum.
+fn bfly(v: f32, lid: u32, lane: u32) -> f32 {{
+    let wb = lid & 0xFFFFFFE0u;
+    bt0[lid] = v;
+    workgroupBarrier();
+    var t = bt0[lid] + bt0[wb + (lane ^ 16u)];
+    bt1[lid] = t;
+    workgroupBarrier();
+    t = bt1[lid] + bt1[wb + (lane ^ 8u)];
+    bt0[lid] = t;
+    workgroupBarrier();
+    t = bt0[lid] + bt0[wb + (lane ^ 4u)];
+    bt1[lid] = t;
+    workgroupBarrier();
+    t = bt1[lid] + bt1[wb + (lane ^ 2u)];
+    bt0[lid] = t;
+    workgroupBarrier();
+    t = bt0[lid] + bt0[wb + (lane ^ 1u)];
+    return t;
+}}
+
+@compute @workgroup_size({threads})
+fn gemv_batch_slots(@builtin(workgroup_id) wgid: vec3<u32>,
+                    @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let lane = lid.x & 31u;
+    let warp = lid.x >> 5u;
+    let row = wgid.x * RPW + warp;
+    let wbase = row * KG;
+    let wb = (wgid.x * {rowsw}u);
+{accs}    var i = lane;
+    for (var g = 0u; g < TILES; g = g + 4u) {{
+{body}    }}
+{reduce}    workgroupBarrier();
+    if (lid.x == 0u) {{
+{epilogue}    }}
+}}
+",
+        decl = decl,
+        kg = kg,
+        tiles = tiles,
+        threads = THREADS,
+        rpw = RPW,
+        accum = accum_lit,
+        rowsn = rowsn,
+        rowsw = rowsw,
+        accs = accs,
+        body = body,
+        reduce = reduce,
+        epilogue = epilogue,
+    )
+}
+
 /// [`gemv`] with the RMSNorm that feeds it folded into the workgroup prologue.
 ///
 /// The norm is one 1-workgroup dispatch per site in the decode loop and each of
@@ -733,6 +1131,245 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
     )
 }
 
+/// [`gemv_norm`] over `batch` sequences: one weight read, `batch` norm+GEMVs.
+///
+/// Same prologue statements as [`gemv_norm`] -- the `vc = bs/256` folded partials,
+/// the 256-wide tree, `norm_word`'s two multiplies and its f16 packing -- but run
+/// once per slot into that slot's shared row, and then one GEMV loop that reads
+/// each weight word once and multiplies it into every slot's staged row.  That
+/// keeps a batched token bit-identical to a lone one, which the `rms_norm` +
+/// `gemv` split does **not**: the standalone norm reduces with `bs` threads where
+/// this one folds `vc` partials per thread, so the two f32 sums associate
+/// differently and an occasional f16 rounding lands the other way.
+///
+/// `Xr`/`Y` are one binding per slot (the decoder keeps its per-slot buffers);
+/// the norm weights are shared, and `EPS` is baked in exactly as it is for the
+/// single-vector kernel.
+pub fn gemv_norm_batch_slots(
+    n: usize,
+    k: usize,
+    batch: usize,
+    accum: bool,
+    last: usize,
+    bs: usize,
+    eps: f32,
+) -> String {
+    assert_eq!(n % 8, 0, "gemv_norm_batch_slots: rows must be a multiple of 8");
+    let kg = k / 8;
+    assert_eq!(k % 256, 0, "gemv_norm_batch_slots: k must be a multiple of 256");
+    let tiles = kg / 32;
+    assert_eq!(tiles % 4, 0, "gemv_norm_batch_slots: k/256 must be a multiple of 4");
+    let last2 = last / 2;
+    assert_eq!(last2, kg * 4, "gemv_norm_batch_slots: activation row != k/2 words");
+    assert!((2..=32).contains(&batch), "gemv_norm_batch_slots: batch must be 2..=16");
+    let vc = bs / 256;
+    assert_eq!(bs, vc * 256, "gemv_norm_batch_slots: block size must be 256/512/1024");
+    assert!([1usize, 2, 4].contains(&vc), "gemv_norm_batch_slots: block size");
+    let accum_lit = u32::from(accum);
+    let folded = match vc {
+        1 => "l0".to_string(),
+        2 => "l0 + l1".to_string(),
+        _ => "(l0 + l2) + (l1 + l3)".to_string(),
+    };
+
+    // Same shape as `gemv_batch_slots`: one binding holds every slot's row, so
+    // the slot is the buffer the dispatch names and never a stride.
+    let decl = String::from(
+        "enable wgpu_binding_array;
+struct Arr4  { v: array<vec4<u32>> };
+struct Arr32 { v: array<u32> };
+@group(0) @binding(0) var<storage, read>       Wt:  array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read>       Xs:  binding_array<Arr32, 32>;
+@group(0) @binding(2) var<storage, read_write> Ys:  binding_array<Arr32, 32>;
+@group(0) @binding(3) var<storage, read>       NW:  array<u32>;
+",
+    );
+
+    let mut xs_decl = String::new();
+    for s in 0..batch {
+        xs_decl.push_str(&format!("var<workgroup> xs{s}: array<vec4<u32>, {kg}u>;\n"));
+    }
+    // One helper, not one per slot: `wgid.z` already picks the row.
+    let normfns = "fn norm_word(z: u32, j: u32, inv_rms: f32) -> u32 {
+    let xv = unpack2x16float(Xs[z].v[j]);
+    let wv = unpack2x16float(NW[j]);
+    return pack2x16float(vec2<f32>(xv.x * inv_rms * wv.x, xv.y * inv_rms * wv.y));
+}
+";
+
+    // Prologue per slot: the shipped statements, against that slot's row.
+    let mut pro = String::new();
+    for s in 0..batch {
+        pro.push_str(&format!("    // slot {s}\n    {{\n"));
+        for i in 0..vc {
+            pro.push_str(&format!("    var l{i} = 0.0;\n"));
+        }
+        for i in 0..vc {
+            let off = i * 256;
+            pro.push_str(&format!(
+                "    for (var j = lid.x + {off}u; j < LAST2; j = j + BS) {{\n        let v = unpack2x16float(Xs[{s}].v[j]);\n        l{i} = l{i} + (v.x * v.x + v.y * v.y);\n    }}\n"
+            ));
+        }
+        pro.push_str(&format!(
+            "    red[lid.x] = {folded};
+    workgroupBarrier();
+    for (var t = 128u; t > 0u; t = t >> 1u) {{
+        if (lid.x < t) {{ red[lid.x] = red[lid.x] + red[lid.x + t]; }}
+        workgroupBarrier();
+    }}
+    let inv_rms{s} = inverseSqrt(red[0] / f32(LAST) + EPS);
+    workgroupBarrier();
+    for (var w4 = lid.x; w4 < KG; w4 = w4 + 256u) {{
+        let b0 = norm_word({s}, 4u * w4, inv_rms{s});
+        let b1 = norm_word({s}, 4u * w4 + 1u, inv_rms{s});
+        let b2 = norm_word({s}, 4u * w4 + 2u, inv_rms{s});
+        let b3 = norm_word({s}, 4u * w4 + 3u, inv_rms{s});
+        xs{s}[w4] = vec4<u32>(b0, b1, b2, b3);
+    }}
+    workgroupBarrier();
+    }}
+"
+        ));
+    }
+
+    let mut accs = String::new();
+    let mut body = String::new();
+    for s in 0..batch {
+        for c in 0..4 {
+            accs.push_str(&format!("    var a{s}_{c} = 0.0;\n"));
+        }
+    }
+    for t in 0..4 {
+        let off = ["", " + 32u", " + 64u", " + 96u"][t];
+        body.push_str(&format!("        let wv{t} = Wt[wbase + i{off}];\n"));
+    }
+    for t in 0..4 {
+        for (wi, comp) in ["x", "y", "z", "w"].iter().enumerate() {
+            body.push_str(&format!("        let w{t}{wi} = unpack2x16float(wv{t}.{comp});\n"));
+        }
+    }
+    for s in 0..batch {
+        for t in 0..4 {
+            let off = ["", " + 32u", " + 64u", " + 96u"][t];
+            body.push_str(&format!("        let x{s}_{t} = xs{s}[i{off}];\n"));
+        }
+        for t in 0..4 {
+            for (wi, comp) in ["x", "y", "z", "w"].iter().enumerate() {
+                body.push_str(&format!(
+                    "        let x{s}{t}{wi} = unpack2x16float(x{s}_{t}.{comp});\n"
+                ));
+            }
+        }
+        for t in 0..4 {
+            for c in 0..4 {
+                body.push_str(&format!(
+                    "        a{s}_{c} = fma(w{t}{c}.x, x{s}{t}{c}.x, fma(w{t}{c}.y, x{s}{t}{c}.y, a{s}_{c}));\n"
+                ));
+            }
+        }
+    }
+    body.push_str("        i = i + 128u;\n");
+
+    let mut reduce = String::new();
+    for s in 0..batch {
+        reduce.push_str(&format!(
+            "    let acc{s} = (a{s}_0 + a{s}_1) + (a{s}_2 + a{s}_3);\n    let r{s} = bfly(acc{s}, lid.x, lane);\n    if (lane == 0u) {{ rows_out[{o}u + warp] = r{s}; }}\n",
+            o = s * 8
+        ));
+    }
+    let mut epi = String::new();
+    for s in 0..batch {
+        for w in 0..4 {
+            epi.push_str(&format!(
+                "        var va{s}_{w} = rows_out[{a}u];\n        var vb{s}_{w} = rows_out[{c}u];\n",
+                a = s * 8 + 2 * w,
+                c = s * 8 + 2 * w + 1
+            ));
+            epi.push_str(&format!(
+                "        if (ACCUM == 1u) {{ let old = unpack2x16float(Ys[{s}].v[wordbase + {w}u]); va{s}_{w} = va{s}_{w} + old.x; vb{s}_{w} = vb{s}_{w} + old.y; }}\n"
+            ));
+            epi.push_str(&format!(
+                "        Ys[{s}].v[wordbase + {w}u] = pack2x16float(vec2<f32>(va{s}_{w}, vb{s}_{w}));\n"
+            ));
+        }
+    }
+
+    format!(
+        "{decl}
+const KG: u32 = {kg}u;
+const TILES: u32 = {tiles}u;
+const ACCUM: u32 = {accum}u;
+const LAST: u32 = {last}u;
+const LAST2: u32 = {last2}u;
+const BS: u32 = {bs}u;
+const EPS: f32 = {eps:?}f;
+
+var<workgroup> bt0: array<f32, 256>;
+var<workgroup> bt1: array<f32, 256>;
+var<workgroup> rows_out: array<f32, {rowsn}>;
+var<workgroup> red: array<f32, 256>;
+{xs_decl}
+/// The same 5-round xor butterfly as `gemv_norm`, through shared memory.
+fn bfly(v: f32, lid: u32, lane: u32) -> f32 {{
+    let wb = lid & 0xFFFFFFE0u;
+    bt0[lid] = v;
+    workgroupBarrier();
+    var t = bt0[lid] + bt0[wb + (lane ^ 16u)];
+    bt1[lid] = t;
+    workgroupBarrier();
+    t = bt1[lid] + bt1[wb + (lane ^ 8u)];
+    bt0[lid] = t;
+    workgroupBarrier();
+    t = bt0[lid] + bt0[wb + (lane ^ 4u)];
+    bt1[lid] = t;
+    workgroupBarrier();
+    t = bt1[lid] + bt1[wb + (lane ^ 2u)];
+    bt0[lid] = t;
+    workgroupBarrier();
+    t = bt0[lid] + bt0[wb + (lane ^ 1u)];
+    return t;
+}}
+
+/// `rms_norm`'s output word `j`, per slot: the same two multiplies in the same
+/// order, so the f16 rounding matches the buffer it used to go through.
+{normfns}
+@compute @workgroup_size(256)
+fn gemv_norm_batch_slots(@builtin(workgroup_id) wgid: vec3<u32>,
+                         @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let lane = lid.x & 31u;
+    let warp = lid.x >> 5u;
+    let row = wgid.x * 8u + warp;
+
+{pro}
+    let wbase = row * KG;
+{accs}    var i = lane;
+    for (var g = 0u; g < TILES; g = g + 4u) {{
+{body}    }}
+{reduce}    workgroupBarrier();
+    if (lid.x == 0u) {{
+        let wordbase = (wgid.x * 8u) >> 1u;
+{epi}    }}
+}}
+",
+        decl = decl,
+        kg = kg,
+        tiles = tiles,
+        accum = accum_lit,
+        last = last,
+        last2 = last2,
+        bs = bs,
+        eps = eps,
+        rowsn = batch * 8,
+        xs_decl = xs_decl,
+        normfns = normfns,
+        pro = pro,
+        accs = accs,
+        body = body,
+        reduce = reduce,
+        epi = epi,
+    )
+}
+
 /// `qkv_extract_qkv_norm_rotary_cache_f16` — one workgroup per head slot,
 /// `grid = (1, nqh + nkvh)`.  Q heads land in `QOut`, K heads write the roped K
 /// into `KCache` and copy V through verbatim.
@@ -844,6 +1481,146 @@ fn qkv_extract(@builtin(workgroup_id) wgid: vec3<u32>,
                     rope_elem(false, kbase, csbase, j0, inv_rms),
                     rope_elem(false, kbase, csbase, j0 + 1u, inv_rms)));
                 VCache[cache + w] = Qkv[vbase + w];
+            }}
+        }}
+    }}
+}}
+",
+        d2 = d / 2,
+        hd = d / 2,
+        tot2 = total_cols / 2,
+        qd2 = q_dim / 2,
+        kvd2 = kv_dim / 2,
+    )
+}
+/// [`qkv_extract`] over `batch` sequences in one dispatch, `wgid.z` = the slot.
+///
+/// The pooled buffers carry a slot stride for the qkv read, the q_out write and
+/// the two cache writes; every other expression -- the head RMSNorm, the
+/// rotate-half RoPE, the f16 packing -- is the shipped kernel's, so each slot's
+/// KV rows and q_out bytes are the ones a lone run would have written.
+pub fn qkv_extract_slots(
+    nqh: usize,
+    nkvh: usize,
+    d: usize,
+) -> String {
+    assert_eq!(d % 2, 0);
+    let total_cols = (nqh + 2 * nkvh) * d;
+    let q_dim = nqh * d;
+    let kv_dim = nkvh * d;
+    format!(
+        "enable wgpu_binding_array;
+/// naga requires the binding-array element to be a struct; one struct per word
+/// shape keeps the bodies the same `array<...>` the lone kernels use.
+struct Arr4  {{ v: array<vec4<u32>> }};
+struct Arr32 {{ v: array<u32> }};
+{HALF_AT}
+struct Cfg {{ max_seq: u32, start: u32, pos_offset: u32, s: u32, eps: f32, _a: u32, _b: u32, _c: u32 }};
+
+@group(0) @binding(0) var<storage, read>       Qkv:    binding_array<Arr32, 32>;
+@group(0) @binding(1) var<storage, read>       QnW:    array<u32>;
+@group(0) @binding(2) var<storage, read>       KnW:    array<u32>;
+@group(0) @binding(3) var<storage, read>       Cos:    array<u32>;
+@group(0) @binding(4) var<storage, read>       Sin:    array<u32>;
+@group(0) @binding(5) var<storage, read_write> QOut:   binding_array<Arr32, 32>;
+@group(0) @binding(6) var<storage, read_write> KCache: binding_array<Arr32, 32>;
+@group(0) @binding(7) var<storage, read_write> VCache: binding_array<Arr32, 32>;
+/// Group 1: wgpu refuses a bind group that mixes a binding array with a uniform.
+@group(1) @binding(0) var<uniform>             cfg:    Cfg;
+/// Each slot's own write position: the segments in a batch have different
+/// lengths, so slot 0's `cfg.start` is not it.
+@group(0) @binding(9) var<storage, read>       POS:    array<u32>;
+
+const D: u32 = {d}u;
+const D2: u32 = {d2}u;
+const HD: u32 = {hd}u;
+const NQH: u32 = {nqh}u;
+const NKVH: u32 = {nkvh}u;
+const TOT2: u32 = {tot2}u;
+const QD2: u32 = {qd2}u;
+const KVD2: u32 = {kvd2}u;
+const BS: u32 = 128u;
+
+var<workgroup> red: array<f32, 128>;
+
+/// Sum of squares + tree reduction + inverse RMS (one element per thread,
+/// `s` halving from `bs/2`).
+fn head_inv_rms(z: u32, base: u32, lid: u32) -> f32 {{
+    var local = 0.0;
+    for (var j = lid; j < D; j = j + BS) {{
+        let e = half_at(unpack2x16float(Qkv[z].v[base + (j >> 1u)]), j);
+        local = local + e * e;
+    }}
+    red[lid] = local;
+    workgroupBarrier();
+    for (var s = BS >> 1u; s > 0u; s = s >> 1u) {{
+        if (lid < s) {{ red[lid] = red[lid] + red[lid + s]; }}
+        workgroupBarrier();
+    }}
+    let r = inverseSqrt(red[0] / f32(D) + cfg.eps);
+    workgroupBarrier();
+    return r;
+}}
+
+/// One roped output element: norm over the head row, then rotate-half RoPE.
+/// `use_q` picks the Q norm weights over the K norm weights.
+fn rope_elem(z: u32, use_q: bool, base: u32, csbase: u32, j: u32, inv_rms: f32) -> f32 {{
+    let xj = half_at(unpack2x16float(Qkv[z].v[base + (j >> 1u)]), j);
+    var wj = 0.0;
+    if (use_q) {{
+        wj = half_at(unpack2x16float(QnW[j >> 1u]), j);
+    }} else {{
+        wj = half_at(unpack2x16float(KnW[j >> 1u]), j);
+    }}
+    let x_val_j = xj * inv_rms * wj;
+    let pj = select(j - HD, j + HD, j < HD);
+    let xp = half_at(unpack2x16float(Qkv[z].v[base + (pj >> 1u)]), pj);
+    var wp = 0.0;
+    if (use_q) {{
+        wp = half_at(unpack2x16float(QnW[pj >> 1u]), pj);
+    }} else {{
+        wp = half_at(unpack2x16float(KnW[pj >> 1u]), pj);
+    }}
+    let x_pair = xp * inv_rms * wp;
+    let pair_val = select(x_pair, -x_pair, j < HD);
+    let c = half_at(unpack2x16float(Cos[csbase + (j >> 1u)]), j);
+    let si = half_at(unpack2x16float(Sin[csbase + (j >> 1u)]), j);
+    return x_val_j * c + pair_val * si;
+}}
+
+@compute @workgroup_size(128)
+fn qkv_extract(@builtin(workgroup_id) wgid: vec3<u32>,
+               @builtin(local_invocation_id) lid: vec3<u32>) {{
+    // wgid.x = position within the batch (0 for decode, 0..s for prefill)
+    let is = wgid.x;
+    let slot = wgid.z;
+    let hy = wgid.y;
+    // cos/sin are `array<u32>` (2 f16 per word): row `p` starts at word p*D2.
+    let csbase = (POS[slot] + is) * D2;
+
+    if (hy < NQH) {{
+        // Q head `hy` of position `is`: word is*TOT2 + hy*D2 (D2 words = D f16).
+        let base = is * TOT2 + hy * D2;
+        let inv_rms = head_inv_rms(slot, base, lid.x);
+        for (var w = lid.x; w < D2; w = w + BS) {{
+            let j0 = w * 2u;
+            QOut[slot].v[(hy * cfg.s + is) * D2 + w] = pack2x16float(vec2<f32>(
+                rope_elem(slot, true, base, csbase, j0, inv_rms),
+                rope_elem(slot, true, base, csbase, j0 + 1u, inv_rms)));
+        }}
+    }} else {{
+        let ih = hy - NQH;
+        if (ih < NKVH) {{
+            let kbase = is * TOT2 + QD2 + ih * D2;
+            let vbase = is * TOT2 + QD2 + KVD2 + ih * D2;
+            let cache = (ih * cfg.max_seq + POS[slot] + is) * D2;
+            let inv_rms = head_inv_rms(slot, kbase, lid.x);
+            for (var w = lid.x; w < D2; w = w + BS) {{
+                let j0 = w * 2u;
+                KCache[slot].v[cache + w] = pack2x16float(vec2<f32>(
+                    rope_elem(slot, false, kbase, csbase, j0, inv_rms),
+                    rope_elem(slot, false, kbase, csbase, j0 + 1u, inv_rms)));
+                VCache[slot].v[cache + w] = Qkv[slot].v[vbase + w];
             }}
         }}
     }}
@@ -1100,6 +1877,7 @@ fn expf_bt(x: f32) -> f32 {
 }
 ";
 
+
 pub fn gqa_decode_single(nqh: usize, nkvh: usize, d: usize, bs: usize, cap: usize) -> String {
     let tchunks = (bs / d).max(1);
     assert_eq!(d % 2, 0);
@@ -1235,6 +2013,174 @@ fn gqa(@builtin(workgroup_id) wgid: vec3<u32>,
     )
 }
 
+/// [`gqa_decode_single`] with a slot axis: `wgid.z` is the slot.
+///
+/// One dispatch of `nqh * slots` workgroups replaces `slots` dispatches of
+/// `nqh`.  At the 1.7B shape `nqh` is 16, so the shipped dispatch is 16
+/// workgroups on a 96-CU card -- latency-bound at ~49 GB/s of KV traffic; eight
+/// of those run one after another (measured 14.51 ms per 28 layers) while one
+/// 128-workgroup dispatch measures 1.97 ms for the same work.  Each workgroup
+/// still walks its own slot's rows in the same order with the same trees, and
+/// the only new input is that slot's `cur_len`, so a batched slot is
+/// bit-identical to a lone one.
+pub fn gqa_decode_single_slots(
+    nqh: usize,
+    nkvh: usize,
+    d: usize,
+    bs: usize,
+    cap: usize,
+) -> String {
+    let tchunks = (bs / d).max(1);
+    assert_eq!(d % 2, 0);
+    assert_eq!(bs % d, 0);
+    format!(
+        "enable wgpu_binding_array;
+/// naga requires the binding-array element to be a struct; one struct per word
+/// shape keeps the bodies the same `array<...>` the lone kernels use.
+struct Arr4  {{ v: array<vec4<u32>> }};
+struct Arr32 {{ v: array<u32> }};
+{HALF_AT}
+{EXP_BT}
+struct Cfg {{ cur_len: u32, max_seq: u32, scale: f32, _p: f32 }};
+
+@group(0) @binding(0) var<storage, read>       Q4:  binding_array<Arr4, 32>;
+@group(0) @binding(1) var<storage, read>       KC4: binding_array<Arr4, 32>;
+@group(0) @binding(2) var<storage, read>       VC:  binding_array<Arr32, 32>;
+@group(0) @binding(3) var<storage, read_write> Out: binding_array<Arr32, 32>;
+/// Group 1: wgpu refuses a bind group that mixes a binding array with a
+/// uniform, and the per-slot arrays already fill group 0.
+@group(1) @binding(0) var<uniform>             cfg: Cfg;
+/// Each slot's own `cur_len`: a batch holds segments of different lengths, so
+/// this cannot ride the one shared uniform.
+@group(0) @binding(5) var<storage, read>       CL:   array<u32>;
+/// The slots this dispatch owns, compacted: `wgid.z` -> slot.  A step runs one
+/// dispatch per block width (the shipped kernel picks 256 or 512 above/below
+/// 512, and the two trees differ), so this is the only place a dispatch is told
+/// which slots are its own.
+@group(0) @binding(6) var<storage, read>       PICK: array<u32>;
+
+const D: u32 = {d}u;
+const D2: u32 = {d2}u;
+const D4: u32 = {d4}u;
+const BS: u32 = {bs}u;
+const TCH: u32 = {tchunks}u;
+const REP: u32 = {rep}u;
+const CAP: u32 = {cap}u;
+
+var<workgroup> sc:      array<f32, {cap}>;
+var<workgroup> partial: array<f32, {d} * {tchunks}>;
+var<workgroup> red_max: array<f32, {bs}>;
+var<workgroup> red_sum: array<f32, {bs}>;
+
+@compute @workgroup_size({bs})
+fn gqa(@builtin(workgroup_id) wgid: vec3<u32>,
+       @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let qh = wgid.x;
+    let kh = qh / REP;
+    let z = PICK[wgid.z];
+    let cur_len = CL[z];
+    let qbase = qh * D2;
+    let kbase = kh * cfg.max_seq * D2;
+
+    // Stage 1 — scores[t] = (Q . K[t]) * scale.  Same word order and the same
+    // f32 adds as the scalar form; four words per load instead of one (see the
+    // split kernel's stage 1 for why the transactions matter).
+    let q4 = qbase >> 2u;
+    for (var t = lid.x; t < cur_len; t = t + BS) {{
+        var dot = 0.0;
+        let row4 = (kbase + t * D2) >> 2u;
+        for (var j4 = 0u; j4 < D4; j4 = j4 + 1u) {{
+            let qv = Q4[z].v[q4 + j4];
+            let kv = KC4[z].v[{krow} + j4];
+            let q0 = unpack2x16float(qv.x);
+            let k0 = unpack2x16float(kv.x);
+            dot = dot + (q0.x * k0.x + q0.y * k0.y);
+            let q1 = unpack2x16float(qv.y);
+            let k1 = unpack2x16float(kv.y);
+            dot = dot + (q1.x * k1.x + q1.y * k1.y);
+            let q2 = unpack2x16float(qv.z);
+            let k2 = unpack2x16float(kv.z);
+            dot = dot + (q2.x * k2.x + q2.y * k2.y);
+            let q3 = unpack2x16float(qv.w);
+            let k3 = unpack2x16float(kv.w);
+            dot = dot + (q3.x * k3.x + q3.y * k3.y);
+        }}
+        sc[t] = dot * cfg.scale;
+    }}
+    workgroupBarrier();
+
+    // Stage 2 — row max
+    var lmax = bitcast<f32>(0xFF800000u);
+    for (var t = lid.x; t < cur_len; t = t + BS) {{
+        if (sc[t] > lmax) {{ lmax = sc[t]; }}
+    }}
+    red_max[lid.x] = lmax;
+    workgroupBarrier();
+    for (var s = BS >> 1u; s > 0u; s = s >> 1u) {{
+        if (lid.x < s) {{ red_max[lid.x] = max(red_max[lid.x], red_max[lid.x + s]); }}
+        workgroupBarrier();
+    }}
+    let row_max = red_max[0];
+    workgroupBarrier();
+
+    // Stage 3 — exp + sum
+    var lsum = 0.0;
+    for (var t = lid.x; t < cur_len; t = t + BS) {{
+        let e = expf_bt(sc[t] - row_max);
+        sc[t] = e;
+        lsum = lsum + e;
+    }}
+    red_sum[lid.x] = lsum;
+    workgroupBarrier();
+    for (var s = BS >> 1u; s > 0u; s = s >> 1u) {{
+        if (lid.x < s) {{ red_sum[lid.x] = red_sum[lid.x] + red_sum[lid.x + s]; }}
+        workgroupBarrier();
+    }}
+    let inv_sum = 1.0 / red_sum[0];
+    workgroupBarrier();
+
+    // Stage 4 — partial[t_idx][j] then cross-t_chunk merge.  One thread owns a
+    // *pair* of dims: both halves sit in the same f16 word, so a single LDS and
+    // a single unpack feed two FMAs instead of one.  Each dim still walks the
+    // same stride-`TCH` key set in the same order, so every accumulator keeps its
+    // original summation order — only the instruction count per element drops
+    // (the block's second half has no pair left to own and idles here).
+    let jp = lid.x % D2;
+    let t_idx = lid.x / D2;
+    if (t_idx < TCH) {{
+        var a0 = 0.0;
+        var a1 = 0.0;
+        for (var t = t_idx; t < cur_len; t = t + TCH) {{
+            let row = kbase + t * D2;
+            let v = unpack2x16float(VC[z].v[row + jp]);
+            a0 = a0 + sc[t] * v.x;
+            a1 = a1 + sc[t] * v.y;
+        }}
+        partial[t_idx * D + jp * 2u] = a0;
+        partial[t_idx * D + jp * 2u + 1u] = a1;
+    }}
+    workgroupBarrier();
+
+    // exactly one element per thread, written as whole f16 words — the
+    // per-element arithmetic, and its order, is unchanged.
+    if (lid.x < D2) {{
+        var a0 = 0.0;
+        var a1 = 0.0;
+        for (var ti = 0u; ti < TCH; ti = ti + 1u) {{
+            a0 = a0 + partial[ti * D + lid.x * 2u];
+            a1 = a1 + partial[ti * D + lid.x * 2u + 1u];
+        }}
+        Out[z].v[qbase + lid.x] = pack2x16float(vec2<f32>(a0 * inv_sum, a1 * inv_sum));
+    }}
+}}
+",
+        d2 = d / 2,
+        d4 = d / 8,
+        rep = nqh / nkvh,
+        krow = "row4",
+    )
+}
+
 /// `silu_mul_split_f16` — `gu` holds `[gate | up]` per row.  The reference's
 /// approx exp is `ex2.approx(x * log2(e))`, so `exp2` is used rather than `exp`.
 pub fn silu_mul_split(inter: usize) -> String {
@@ -1270,6 +2216,51 @@ fn silu_mul_split(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let sx = 1.0 / (1.0 + exp2(-gv.x * LOG2E));
     let sy = 1.0 / (1.0 + exp2(-gv.y * LOG2E));
     Out[i] = pack2x16float(vec2<f32>(gv.x * sx * uv.x, gv.y * sy * uv.y));
+}}
+",
+        log2e = format_f32(LOG2_E),
+    )
+}
+
+/// [`silu_mul_split`] over `batch` sequences in one dispatch, `wgid.z` = slot.
+///
+/// `Gu` and `Out` are `[slot, ...]` rows of one allocation: the slot is added to
+/// both addresses, and the element's own arithmetic (`pack2x16float(gv * s * uv)`
+/// with the same approx exp) is untouched.
+pub fn silu_mul_split_slots(inter: usize) -> String {
+    assert!(inter % 2 == 0);
+    let inter2 = inter / 2;
+    let threads = 256usize;
+    format!(
+        "enable wgpu_binding_array;
+/// naga requires the binding-array element to be a struct; one struct per word
+/// shape keeps the bodies the same `array<...>` the lone kernels use.
+struct Arr4  {{ v: array<vec4<u32>> }};
+struct Arr32 {{ v: array<u32> }};
+@group(0) @binding(0) var<storage, read>       Gu:  binding_array<Arr32, 32>;
+@group(0) @binding(1) var<storage, read_write> Out: binding_array<Arr32, 32>;
+/// Group 1: wgpu refuses a bind group that mixes a binding array with a uniform.
+@group(1) @binding(0) var<uniform>             cfg: Cfg;
+
+struct Cfg {{ inter2: u32, total2: u32, gx: u32, _b: u32 }};
+
+const INTER2: u32 = {inter2}u;
+const LOG2E: f32 = {log2e};
+const THREADS: u32 = {threads}u;
+
+@compute @workgroup_size({threads})
+fn silu_mul_split_slots(@builtin(workgroup_id) wgid: vec3<u32>,
+                        @builtin(global_invocation_id) gid: vec3<u32>) {{
+    let i = gid.x + gid.y * (cfg.gx * THREADS);
+    if (i >= cfg.total2) {{ return; }}
+    let row = i / cfg.inter2;
+    let c = i - row * cfg.inter2;
+    let base = row * cfg.inter2 * 2u;
+    let gv = unpack2x16float(Gu[wgid.z].v[base + c]);
+    let uv = unpack2x16float(Gu[wgid.z].v[base + cfg.inter2 + c]);
+    let sx = 1.0 / (1.0 + exp2(-gv.x * LOG2E));
+    let sy = 1.0 / (1.0 + exp2(-gv.y * LOG2E));
+    Out[wgid.z].v[i] = pack2x16float(vec2<f32>(gv.x * sx * uv.x, gv.y * sy * uv.y));
 }}
 ",
         log2e = format_f32(LOG2_E),

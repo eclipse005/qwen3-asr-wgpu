@@ -446,6 +446,48 @@ impl AsrInference {
     /// Returns the parsed transcript plus the language — either the one the
     /// model named in its output, or, when the caller forced one, the caller's
     /// (see [`TranscribeOptions::language`]).
+    /// Transcribe `wavs` with `batch` sequences decoding at a time.
+    ///
+    /// `batch = 1` is the shipped single-sequence path.  `batch > 1` decodes
+    /// several segments together: the projections read their weights once for the
+    /// whole batch, which is where the throughput comes from.  The transcripts are
+    /// identical to calling [`Self::transcribe`] on each file -- the batch only
+    /// changes when a dispatch reaches the GPU, never what it computes.
+    ///
+    /// Requires the GPU text decoder and `seq + max_new <= 1024` per segment
+    /// (the single-block attention path).
+    pub fn transcribe_wavs_batch(
+        &self,
+        wavs: &[std::path::PathBuf],
+        opts: &TranscribeOptions,
+        batch: usize,
+    ) -> crate::Result<Vec<TranscribeResult>> {
+        let mut g = self.lock()?;
+        g.transcribe_wavs_batch_inner(
+            wavs,
+            opts.max_new_tokens,
+            opts,
+            batch,
+            &mut BatchTimings::default(),
+        )
+        .map_err(crate::AsrError::Inference)
+    }
+
+    /// [`Self::transcribe_wavs_batch_inner`] with a phase breakdown.
+    pub fn transcribe_wavs_batch_timed(
+        &self,
+        wavs: &[std::path::PathBuf],
+        opts: &TranscribeOptions,
+        batch: usize,
+    ) -> crate::Result<(Vec<TranscribeResult>, BatchTimings)> {
+        let mut t = BatchTimings::default();
+        let mut g = self.lock()?;
+        let out = g
+            .transcribe_wavs_batch_inner(wavs, opts.max_new_tokens, opts, batch, &mut t)
+            .map_err(crate::AsrError::Inference)?;
+        Ok((out, t))
+    }
+
     pub fn transcribe(
         &self,
         audio_path: &str,
@@ -583,6 +625,82 @@ pub(crate) fn with_forced_language(
     }
     r
 }
+
+/// Fill every free slot from the frontier, in **one** batched prefill.
+///
+/// The projections are row-independent, so the segments admitted together go
+/// through one GEMM per layer ([`crate::decoder::prefill_batch`]); only their
+/// attention stays separate.  A slot is reused across admissions -- the next
+/// segment's prompt overwrites its own KV rows `0..len` and `pos` is set to
+/// `len`, so there is nothing to clear and no bind group to rebuild.
+#[allow(clippy::too_many_arguments)]
+fn fill_slots(
+    slots: &mut [WgpuTextDecoder],
+    active: &mut [Option<usize>],
+    frontier: &mut usize,
+    plans: &[(usize, Vec<u8>)],
+    order: &[usize],
+    gen: &mut [Vec<u32>],
+    stop: &mut [StopReason],
+    eos: &[i32; 2],
+    timings: &mut BatchTimings,
+) -> Result<()> {
+    loop {
+        let free: Vec<usize> = (0..slots.len()).filter(|&s| active[s].is_none()).collect();
+        let take = free.len().min(order.len() - *frontier);
+        if take == 0 {
+            return Ok(());
+        }
+        let segs: Vec<usize> = order[*frontier..*frontier + take].to_vec();
+        // `free` is ascending, so one pass over the slots hands out exactly the
+        // free ones and leaves the busy ones untouched.
+        let mut handles: Vec<&mut WgpuTextDecoder> = Vec::with_capacity(take);
+        {
+            let mut want = free[..take].iter().copied().peekable();
+            for (i, d) in slots.iter_mut().enumerate() {
+                if want.peek() == Some(&i) {
+                    handles.push(d);
+                    want.next();
+                }
+            }
+        }
+        let batch: Vec<(usize, &[u8])> =
+            segs.iter().map(|&g| (plans[g].0, plans[g].1.as_slice())).collect();
+        let t0 = std::time::Instant::now();
+        let firsts = crate::decoder::prefill_batch(&mut handles, &batch)?;
+        timings.prefill += t0.elapsed();
+        drop(handles);
+        for (k, (&s, &g)) in free[..take].iter().zip(segs.iter()).enumerate() {
+            let d = &mut slots[s];
+            d.pos = plans[g].0;
+            if eos.contains(&firsts[k]) {
+                stop[g] = StopReason::Eos;
+            } else {
+                gen[g].push(firsts[k] as u32);
+                d.set_input_token(firsts[k]);
+                active[s] = Some(g);
+            }
+        }
+        *frontier += take;
+    }
+}
+
+/// Where the wall clock of a batched transcription goes.
+///
+/// The phases are sequential and each waits for the previous one -- mel on
+/// the CPU, then the audio encoder, then the decoder's prefill, then the
+/// batched decode -- so this split is what says which phase is worth
+/// batching across segments (`mel`/`encoder`/`prefill` are still per segment).
+///
+/// Filled by [`Self::transcribe_wavs_batch_timed`].
+#[derive(Default, Debug, Clone, Copy)]
+pub struct BatchTimings {
+    pub mel: std::time::Duration,
+    pub encoder: std::time::Duration,
+    pub prefill: std::time::Duration,
+    pub decode: std::time::Duration,
+}
+
 
 impl Inner {
     pub fn load_with_selector(
@@ -1329,6 +1447,56 @@ impl Inner {
         Ok(embeds)
     }
 
+    /// [`Self::run_encoder`] for a whole list, one transformer pass per group.
+    ///
+    /// The encoder's windows never cross an utterance boundary, so a group's
+    /// tokens can share one pass ([`crate::audio_encoder_gpu::GpuAudioEncoder::encode_batch`]).
+    /// Groups are bounded by `MAX_TOKENS` and by a slot-sized count: the pass'
+    /// scratch grows with the token count, not with the group size.
+    pub(crate) fn run_encoder_batch(
+        &mut self,
+        mels: &[(Vec<f32>, usize, usize)],
+    ) -> Result<Vec<Vec<f32>>> {
+        if !matches!(self.decoder, TextBackend::Gpu(_)) || self.gpu_encoder.is_none() {
+            return mels
+                .iter()
+                .map(|(mel, nm, nf)| self.cpu_tower()?.forward(mel, *nm, *nf))
+                .collect();
+        }
+        // The encoder's own ceiling is 16384 tokens of scratch; stop short of it
+        // so a group never fails the encoder's own check.
+        const GROUP_TOKENS: usize = 14336;
+        let mut out = Vec::with_capacity(mels.len());
+        let mut i = 0usize;
+        while i < mels.len() {
+            // Grow the group until the token budget or the utterance count says
+            // stop; `encode_batch` lays the group out and runs one pass.
+            let mut j = i;
+            let mut tokens = 0usize;
+            while j < mels.len() && j - i < 16 {
+                let (_mel, _nm, nf) = &mels[j];
+                let est = (*nf / 100 + 1) * 13;
+                if j > i && tokens + est > GROUP_TOKENS {
+                    break;
+                }
+                tokens += est;
+                j += 1;
+            }
+            let group: Vec<(&[f32], usize, usize)> =
+                mels[i..j].iter().map(|(m, nm, nf)| (m.as_slice(), *nm, *nf)).collect();
+            let TextBackend::Gpu(dec) = &self.decoder else {
+                unreachable!("checked above")
+            };
+            let enc = self.gpu_encoder.as_mut().expect("checked above");
+            let embs = enc.encode_batch(&dec.gpu, &group)?;
+            for e in embs {
+                out.push(e.iter().map(|v| v.to_f32()).collect());
+            }
+            i = j;
+        }
+        Ok(out)
+    }
+
     pub fn transcribe_from_embeds(
         &mut self,
         audio_embeds: &[f32],
@@ -1436,6 +1604,222 @@ impl Inner {
             std::fs::write(dir.join("gen_ids.txt"), ids)?;
         }
         prompt::decode_result(&self.tokenizer, &gen.ids, gen.stop_reason)
+    }
+
+    /// Encode `wavs` and decode them `batch` at a time.
+    ///
+    /// The audio tower and the prefill stay per segment; what is shared is the
+    /// decode: `batch` segments fill one [`SlotPool`](crate::decoder::SlotPool),
+    /// and every projection reads its weight once for all of them.  The token
+    /// streams are the ones the b=1 path produces -- the batch only changes when
+    /// a dispatch reaches the GPU (see [`crate::decoder::BatchProjections`]).
+    pub(crate) fn transcribe_wavs_batch_inner(
+        &mut self,
+        wavs: &[std::path::PathBuf],
+        max_new_tokens: usize,
+        opts: &TranscribeOptions,
+        batch: usize,
+        t: &mut BatchTimings,
+    ) -> Result<Vec<TranscribeResult>> {
+        // Every mel first, then every encoder: the encoder's transformer takes a
+        // group as one pass, so it must not be called per segment.
+        let mut mels = Vec::with_capacity(wavs.len());
+        for w in wavs {
+            let t0 = std::time::Instant::now();
+            let samples = crate::mel::load_audio_wav(w, MEL_SAMPLE_RATE)?;
+            let (mel, n_mels, n_frames) = self.mel.extract(&samples)?;
+            t.mel += t0.elapsed();
+            mels.push((mel, n_mels, n_frames));
+        }
+        let t0 = std::time::Instant::now();
+        let embeds = self.run_encoder_batch(&mels)?;
+        t.encoder += t0.elapsed();
+        self.decode_batch_embeds(&embeds, max_new_tokens, opts, batch, t)
+    }
+
+    /// The decode half of [`Self::transcribe_wavs_batch_inner`].
+    pub(crate) fn decode_batch_embeds(
+        &mut self,
+        embeds: &[Vec<f32>],
+        max_new_tokens: usize,
+        opts: &TranscribeOptions,
+        batch: usize,
+        t: &mut BatchTimings,
+    ) -> Result<Vec<TranscribeResult>> {
+        use crate::decoder::{BatchProjections, WgpuTextDecoder};
+        let hs = self.config.thinker_config.text_config.hidden_size;
+        let language = opts.forced_language()?;
+        let eos = [ENDOFTEXT_TOKEN_ID as i32, IM_END_TOKEN_ID as i32];
+        let batch = batch.max(1);
+        let mut out: Vec<Option<TranscribeResult>> = (0..embeds.len()).map(|_| None).collect();
+        if embeds.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Prompt + hidden rows for every segment, once: admission below only
+        // picks the next one.
+        let et = self
+            .tensors
+            .get("thinker.model.embed_tokens.weight")
+            .ok_or_else(|| anyhow::anyhow!("missing embed table"))?;
+        let mut plans: Vec<(usize, Vec<u8>)> = Vec::with_capacity(embeds.len());
+        for emb in embeds {
+            let nat = emb.len() / hs;
+            let (input_ids, asp) = prompt::build_prompt(
+                &self.tokenizer,
+                self.config.thinker_config.audio_start_token_id,
+                self.config.thinker_config.audio_token_id,
+                self.config.thinker_config.audio_end_token_id,
+                nat,
+                language.as_deref(),
+                &opts.context,
+                None,
+            )?;
+            let mut hidden: Vec<u8> = Vec::with_capacity(input_ids.len() * hs * 2);
+            for &id in &input_ids[..asp] {
+                et.append_f16_row_le(id as usize, hs, &mut hidden)?;
+            }
+            for v in emb {
+                hidden.extend_from_slice(&f16::from_f32(*v).to_le_bytes());
+            }
+            for &id in &input_ids[asp + nat..] {
+                et.append_f16_row_le(id as usize, hs, &mut hidden)?;
+            }
+            anyhow::ensure!(hidden.len() == input_ids.len() * hs * 2, "hidden size");
+            plans.push((input_ids.len(), hidden));
+        }
+
+        // A batched slot's attention is the decode kernel, which is bounded by
+        // `GQA_SINGLE_CAP`; a segment whose prompt plus generation does not fit
+        // is decoded by the shipped path instead of failing the whole set.  With
+        // `max_new` at 256 that leaves ~60 s of audio per segment, which is what
+        // the VAD pipeline targets anyway.
+        let step = crate::decoder::KV_STEP;
+        let fits = |len: usize| {
+            (len + max_new_tokens + 8).div_ceil(step) * step <= crate::decoder::BATCH_SEQ_CAP
+        };
+        let (long, batchable): (Vec<usize>, Vec<usize>) =
+            (0..plans.len()).partition(|&i| !fits(plans[i].0));
+        if std::env::var("QASR_BATCH_DEBUG").is_ok() {
+            eprintln!(
+                "[batch] segments={} long={} batchable={} max_len_batchable={}",
+                plans.len(),
+                long.len(),
+                batchable.len(),
+                batchable.iter().map(|&i| plans[i].0).max().unwrap_or(0)
+            );
+        }
+        if !long.is_empty() {
+            let t0 = std::time::Instant::now();
+            for &i in &long {
+                let gen = self.generate_from_embeds(&embeds[i], max_new_tokens, opts, None)?;
+                out[i] = Some(prompt::decode_result(&self.tokenizer, &gen.ids, gen.stop_reason)?);
+            }
+            t.decode += t0.elapsed();
+        }
+
+        // Fewer than two slots means there is nothing to share a weight read
+        // with, so the shipped single-sequence path is the right one (and the
+        // same arithmetic).
+        let nslots = batch.min(batchable.len());
+        if nslots < 2 {
+            let t0 = std::time::Instant::now();
+            for &i in &batchable {
+                let gen = self.generate_from_embeds(&embeds[i], max_new_tokens, opts, None)?;
+                out[i] = Some(prompt::decode_result(&self.tokenizer, &gen.ids, gen.stop_reason)?);
+            }
+            t.decode += t0.elapsed();
+            return Ok(out.into_iter().map(|r| r.expect("every segment filled")).collect());
+        }
+
+        // One capacity for every slot, rounded here rather than left to
+        // `ensure_capacity`: the batched kernels take `max_seq` from a single
+        // uniform, so a slot that rounded further would put its K rows where its
+        // neighbours do not look.
+        let seq_max = batchable.iter().map(|&i| plans[i].0).max().unwrap_or(0);
+        let step = crate::decoder::KV_STEP;
+        let cap = (seq_max + max_new_tokens + 8).div_ceil(step) * step;
+        anyhow::ensure!(
+            cap <= crate::decoder::BATCH_SEQ_CAP,
+            "batch decode needs seq + max_new <= {} (got {cap}); use shorter segments",
+            crate::decoder::BATCH_SEQ_CAP
+        );
+
+        let mut slots: Vec<WgpuTextDecoder> = {
+            let base = match &self.decoder {
+                TextBackend::Gpu(d) => d,
+                TextBackend::Cpu(_) => anyhow::bail!("batch decode needs the GPU decoder"),
+            };
+            (0..nslots)
+                .map(|_| base.fork_capped(cap))
+                .collect::<Result<_>>()?
+        };
+        let mut gen: Vec<Vec<u32>> = vec![Vec::new(); plans.len()];
+        let mut stop: Vec<StopReason> = vec![StopReason::MaxTokens; plans.len()];
+        // Which segment each slot is decoding, if any.
+        let mut active: Vec<Option<usize>> = vec![None; nslots];
+        let mut frontier = 0usize;
+
+        // Longest prompt first.  The step cost is the weight stream, not the
+        // number of live slots, so a batch whose slots finish together is what
+        // makes `b` pay; admitting in arrival order leaves the last slots doing
+        // short segments alone at full step cost.  Prompt length is the audio
+        // token count plus a fixed prefix, i.e. the best predictor of how long a
+        // slot will stay busy.
+        let order: Vec<usize> = {
+            let mut o = batchable.clone();
+            o.sort_by_key(|&i| std::cmp::Reverse(plans[i].0));
+            o
+        };
+        let fill = |slots: &mut [WgpuTextDecoder],
+                        active: &mut [Option<usize>],
+                        frontier: &mut usize,
+                        gen: &mut [Vec<u32>],
+                        stop: &mut [StopReason],
+                        t: &mut BatchTimings|
+         -> Result<()> {
+            fill_slots(slots, active, frontier, &plans, &order, gen, stop, &eos, t)
+        };
+
+        let t0 = std::time::Instant::now();
+        fill(&mut slots, &mut active, &mut frontier, &mut gen, &mut stop, t)?;
+        if active.iter().any(Option::is_some) {
+            // Built once for the whole run: the slots keep their buffers for the
+            // entire job, so their bind groups stay valid across admissions.
+            let proj = BatchProjections::new(&slots)?;
+            loop {
+                let toks = proj.step(&mut slots)?;
+                for s in 0..nslots {
+                    let Some(seg) = active[s] else { continue };
+                    let tok = toks[s];
+                    if eos.contains(&tok) {
+                        stop[seg] = StopReason::Eos;
+                        active[s] = None;
+                    } else if gen[seg].len() >= max_new_tokens {
+                        stop[seg] = StopReason::MaxTokens;
+                        active[s] = None;
+                    } else {
+                        gen[seg].push(tok as u32);
+                        slots[s].set_input_token(tok);
+                    }
+                    if active[s].is_none() {
+                        fill(&mut slots, &mut active, &mut frontier, &mut gen, &mut stop, t)?;
+                    }
+                }
+                if active.iter().all(Option::is_none) {
+                    break;
+                }
+            }
+        }
+        t.decode += t0.elapsed();
+
+        // Only the segments that went through a slot: the ones the batched path
+        // could not hold were already decoded above, and their `gen` entry is
+        // empty -- overwriting them here would erase a correct transcript.
+        for &i in &order {
+            out[i] = Some(prompt::decode_result(&self.tokenizer, &gen[i], stop[i])?);
+        }
+        Ok(out.into_iter().map(|r| r.expect("every segment filled")).collect())
     }
 
     pub(crate) fn generate_from_embeds(

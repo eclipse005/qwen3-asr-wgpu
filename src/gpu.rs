@@ -9,6 +9,21 @@ pub struct Gpu {
     pub features: wgpu::Features,
 }
 
+/// A handle clone, not a second device: `wgpu::Device`/`Queue` are `Arc` inside,
+/// so a cloned `Gpu` owns the same device.  Batch slots need this to build a
+/// decoder that shares the first one's device without re-opening it.
+impl Clone for Gpu {
+    fn clone(&self) -> Self {
+        Self {
+            device: self.device.clone(),
+            queue: self.queue.clone(),
+            info: self.info.clone(),
+            limits: self.limits.clone(),
+            features: self.features,
+        }
+    }
+}
+
 /// Which device to run on.
 ///
 /// One binary, several devices is the whole point of the port, so the choice is
@@ -467,11 +482,18 @@ impl Gpu {
             match adapter
                 .request_device(&wgpu::DeviceDescriptor {
                     label: Some("qwen3-asr-wgpu"),
+                    // `BUFFER_BINDING_ARRAY` is what lets one batched dispatch
+                    // reach every slot's own buffer (`Xs[wgid.z]`) instead of
+                    // packing the slots into one allocation and re-deriving a
+                    // stride in every kernel -- see `shaders::gemv_batch_slots`.
                     required_features: features
                         & (wgpu::Features::TIMESTAMP_QUERY
                             | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
                             | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
-                            | wgpu::Features::SUBGROUP),
+                            | wgpu::Features::SUBGROUP
+                            | wgpu::Features::BUFFER_BINDING_ARRAY
+                            | wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY
+                            | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING),
                     required_limits: limits.clone(),
                     ..Default::default()
                 })
@@ -586,6 +608,40 @@ impl Gpu {
     /// Start a bulk upload session (load-time weight transfer).
     pub fn uploader(&self) -> BulkUpload<'_> {
         BulkUpload { gpu: self, pending: 0 }
+    }
+
+    /// [`Self::readback`] from a byte offset: a batched caller can pull one
+    /// item's rows out of a shared buffer without moving the rest.
+    pub fn readback_at(&self, buf: &wgpu::Buffer, offset: u64, bytes: u64) -> Result<Vec<u8>> {
+        Ok(self.readback_span(buf, offset, bytes)?.0)
+    }
+
+    /// [`Self::readback`] plus the offset it started at, so a caller that reads
+    /// several spans can hand them out in order.
+    fn readback_span(&self, buf: &wgpu::Buffer, offset: u64, bytes: u64) -> Result<(Vec<u8>, u64)> {
+        let size = (bytes + 3) & !3;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback_at"),
+            size: size.max(4),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(buf, offset, &staging, 0, size.max(4));
+        self.queue.submit([enc.finish()]);
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device.poll(wgpu::PollType::wait_indefinitely())?;
+        rx.recv()??;
+        let out = {
+            let d = slice.get_mapped_range()?;
+            d[..bytes as usize].to_vec()
+        };
+        staging.unmap();
+        Ok((out, offset))
     }
 
     pub fn readback(&self, buf: &wgpu::Buffer, bytes: u64) -> Result<Vec<u8>> {

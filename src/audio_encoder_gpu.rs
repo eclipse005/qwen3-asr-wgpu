@@ -380,6 +380,8 @@ pub struct AttnShot {
 /// vectors mean "not captured".
 #[derive(Default)]
 pub struct Capture {
+    /// Tokens this utterance produced (what `conv_into` reports back).
+    pub conv_tokens: usize,
     pub rounds: Vec<ConvRound>,
     /// The first 64 mel halves and the first 72 taps of each level.
     pub mel_head: Vec<f16>,
@@ -566,6 +568,31 @@ struct LayerCtx<'a> {
     kt: &'a wgpu::Buffer,
     vp: &'a wgpu::Buffer,
     attn_out: &'a wgpu::Buffer,
+}
+
+/// Every buffer one transformer pass reads or writes, sized by *its* `s_pad`.
+///
+/// The conv stem and the transformer meet here: the batched encoder runs the conv
+/// per utterance (it is per-utterance work anyway) and then a single transformer
+/// pass over all of their token blocks, which is where the GEMMs get their rows.
+struct XfBufs<'a> {
+    h: &'a wgpu::Buffer,
+    normed: &'a wgpu::Buffer,
+    norm2: &'a wgpu::Buffer,
+    qkv: &'a wgpu::Buffer,
+    q: &'a wgpu::Buffer,
+    k: &'a wgpu::Buffer,
+    v: &'a wgpu::Buffer,
+    attn_flat: &'a wgpu::Buffer,
+    qp: &'a wgpu::Buffer,
+    kt: &'a wgpu::Buffer,
+    vp: &'a wgpu::Buffer,
+    scores: &'a wgpu::Buffer,
+    attn: &'a wgpu::Buffer,
+    attn_out: &'a wgpu::Buffer,
+    gu: &'a wgpu::Buffer,
+    act: &'a wgpu::Buffer,
+    out_emb: &'a wgpu::Buffer,
 }
 
 impl GpuAudioEncoder {
@@ -890,6 +917,12 @@ impl GpuAudioEncoder {
     /// the host.  `cap` forces a submit+poll per readback, so it is a
     /// diagnostic path only: the production call passes `None` and runs a whole
     /// round — and then the transformer — without a host round trip.
+    /// How far [`Self::encode_capture`] runs.
+    ///
+    /// `ConvInto` stops after the conv stem and appends the utterance's token
+    /// rows to the given buffer: that is what lets several utterances share one
+    /// transformer pass (their windows never span a boundary, so the arithmetic
+    /// per token does not change).
     pub fn encode_capture(
         &mut self,
         gpu: &Gpu,
@@ -897,6 +930,165 @@ impl GpuAudioEncoder {
         n_mels: usize,
         n_frames: usize,
         capture: bool,
+    ) -> Result<Capture> {
+        self.encode_stage(gpu, mel, n_mels, n_frames, capture, None)
+    }
+
+    /// Run the conv stem for one utterance and append its token rows to `dst`
+    /// starting at row `dst_row`, returning the token count.
+    ///
+    /// The rows written are exactly the ones the transformer would have read for
+    /// this utterance alone; the caller pads the block up to a whole number of
+    /// attention windows so a shared pass cannot mix two utterances.
+    pub fn encode_conv_into(
+        &mut self,
+        gpu: &Gpu,
+        dst: &wgpu::Buffer,
+        dst_row: usize,
+        mel: &[f32],
+        n_mels: usize,
+        n_frames: usize,
+    ) -> Result<usize> {
+        let c = self.encode_stage(gpu, mel, n_mels, n_frames, false, Some((dst, dst_row)))?;
+        Ok(c.conv_tokens)
+    }
+
+    /// Encode several utterances with **one** transformer pass.
+    ///
+    /// The two halves of the encoder want different shapes, exactly like the
+    /// decoder's prefill:
+    ///
+    /// * the **conv stem** is per utterance (its im2col is chunk-indexed by that
+    ///   utterance's mel), so it runs once per utterance as before;
+    /// * the **transformer** attends inside windows of `wlen` tokens and its
+    ///   projections are row-independent, so laying the utterances out
+    ///   back-to-back -- each block padded up to a whole number of windows --
+    ///   makes one pass compute per token what a lone pass computes.  A window
+    ///   never spans a block boundary, which is what keeps the arithmetic
+    ///   identical rather than merely close.
+    ///
+    /// The embeddings come back per utterance, `n_total_i * out_dim` each.
+    pub fn encode_batch(
+        &mut self,
+        gpu: &Gpu,
+        utts: &[(&[f32], usize, usize)],
+    ) -> Result<Vec<Vec<f16>>> {
+        if utts.is_empty() {
+            return Ok(Vec::new());
+        }
+        if utts.len() == 1 {
+            let (mel, n_mels, n_frames) = utts[0];
+            return Ok(vec![self.encode(gpu, mel, n_mels, n_frames)?]);
+        }
+
+        let (cs, tpc) = (self.cs, self.tpc);
+        let dm = self.d_model;
+        let out_dim = self.out_dim;
+        let wlen = tpc * (self.window_infer / cs);
+        anyhow::ensure!(wlen > 0, "encoder window is empty");
+
+        // Tokens per utterance, then the layout: every block is rounded up to a
+        // whole number of attention windows.
+        let lens: Vec<usize> = utts
+            .iter()
+            .map(|&(_, n_mels, n_frames)| {
+                anyhow::ensure!(n_mels == self.n_mels, "mel bins {n_mels} != {}", self.n_mels);
+                let nfull = n_frames / cs;
+                let tail = n_frames % cs;
+                let n_chunks = nfull + usize::from(tail > 0);
+                anyhow::ensure!(n_chunks > 0, "empty mel");
+                let n: usize = (0..n_chunks)
+                    .map(|i| if i < nfull { tpc } else { feo(tail) })
+                    .sum();
+                Ok(n)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut row0 = Vec::with_capacity(lens.len());
+        let mut acc = 0usize;
+        for &n in &lens {
+            row0.push(acc);
+            acc += n.div_ceil(wlen) * wlen;
+        }
+        let s_total = acc;
+        anyhow::ensure!(s_total <= MAX_TOKENS, "batch needs {s_total} tokens > {MAX_TOKENS}");
+        let s_pad = align(s_total, GEMM_BM);
+        let n_win = s_total / wlen;
+        let geom = Geom { s: s_total, wlen, n_win };
+
+        let (nh, hd, inter, acols) = (self.nh, self.hd, self.inter, self.attn_cols);
+        let qkv_cols = align(3 * dm, GEMM_BM);
+        let inter_pad = align(inter, GEMM_BM);
+        let gu_pad = align(2 * inter, GEMM_BM);
+        let hd_pad = align(hd, GEMM_BN);
+        let wpad = align(wlen, GEMM_BM);
+        let z_blocks = nh * n_win;
+        let words = |n: usize| (n / 2 * 4) as u64;
+
+        // Zero-filled by construction, so the rows between a block's last token
+        // and its window boundary are the zeros a lone run's tail would be.
+        let h = gpu.storage("encb.h", words(s_pad * dm));
+        let normed = gpu.storage("encb.normed", words(s_pad * dm));
+        let norm2 = gpu.storage("encb.norm2", words(s_pad * dm));
+        let qkv = gpu.storage("encb.qkv", words(s_pad * qkv_cols));
+        let q_buf = gpu.storage("encb.q", words(s_pad * acols));
+        let k_buf = gpu.storage("encb.k", words(s_pad * acols));
+        let v_buf = gpu.storage("encb.v", words(s_pad * acols));
+        let attn_flat = gpu.storage("encb.attn_flat", words(s_pad * acols));
+        let qp = gpu.storage("encb.qp", (z_blocks * wpad * hd * 2) as u64);
+        let kt = gpu.storage("encb.kt", (z_blocks * hd * wpad * 2) as u64);
+        let vp = gpu.storage("encb.vp", (z_blocks * wpad * hd_pad * 2) as u64);
+        let scores = gpu.storage("encb.scores", (z_blocks * wpad * wpad * 2) as u64);
+        let attn = gpu.storage("encb.attn", (z_blocks * wpad * wpad * 2) as u64);
+        let attn_out = gpu.storage("encb.attn_out", (z_blocks * wpad * hd_pad * 2) as u64);
+        let gu = gpu.storage("encb.gu", words(s_pad * gu_pad));
+        let gact = gpu.storage("encb.gact", words(s_pad * inter_pad));
+        let out_emb = gpu.storage("encb.out", words(s_pad * out_dim));
+
+        // The conv stem, one utterance at a time, straight into its block.
+        for (i, &(mel, n_mels, n_frames)) in utts.iter().enumerate() {
+            let got = self.encode_conv_into(gpu, &h, row0[i], mel, n_mels, n_frames)?;
+            anyhow::ensure!(got == lens[i], "conv produced {got} tokens, planned {}", lens[i]);
+        }
+
+        let b = XfBufs {
+            h: &h,
+            normed: &normed,
+            norm2: &norm2,
+            qkv: &qkv,
+            q: &q_buf,
+            k: &k_buf,
+            v: &v_buf,
+            attn_flat: &attn_flat,
+            qp: &qp,
+            kt: &kt,
+            vp: &vp,
+            scores: &scores,
+            attn: &attn,
+            attn_out: &attn_out,
+            gu: &gu,
+            act: &gact,
+            out_emb: &out_emb,
+        };
+        self.xf_forward(gpu, &b, geom, s_pad, false, &mut Capture::default())?;
+
+        // One readback per utterance, from its own rows.
+        let mut out = Vec::with_capacity(utts.len());
+        for (i, &n) in lens.iter().enumerate() {
+            let off = (row0[i] * out_dim * 2) as u64;
+            let bytes = gpu.readback_at(&out_emb, off, (n * out_dim * 2) as u64)?;
+            out.push(bytes.chunks_exact(2).map(|c| f16::from_le_bytes([c[0], c[1]])).collect());
+        }
+        Ok(out)
+    }
+
+    fn encode_stage(
+        &mut self,
+        gpu: &Gpu,
+        mel: &[f32],
+        n_mels: usize,
+        n_frames: usize,
+        capture: bool,
+        conv_into: Option<(&wgpu::Buffer, usize)>,
     ) -> Result<Capture> {
         let t_all = std::time::Instant::now();
         anyhow::ensure!(n_mels == self.n_mels, "mel bins {n_mels} != {}", self.n_mels);
@@ -982,6 +1174,25 @@ impl GpuAudioEncoder {
             );
         }
 
+        let xb = XfBufs {
+            h: &h_buf,
+            normed: &normed,
+            norm2: &norm2,
+            qkv: &qkv,
+            q: &q_buf,
+            k: &k_buf,
+            v: &v_buf,
+            attn_flat: &attn_flat,
+            qp: &qp,
+            kt: &kt,
+            vp: &vp,
+            scores: &scores,
+            attn: &attn,
+            attn_out: &attn_out,
+            gu: &gu,
+            act: &gact,
+            out_emb: &out_emb,
+        };
         let mut out = Capture::default();
         let t_conv = std::time::Instant::now();
 
@@ -1004,10 +1215,12 @@ impl GpuAudioEncoder {
             if capture {
                 self.capture_round(gpu, &mut enc, &mut out, ch0, n, &mel_buf)?;
             } else {
+                // Submit only: the rounds reuse the same activation buffers, and
+                // the queue already orders this round's writes after the last
+                // one's reads.  Waiting for idle here cost ~60 ms per utterance
+                // (the trace's `host encode: wait`) and stopped the host from
+                // queueing the next round while the GPU was busy.
                 gpu.queue.submit([enc.finish()]);
-                gpu.device
-                    .poll(wgpu::PollType::wait_indefinitely())
-                    .map_err(|e| anyhow::anyhow!("audio encoder: device lost in conv round {ch0}: {e:?}"))?;
             }
             ch0 += n;
         }
@@ -1020,11 +1233,30 @@ impl GpuAudioEncoder {
         );
         self.add_pe(gpu, &mut enc, &h_raw, &h_buf, s_pad);
         gpu.queue.submit([enc.finish()]);
-        gpu.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| anyhow::anyhow!("audio encoder: device lost after conv_out: {e:?}"))?;
         if capture {
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| anyhow::anyhow!("audio encoder: device lost after conv_out: {e:?}"))?;
             out.h = read_f16_buf(gpu, &h_buf, s_pad * dm)?;
+        }
+        // The conv half on its own: hand the token rows to the shared buffer and
+        // stop.  The copy is ordered after `add_pe` by the queue, so no wait is
+        // needed; the rows past `n_total` stay zero (wgpu zero-fills buffers),
+        // which is what the shared pass expects between two utterances.
+        if let Some((dst, row)) = conv_into {
+            out.conv_tokens = n_total;
+            let mut enc = gpu.device.create_command_encoder(&Default::default());
+            enc.copy_buffer_to_buffer(
+                &h_buf,
+                0,
+                dst,
+                (row * dm * 2) as u64,
+                (n_total * dm * 2) as u64,
+            );
+            gpu.queue.submit([enc.finish()]);
+            ENC_MS.store((t_all.elapsed().as_secs_f64() * 1000.0) as u64, Ordering::Relaxed);
+            PACK_MS.store((t_pack.as_secs_f64() * 1000.0) as u64, Ordering::Relaxed);
+            return Ok(out);
         }
         // Phase split under `QASR_ENC_TRACE`: the conv rounds each end in a
         // submit + wait-for-idle, the whole transformer is one command buffer,
@@ -1035,6 +1267,60 @@ impl GpuAudioEncoder {
         HOST_REC_US.store(0, Ordering::Relaxed);
         HOST_WAIT_US.store(0, Ordering::Relaxed);
 
+        self.xf_forward(gpu, &xb, geom, s_pad, capture, &mut out)?;
+        let host_ms = 0.0f64;
+        let xf_ms = t_xf.elapsed().as_secs_f64() * 1000.0;
+        if enc_trace() {
+            eprintln!(
+                "enc trace: tokens={n_total} conv={conv_ms:.1}ms xf={xf_ms:.1}ms \
+                 (host encode {host_ms:.1}: wait {:.1}, passes {:.1}, bg {:.1}, device {:.1}) pack={:.2}ms",
+                HOST_WAIT_US.load(Ordering::Relaxed) as f64 / 1000.0,
+                HOST_REC_US.load(Ordering::Relaxed) as f64 / 1000.0,
+                HOST_BUILD_US.load(Ordering::Relaxed) as f64 / 1000.0,
+                xf_ms - host_ms,
+                t_pack.as_secs_f64() * 1000.0
+            );
+        }
+
+        let read_f16 = |buf: &wgpu::Buffer, n: usize| -> Result<Vec<f16>> {
+            let bytes = gpu.readback(buf, (n * 2) as u64)?;
+            Ok(bytes.chunks_exact(2).map(|c| f16::from_le_bytes([c[0], c[1]])).collect())
+        };
+        if capture {
+            out.packed = read_f16(&packed, s_pad * cf)?;
+        }
+        let mut embeds = read_f16(&out_emb, s_pad * out_dim)?;
+        embeds.truncate(n_total * out_dim);
+        out.embeds = embeds;
+        out.conv_tokens = n_total;
+
+        ENC_MS.store((t_all.elapsed().as_secs_f64() * 1000.0) as u64, Ordering::Relaxed);
+        PACK_MS.store((t_pack.as_secs_f64() * 1000.0) as u64, Ordering::Relaxed);
+        Ok(out)
+    }
+
+    /// The transformer + the projector over `b.h`, then the submit that finishes
+    /// them.
+    ///
+    /// One pass is one contiguous token range with `n_win` windows of `wlen`
+    /// tokens; the attention never crosses a window, so a range made of several
+    /// utterances -- each padded up to a whole number of windows -- computes per
+    /// token exactly what a lone run computes.
+    fn xf_forward(
+        &self,
+        gpu: &Gpu,
+        b: &XfBufs<'_>,
+        geom: Geom,
+        s_pad: usize,
+        capture: bool,
+        out: &mut Capture,
+    ) -> Result<()> {
+        let Geom { s: n_total, wlen, n_win } = geom;
+        let z_blocks = self.nh * n_win;
+        let (dm, nh, hd, inter, acols) =
+            (self.d_model, self.nh, self.hd, self.inter, self.attn_cols);
+        let qkv_cols = align(3 * dm, GEMM_BM);
+        let _ = (inter, qkv_cols);
         self.mid_capture.set(capture);
         self.gd_slot.set(0);
         let mut enc = gpu.device.create_command_encoder(&Default::default());
@@ -1042,22 +1328,22 @@ impl GpuAudioEncoder {
             geom,
             s_pad,
             acols,
-            h: &h_buf,
-            normed: &normed,
-            norm2: &norm2,
-            qkv: &qkv,
-            q: &q_buf,
-            k: &k_buf,
-            v: &v_buf,
-            scores: &scores,
-            attn: &attn,
-            attn_flat: &attn_flat,
-            gu: &gu,
-            act: &gact,
-            qp: &qp,
-            kt: &kt,
-            vp: &vp,
-            attn_out: &attn_out,
+            h: &b.h,
+            normed: &b.normed,
+            norm2: &b.norm2,
+            qkv: &b.qkv,
+            q: &b.q,
+            k: &b.k,
+            v: &b.v,
+            scores: &b.scores,
+            attn: &b.attn,
+            attn_flat: &b.attn_flat,
+            gu: &b.gu,
+            act: &b.act,
+            qp: &b.qp,
+            kt: &b.kt,
+            vp: &b.vp,
+            attn_out: &b.attn_out,
         };
         // These four uniforms are geometry-only: every layer writes the *same*
         // bytes, so writing them once instead of 14 times is 56 fewer
@@ -1131,7 +1417,7 @@ impl GpuAudioEncoder {
                     .poll(wgpu::PollType::wait_indefinitely())
                     .map_err(|e| anyhow::anyhow!("audio encoder: device lost after layer {li}: {e:?}"))?;
                 enc = gpu.device.create_command_encoder(&Default::default());
-                out.layers.push(read_f16_buf(gpu, &h_buf, s_pad * dm)?);
+                out.layers.push(read_f16_buf(gpu, &b.h, s_pad * dm)?);
                 if li == 0 {
                     let mid = self.mid_h.borrow_mut().take().unwrap_or_default();
                     let (wpad, hd_pad) = (align(wlen, GEMM_BM), align(hd, GEMM_BN));
@@ -1178,53 +1464,22 @@ impl GpuAudioEncoder {
             }
         }
         self.layernorm(gpu, &mut enc, ctx.h, &self.ln_post, ctx.normed, geom.s, "lnpost");
-        self.gemm(gpu, &mut enc, ctx.normed, &self.proj1.w, &gu, geom.s, self.proj1.n_pad, self.proj1.k, self.proj1.n_pad, None, "proj1");
+        self.gemm(gpu, &mut enc, ctx.normed, &self.proj1.w, &b.gu, geom.s, self.proj1.n_pad, self.proj1.k, self.proj1.n_pad, None, "proj1");
         self.bias_gelu_tensor(
-            gpu, &mut enc, &gu, &self.proj1.bias, &gact, &self.u_sc[4],
+            gpu, &mut enc, &b.gu, &self.proj1.bias, &b.act, &self.u_sc[4],
             s_pad * self.proj1.n_pad, self.proj1.n_pad / 2, false, "pgelu",
         );
         self.gemm(
-            gpu, &mut enc, &gact, &self.proj2.w, &out_emb, geom.s,
+            gpu, &mut enc, &b.act, &self.proj2.w, &b.out_emb, geom.s,
             self.proj2.n_pad, self.proj2.k, self.proj2.n_pad, Some(&self.proj2.bias), "proj2",
         );
 
         anyhow::ensure!(self.gd_slot.get() <= MAX_GEMMS, "{} GEMM slots > {MAX_GEMMS}", self.gd_slot.get());
-        // `t_xf` is wall clock, so it covers *encoding* the 14 layers as well as
-        // running them.  Splitting the two answers whether the transformer is
-        // slow on the device or starved by the host: every layer writes ~13
-        // uniforms and creates ~13 bind groups inside this window.
-        let host_ms = t_xf.elapsed().as_secs_f64() * 1000.0;
         gpu.queue.submit([enc.finish()]);
         gpu.device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| anyhow::anyhow!("audio encoder: device lost at readback: {e:?}"))?;
-        let xf_ms = t_xf.elapsed().as_secs_f64() * 1000.0;
-        if enc_trace() {
-            eprintln!(
-                "enc trace: tokens={n_total} conv={conv_ms:.1}ms xf={xf_ms:.1}ms \
-                 (host encode {host_ms:.1}: wait {:.1}, passes {:.1}, bg {:.1}, device {:.1}) pack={:.2}ms",
-                HOST_WAIT_US.load(Ordering::Relaxed) as f64 / 1000.0,
-                HOST_REC_US.load(Ordering::Relaxed) as f64 / 1000.0,
-                HOST_BUILD_US.load(Ordering::Relaxed) as f64 / 1000.0,
-                xf_ms - host_ms,
-                t_pack.as_secs_f64() * 1000.0
-            );
-        }
-
-        let read_f16 = |buf: &wgpu::Buffer, n: usize| -> Result<Vec<f16>> {
-            let bytes = gpu.readback(buf, (n * 2) as u64)?;
-            Ok(bytes.chunks_exact(2).map(|c| f16::from_le_bytes([c[0], c[1]])).collect())
-        };
-        if capture {
-            out.packed = read_f16(&packed, s_pad * cf)?;
-        }
-        let mut embeds = read_f16(&out_emb, s_pad * out_dim)?;
-        embeds.truncate(n_total * out_dim);
-        out.embeds = embeds;
-
-        ENC_MS.store((t_all.elapsed().as_secs_f64() * 1000.0) as u64, Ordering::Relaxed);
-        PACK_MS.store((t_pack.as_secs_f64() * 1000.0) as u64, Ordering::Relaxed);
-        Ok(out)
+        Ok(())
     }
 
     fn capture_round(

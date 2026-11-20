@@ -593,6 +593,35 @@ fn kv_bind_groups(
     k_cache: &wgpu::Buffer,
     v_cache: &wgpu::Buffer,
 ) -> (wgpu::BindGroup, wgpu::BindGroup, wgpu::BindGroup) {
+    kv_bind_groups_res(
+        gpu,
+        pipes,
+        scratch,
+        qn_w,
+        kn_w,
+        scratch.q_out.as_entire_binding(),
+        k_cache.as_entire_binding(),
+        v_cache.as_entire_binding(),
+        scratch.attn_out.as_entire_binding(),
+    )
+}
+
+/// [`kv_bind_groups`] with the four attention tensors given as binding
+/// resources, so a pooled slot can bind a `BufferBinding` slice of a shared
+/// allocation instead of a whole buffer.  Offsets of 0 with no size are the
+/// ordinary whole-buffer case.
+#[allow(clippy::too_many_arguments)]
+fn kv_bind_groups_res(
+    gpu: &Gpu,
+    pipes: &Pipes,
+    scratch: &Scratch,
+    qn_w: &wgpu::Buffer,
+    kn_w: &wgpu::Buffer,
+    q_out: wgpu::BindingResource<'_>,
+    k_cache: wgpu::BindingResource<'_>,
+    v_cache: wgpu::BindingResource<'_>,
+    attn_out: wgpu::BindingResource<'_>,
+) -> (wgpu::BindGroup, wgpu::BindGroup, wgpu::BindGroup) {
     let bg_extract = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("qkv_extract"),
         layout: &pipes.extract.get_bind_group_layout(0),
@@ -602,9 +631,9 @@ fn kv_bind_groups(
             wgpu::BindGroupEntry { binding: 2, resource: kn_w.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: scratch.cos.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: scratch.sin.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: scratch.q_out.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 6, resource: k_cache.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 7, resource: v_cache.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: q_out.clone() },
+            wgpu::BindGroupEntry { binding: 6, resource: k_cache.clone() },
+            wgpu::BindGroupEntry { binding: 7, resource: v_cache.clone() },
             wgpu::BindGroupEntry { binding: 8, resource: scratch.u_qkvx.as_entire_binding() },
         ],
     });
@@ -613,9 +642,9 @@ fn kv_bind_groups(
         layout: &pipes.gqa256.get_bind_group_layout(0),
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: scratch.q_out.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: k_cache.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: v_cache.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: scratch.attn_out.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: k_cache.clone() },
+            wgpu::BindGroupEntry { binding: 2, resource: v_cache.clone() },
+            wgpu::BindGroupEntry { binding: 3, resource: attn_out.clone() },
             wgpu::BindGroupEntry { binding: 4, resource: scratch.u_gqa.as_entire_binding() },
         ],
     });
@@ -624,8 +653,8 @@ fn kv_bind_groups(
         layout: &pipes.gqa_split256.get_bind_group_layout(0),
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: scratch.q_out.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: k_cache.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: v_cache.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: k_cache.clone() },
+            wgpu::BindGroupEntry { binding: 2, resource: v_cache.clone() },
             wgpu::BindGroupEntry { binding: 3, resource: scratch.split_part_out.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: scratch.split_part_max.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: scratch.split_part_sum.as_entire_binding() },
@@ -645,6 +674,45 @@ fn kv_bind_groups(
 /// crossover.
 pub const GQA_SINGLE_CAP: usize = 1024;
 
+/// Longest decode KV the batched path will allocate per slot.
+///
+/// The single attention kernel is capped at [`GQA_SINGLE_CAP`]; above that the
+/// batched step runs the same chunked pair + merge the shipped step picks, per
+/// slot.  What bounds this instead is memory: a slot's KV is
+/// `nkvh * cap * hd * 2 * 2` bytes per layer, i.e. ~470 MiB at 4096 over 28
+/// layers, and every slot holds one.
+pub const BATCH_SEQ_CAP: usize = 4096;
+
+/// One block of a decoder layer's dispatch sequence, in the order a step issues
+/// them.
+///
+/// The batch driver walks `LAYER_BLOCKS` outermost and slots innermost, so the
+/// weight tile one slot pulls into L2 is read by every other slot before the
+/// next block replaces it.  A slot's own order is unchanged — `encode_into` with
+/// `want = |_| true` issues exactly these seven blocks in this order — which is
+/// what keeps a batched token stream bit-identical to a lone one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerBlock {
+    Qkv,
+    Extract,
+    Gqa,
+    O,
+    Gu,
+    Silu,
+    Dp,
+}
+
+/// [`LayerBlock`] in issue order.
+pub const LAYER_BLOCKS: [LayerBlock; 7] = [
+    LayerBlock::Qkv,
+    LayerBlock::Extract,
+    LayerBlock::Gqa,
+    LayerBlock::O,
+    LayerBlock::Gu,
+    LayerBlock::Silu,
+    LayerBlock::Dp,
+];
+
 /// KV slots allocated at load (112 KiB each, see [`WgpuTextDecoder::load`]).
 ///
 /// `max_seq` is the ceiling, not the allocation: the cache grows from here on
@@ -654,7 +722,7 @@ pub const KV_INITIAL_CAP: usize = 1024;
 
 /// Capacity grows in multiples of this — a series of clips of one shape then
 /// allocates once and pays nothing after that.
-pub(crate) const KV_STEP: usize = 256;
+pub const KV_STEP: usize = 256;
 
 const SLAB_T: usize = 1024;
 
@@ -872,10 +940,14 @@ pub struct WgpuTextDecoder {
     pending: Option<wgpu::CommandBuffer>,
     /// The token map armed for the step in flight, taken by `take_token`.
     pending_map: Option<std::sync::mpsc::Receiver<anyhow::Result<()>>>,
+    /// KV and the two attention activations live in a [`SlotPool`] at a fixed
+    /// cap: growing them would move the rows out from under the shared buffer,
+    /// so [`Self::ensure_capacity`] is a no-op for a pooled slot.
+    pooled: bool,
 
     embed_table: wgpu::Buffer,
     layers: Vec<Layer>,
-    pipes: Pipes,
+    pipes: std::sync::Arc<Pipes>,
     /// The checkpoint quantized the decoder's linears (M3): the weights sit in
     /// VRAM as int8 with per-row scales, and every decode/prefill GEMV/GEMM
     /// dispatch goes through the `_w8` kernels.  `embed`/`lm_head` and the
@@ -1482,9 +1554,10 @@ impl WgpuTextDecoder {
             host_read_ms: 0.0,
             pending: None,
             pending_map: None,
+            pooled: false,
             embed_table,
             layers,
-            pipes,
+            pipes: std::sync::Arc::new(pipes),
             int8,
             scratch,
             bg_final_rms,
@@ -1529,6 +1602,11 @@ impl WgpuTextDecoder {
     /// ([`kv_bind_groups`]) are rebuilt; weights, pipelines and every other bind
     /// group stay where they are.
     pub fn ensure_capacity(&mut self, need: usize) -> usize {
+        // A pooled slot's KV rows are part of a shared allocation; reallocating
+        // here would silently unhook them from the batch.
+        if self.pooled {
+            return self.cap;
+        }
         let target = (need.div_ceil(KV_STEP) * KV_STEP).min(self.max_seq).max(self.cap);
         if target == self.cap {
             return self.cap;
@@ -1671,6 +1749,32 @@ impl WgpuTextDecoder {
         embed: bool,
         tail: bool,
     ) {
+        {
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            self.encode_into(&mut cp, pos, lo, hi, embed, tail, &|_| true);
+        }
+        if tail {
+            enc.copy_buffer_to_buffer(&self.scratch.token, 0, &self.scratch.token_staging, 0, 4);
+        }
+    }
+
+    /// This slice's dispatches into an already-open compute pass.
+    ///
+    /// [`Self::encode_step_slice`] is this plus the pass and the token copy, so
+    /// the b=1 path issues exactly the dispatches it always did.  The batch
+    /// driver needs the pass-level form: several slots' steps share one pass, so
+    /// the dispatches of layer `l` for every slot land next to each other and the
+    /// weights slot 0 pulls in are the ones the other slots find in L2.
+    pub fn encode_into<'pass>(
+        &'pass self,
+        cp: &mut wgpu::ComputePass<'pass>,
+        pos: usize,
+        lo: usize,
+        hi: usize,
+        embed: bool,
+        tail: bool,
+        want: &dyn Fn(LayerBlock) -> bool,
+    ) {
         let cfg = &self.cfg;
         let cur_len = pos + 1;
         let gemv_grid = |rows: usize| (rows / gemv_rpw()) as u32;
@@ -1685,8 +1789,6 @@ impl WgpuTextDecoder {
         let skip = std::env::var("QASR_SKIP").unwrap_or_default();
         let k = |name: &str| skip == name;
 
-        let mut cp = enc.begin_compute_pass(&Default::default());
-
         if embed {
             cp.set_pipeline(&self.pipes.embed);
             cp.set_bind_group(0, &self.bg_embed, &[]);
@@ -1694,7 +1796,7 @@ impl WgpuTextDecoder {
         }
 
         for l in &self.layers[lo..hi] {
-            if !k("qkv") {
+            if want(LayerBlock::Qkv) && !k("qkv") {
                 if self.int8 {
                     cp.set_pipeline(&self.pipes.gemv_w8_qkv_norm);
                     cp.set_bind_group(0, l.bg_gemv_w8_qkv_norm.as_ref().expect("int8 bind groups"), &[]);
@@ -1704,30 +1806,30 @@ impl WgpuTextDecoder {
                 }
                 cp.dispatch_workgroups(norm_grid(cfg.fused_qkv_cols()), 1, 1);
             }
-            if d("qkv") {
+            if want(LayerBlock::Qkv) && d("qkv") {
                 cp.dispatch_workgroups(norm_grid(cfg.fused_qkv_cols()), 1, 1);
             }
 
-            if !k("extract") {
+            if want(LayerBlock::Extract) && !k("extract") {
                 cp.set_pipeline(&self.pipes.extract);
                 cp.set_bind_group(0, &l.bg_extract, &[]);
                 cp.dispatch_workgroups(1, (cfg.num_attention_heads + cfg.num_key_value_heads) as u32, 1);
             }
-            if d("extract") {
+            if want(LayerBlock::Extract) && d("extract") {
                 cp.dispatch_workgroups(1, (cfg.num_attention_heads + cfg.num_key_value_heads) as u32, 1);
             }
 
-            if !k("gqa") {
-                self.encode_gqa(&mut cp, l, cur_len);
+            if want(LayerBlock::Gqa) && !k("gqa") {
+                self.encode_gqa(cp, l, cur_len);
             }
-            if d("gqa") {
-                if !k("gqa") {
-                self.encode_gqa(&mut cp, l, cur_len);
+            if want(LayerBlock::Gqa) && d("gqa") {
+                if want(LayerBlock::Gqa) && !k("gqa") {
+                self.encode_gqa(cp, l, cur_len);
             }
             }
 
             let rpwr = gemv_rpwr_o_dp(cfg.hidden_size);
-            if !k("o") {
+            if want(LayerBlock::O) && !k("o") {
                 if self.int8 {
                     let bg = if rpwr == 2 {
                         &l.bg_gemv_w8_o_rpwr2
@@ -1749,11 +1851,11 @@ impl WgpuTextDecoder {
                 }
                 cp.dispatch_workgroups(gemv_grid(cfg.hidden_size) / rpwr as u32, 1, 1);
             }
-            if d("o") {
+            if want(LayerBlock::O) && d("o") {
                 cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
             }
 
-            if !k("gu") {
+            if want(LayerBlock::Gu) && !k("gu") {
                 if self.int8 {
                     cp.set_pipeline(&self.pipes.gemv_w8_gu_norm);
                     cp.set_bind_group(0, l.bg_gemv_w8_gu_norm.as_ref().expect("int8 bind groups"), &[]);
@@ -1763,20 +1865,20 @@ impl WgpuTextDecoder {
                 }
                 cp.dispatch_workgroups(norm_grid(2 * cfg.intermediate_size), 1, 1);
             }
-            if d("gu") {
+            if want(LayerBlock::Gu) && d("gu") {
                 cp.dispatch_workgroups(norm_grid(2 * cfg.intermediate_size), 1, 1);
             }
 
-            if !k("silu") {
+            if want(LayerBlock::Silu) && !k("silu") {
                 cp.set_pipeline(&self.pipes.silu);
                 cp.set_bind_group(0, &self.bg_silu, &[]);
                 cp.dispatch_workgroups(silu_grid.0, silu_grid.1, 1);
             }
-            if d("silu") {
+            if want(LayerBlock::Silu) && d("silu") {
                 cp.dispatch_workgroups(silu_grid.0, silu_grid.1, 1);
             }
 
-            if !k("dp") {
+            if want(LayerBlock::Dp) && !k("dp") {
                 if self.int8 {
                     let bg = if rpwr == 2 {
                         &l.bg_gemv_w8_dp_rpwr2
@@ -1798,7 +1900,7 @@ impl WgpuTextDecoder {
                 }
                 cp.dispatch_workgroups(gemv_grid(cfg.hidden_size) / rpwr as u32, 1, 1);
             }
-            if d("dp") {
+            if want(LayerBlock::Dp) && d("dp") {
                 cp.dispatch_workgroups(gemv_grid(cfg.hidden_size), 1, 1);
             }
         }
@@ -1819,11 +1921,39 @@ impl WgpuTextDecoder {
         cp.dispatch_workgroups(1, 1, 1);
         }
 
-        drop(cp);
-        enc.copy_buffer_to_buffer(&self.scratch.token, 0, &self.scratch.token_staging, 0, 4);
-        } else {
-            drop(cp);
         }
+    }
+
+    /// Which split-attention pipeline a `cur_len` needs, its grid width and the
+    /// chunk count (`write_step_uniforms` puts the same numbers in `u_gp1`).
+    ///
+    /// Shared by the shipped step and the batched one: both must make the exact
+    /// choice `cur_len` implies, or a slot's tokens stop matching its lone run.
+    fn split_attn_plan(&self, cur_len: usize) -> (&wgpu::ComputePipeline, u32, u32) {
+        let paired = self.cfg.num_attention_heads == 2 * self.cfg.num_key_value_heads
+            && !matches!(
+                std::env::var("QASR_GQA_PAIR").unwrap_or_default().to_ascii_lowercase().as_str(),
+                "0" | "off" | "no"
+            );
+        let chunk = if paired {
+            gqa_split_chunk(cur_len).max(256)
+        } else {
+            gqa_split_chunk(cur_len)
+        } as u32;
+        let n_chunks = (cur_len as u32).div_ceil(chunk);
+        let split = match (paired, chunk) {
+            (true, 512) => &self.pipes.gqa_split_pair512,
+            (true, _) => &self.pipes.gqa_split_pair256,
+            (false, 128) => &self.pipes.gqa_split128,
+            (false, 512) => &self.pipes.gqa_split512,
+            (false, _) => &self.pipes.gqa_split256,
+        };
+        let split_x = if paired {
+            self.cfg.num_key_value_heads
+        } else {
+            self.cfg.num_attention_heads
+        } as u32;
+        (split, split_x, n_chunks)
     }
 
     fn encode_gqa<'pass>(&self, cp: &mut wgpu::ComputePass<'pass>, l: &Layer, cur_len: usize) {
@@ -2065,6 +2195,16 @@ impl WgpuTextDecoder {
         cp.dispatch_workgroups(1, 1, 1);
     }
 
+    /// The single-block attention pipeline (probe scaffolding).
+    pub fn gqa512_pipe(&self) -> &wgpu::ComputePipeline {
+        &self.pipes.gqa512
+    }
+
+    /// Layer `l`'s single-block attention bind group (probe scaffolding).
+    pub fn gqa_bind(&self, l: usize) -> &wgpu::BindGroup {
+        &self.layers[l].bg_gqa
+    }
+
     /// Per-step uniforms for `pos` (probe scaffolding).
     pub fn debug_write_step_uniforms(&self, pos: usize) {
         self.write_step_uniforms(pos);
@@ -2289,6 +2429,1736 @@ impl WgpuTextDecoder {
 
     pub fn embed_table(&self) -> &wgpu::Buffer {
         &self.embed_table
+    }
+
+    /// A second decoder that shares **this one's weights and pipelines**.
+    ///
+    /// `wgpu::Buffer` clones alias the same allocation, so N slots cost one copy
+    /// of the weights; only the KV cache, the scratch activations and the bind
+    /// groups that reference them are new.  Nothing about a fork changes what a
+    /// dispatch computes: it is the same kernel, the same bindings and the same
+    /// order as [`Self::step`], so a forked slot's token stream is bit-identical
+    /// to running it alone.  That is the property batching is built on -- it may
+    /// change *when* the GPU sees a dispatch, never *what* it computes.
+    pub fn fork(&self) -> Result<Self> {
+        self.fork_inner(None)
+    }
+
+    /// A fork whose KV is allocated at exactly `cap` positions.
+    ///
+    /// [`Self::fork`] inherits this decoder's `cap`, and `ensure_capacity` only
+    /// grows -- so a fork cannot be made *smaller* through it.  The batch path
+    /// needs the prefill's KV and the slot's region to share a stride, which means
+    /// the prefill fork has to be told the exact cap rather than inherit one.
+    pub fn fork_capped(&self, cap: usize) -> Result<Self> {
+        self.fork_inner(Some(cap))
+    }
+
+    fn fork_inner(&self, cap_override: Option<usize>) -> Result<Self> {
+        let gpu = &self.gpu;
+        let cfg = &self.cfg;
+        let pipes = &self.pipes;
+        let cap = cap_override.unwrap_or(self.cap);
+        let hs = cfg.hidden_size;
+        let q_dim = cfg.q_dim();
+        let inter = cfg.intermediate_size;
+        let vocab = cfg.vocab_size;
+        let nqh = cfg.num_attention_heads;
+        let nkvh = cfg.num_key_value_heads;
+        let hd = cfg.head_dim;
+        let kv_words = nkvh * cap * hd / 2;
+        let max_chunks = self.max_seq.div_ceil(256);
+
+        let mut up = gpu.uploader();
+        let scratch = Scratch {
+            h: up.storage("h", (hs / 2 * 4) as u64),
+            norm1: up.storage("norm1", (hs / 2 * 4) as u64),
+            qkv: up.storage("qkv", (cfg.fused_qkv_cols() / 2 * 4) as u64),
+            q_out: up.storage("q_out", (q_dim / 2 * 4) as u64),
+            attn_out: up.storage("attn_out", (q_dim / 2 * 4) as u64),
+            norm2: up.storage("norm2", (hs / 2 * 4) as u64),
+            gate_up: up.storage("gate_up", (inter * 4) as u64),
+            activated: up.storage("activated", (inter / 2 * 4) as u64),
+            final_norm: up.storage("final_norm", (hs / 2 * 4) as u64),
+            logits: up.storage("logits", (vocab / 2 * 4) as u64),
+            token: up.storage("token", 4),
+            token_staging: gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("token_staging"),
+                size: 4,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            // Same size as the source's: the tables themselves are copied over
+            // below, because they are the model's and not the slot's.
+            cos: up.storage("cos", self.scratch.cos.size()),
+            sin: up.storage("sin", self.scratch.sin.size()),
+            u_rms: up.uniform("u_rms", 16),
+            u_qkvx: up.uniform("u_qkvx", 32),
+            u_silu: up.uniform("u_silu", 16),
+            u_gqa: up.uniform("u_gqa", 16),
+            u_gp1: up.uniform("u_gp1", 16),
+            u_gp2: up.uniform("u_gp2", 16),
+            split_part_out: up.storage("split_part_out", (nqh * max_chunks * hd * 4) as u64),
+            split_part_max: up.storage("split_part_max", (nqh * max_chunks * 4) as u64),
+            split_part_sum: up.storage("split_part_sum", (nqh * max_chunks * 4) as u64),
+        };
+        let q_res = scratch.q_out.as_entire_binding();
+        let out_res = scratch.attn_out.as_entire_binding();
+        up.upload(
+            &scratch.u_rms,
+            bytemuck::bytes_of(&RmsCfg { eps: cfg.rms_norm_eps, _a: 0.0, _b: 0.0, _c: 0.0 }),
+        )?;
+        let u_argmax = up.uniform("u_argmax", 16);
+        let u_embed = up.uniform("u_embed", 16);
+        up.upload(
+            &u_argmax,
+            bytemuck::bytes_of(&ArgmaxCfg { n: vocab as u32, slot: 0, _a: 0, _b: 0 }),
+        )?;
+        up.upload(
+            &u_embed,
+            bytemuck::bytes_of(&EmbedCfg { slot: 0, d2: (hs / 2) as u32, _a: 0, _b: 0 }),
+        )?;
+
+        let gemv_bg = |pipe: &wgpu::ComputePipeline,
+                       wt: &wgpu::Buffer,
+                       x: &wgpu::Buffer,
+                       y: &wgpu::Buffer|
+         -> wgpu::BindGroup {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gemv"),
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wt.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: y.as_entire_binding() },
+                ],
+            })
+        };
+        let gemv_w8_bg = |pipe: &wgpu::ComputePipeline,
+                          wt: &wgpu::Buffer,
+                          x: &wgpu::Buffer,
+                          y: &wgpu::Buffer,
+                          s: &wgpu::Buffer|
+         -> wgpu::BindGroup {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gemv_w8"),
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wt.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: y.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: s.as_entire_binding() },
+                ],
+            })
+        };
+        let gemv_norm_w8_bg = |pipe: &wgpu::ComputePipeline,
+                               wt: &wgpu::Buffer,
+                               x: &wgpu::Buffer,
+                               y: &wgpu::Buffer,
+                               nw: &wgpu::Buffer,
+                               s: &wgpu::Buffer|
+         -> wgpu::BindGroup {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gemv_norm_w8"),
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wt.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: y.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: nw.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: s.as_entire_binding() },
+                ],
+            })
+        };
+        let gemv_norm_bg = |pipe: &wgpu::ComputePipeline,
+                            wt: &wgpu::Buffer,
+                            x: &wgpu::Buffer,
+                            y: &wgpu::Buffer,
+                            nw: &wgpu::Buffer|
+         -> wgpu::BindGroup {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gemv_norm"),
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wt.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: y.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: nw.as_entire_binding() },
+                ],
+            })
+        };
+        let rms_bg = |x: &wgpu::Buffer, wt: &wgpu::Buffer, out: &wgpu::Buffer| -> wgpu::BindGroup {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rms"),
+                layout: &pipes.rms_norm.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wt.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: out.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: scratch.u_rms.as_entire_binding() },
+                ],
+            })
+        };
+
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for src in self.layers.iter() {
+            let k_cache = gpu.storage("k_cache", (kv_words * 4) as u64);
+            let v_cache = gpu.storage("v_cache", (kv_words * 4) as u64);
+            let (k_res, v_res) = (
+                k_cache.as_entire_binding(),
+                v_cache.as_entire_binding(),
+            );
+            let (qkv, o, gu, dp) =
+                (src.qkv_w.clone(), src.o_w.clone(), src.gu_w.clone(), src.dp_w.clone());
+            let (iln, pln, qn, kn) =
+                (src.iln_w.clone(), src.pln_w.clone(), src.qn_w.clone(), src.kn_w.clone());
+            let (qkv_s, o_s, gu_s, dp_s) =
+                (src.qkv_s.clone(), src.o_s.clone(), src.gu_s.clone(), src.dp_s.clone());
+
+            let bg_gemv_qkv = gemv_bg(&pipes.gemv_qkv, &qkv, &scratch.norm1, &scratch.qkv);
+            let bg_gemv_qkv_norm =
+                gemv_norm_bg(&pipes.gemv_qkv_norm, &qkv, &scratch.h, &scratch.qkv, &iln);
+            let bg_gemv_o = gemv_bg(&pipes.gemv_o, &o, &scratch.attn_out, &scratch.h);
+            let bg_gemv_o_rpwr2 =
+                gemv_bg(&pipes.gemv_o_rpwr2, &o, &scratch.attn_out, &scratch.h);
+            let bg_gemv_gu = gemv_bg(&pipes.gemv_gu, &gu, &scratch.norm2, &scratch.gate_up);
+            let bg_gemv_gu_norm =
+                gemv_norm_bg(&pipes.gemv_gu_norm, &gu, &scratch.h, &scratch.gate_up, &pln);
+            let bg_gemv_dp = gemv_bg(&pipes.gemv_dp, &dp, &scratch.activated, &scratch.h);
+            let bg_gemv_dp_rpwr2 =
+                gemv_bg(&pipes.gemv_dp_rpwr2, &dp, &scratch.activated, &scratch.h);
+            let (bg_gemv_w8_qkv, bg_gemv_w8_gu, bg_gemv_w8_qkv_norm, bg_gemv_w8_o, bg_gemv_w8_o_rpwr2, bg_gemv_w8_gu_norm, bg_gemv_w8_dp, bg_gemv_w8_dp_rpwr2) =
+                match (&qkv_s, &o_s, &gu_s, &dp_s) {
+                    (Some(qs), Some(os), Some(gs), Some(ds)) => (
+                        Some(gemv_w8_bg(&pipes.gemv_w8_qkv, &qkv, &scratch.norm1, &scratch.qkv, qs)),
+                        Some(gemv_w8_bg(&pipes.gemv_w8_gu, &gu, &scratch.norm2, &scratch.gate_up, gs)),
+                        Some(gemv_norm_w8_bg(&pipes.gemv_w8_qkv_norm, &qkv, &scratch.h, &scratch.qkv, &iln, qs)),
+                        Some(gemv_w8_bg(&pipes.gemv_w8_o, &o, &scratch.attn_out, &scratch.h, os)),
+                        Some(gemv_w8_bg(&pipes.gemv_w8_o_rpwr2, &o, &scratch.attn_out, &scratch.h, os)),
+                        Some(gemv_norm_w8_bg(&pipes.gemv_w8_gu_norm, &gu, &scratch.h, &scratch.gate_up, &pln, gs)),
+                        Some(gemv_w8_bg(&pipes.gemv_w8_dp, &dp, &scratch.activated, &scratch.h, ds)),
+                        Some(gemv_w8_bg(&pipes.gemv_w8_dp_rpwr2, &dp, &scratch.activated, &scratch.h, ds)),
+                    ),
+                    _ => (None, None, None, None, None, None, None, None),
+                };
+            let bg_rms1 = rms_bg(&scratch.h, &iln, &scratch.norm1);
+            let bg_rms2 = rms_bg(&scratch.h, &pln, &scratch.norm2);
+            let (bg_extract, bg_gqa, bg_gqa_split) = kv_bind_groups_res(
+                gpu,
+                pipes,
+                &scratch,
+                &qn,
+                &kn,
+                q_res.clone(),
+                k_res,
+                v_res,
+                out_res.clone(),
+            );
+            let bg_gqa_merge = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gqa_merge"),
+                layout: &pipes.gqa_merge.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: scratch.attn_out.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: scratch.split_part_out.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: scratch.split_part_max.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: scratch.split_part_sum.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: scratch.u_gp2.as_entire_binding() },
+                ],
+            });
+            layers.push(Layer {
+                k_cache: k_cache.clone(),
+                v_cache: v_cache.clone(),
+                iln_w: iln,
+                pln_w: pln,
+                qn_w: qn,
+                kn_w: kn,
+                qkv_w: qkv,
+                o_w: o,
+                gu_w: gu,
+                dp_w: dp,
+                qkv_s,
+                o_s,
+                gu_s,
+                dp_s,
+                bg_gemv_qkv,
+                bg_gemv_qkv_norm,
+                bg_gemv_o,
+                bg_gemv_o_rpwr2,
+                bg_gemv_gu,
+                bg_gemv_gu_norm,
+                bg_gemv_dp,
+                bg_gemv_dp_rpwr2,
+                bg_gemv_w8_qkv,
+                bg_gemv_w8_gu,
+                bg_gemv_w8_qkv_norm,
+                bg_gemv_w8_o,
+                bg_gemv_w8_o_rpwr2,
+                bg_gemv_w8_gu_norm,
+                bg_gemv_w8_dp,
+                bg_gemv_w8_dp_rpwr2,
+                bg_rms1,
+                bg_rms2,
+                bg_extract,
+                bg_gqa,
+                bg_gqa_split,
+                bg_gqa_merge,
+            });
+        }
+
+        let norm_buf = self.norm_buf.clone();
+        let embed_table = self.embed_table.clone();
+        let bg_final_rms = rms_bg(&scratch.h, &norm_buf, &scratch.final_norm);
+        let bg_gemv_lm = gemv_bg(&pipes.gemv_lm, &embed_table, &scratch.final_norm, &scratch.logits);
+        let bg_gemv_lm_norm =
+            gemv_norm_bg(&pipes.gemv_lm_norm, &embed_table, &scratch.h, &scratch.logits, &norm_buf);
+        let bg_silu = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("silu"),
+            layout: &pipes.silu.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: scratch.gate_up.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: scratch.activated.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: scratch.u_silu.as_entire_binding() },
+            ],
+        });
+        let bg_argmax = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("argmax"),
+            layout: &pipes.argmax.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: scratch.logits.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: scratch.token.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: u_argmax.as_entire_binding() },
+            ],
+        });
+        let bg_embed = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("embed"),
+            layout: &pipes.embed.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: embed_table.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: scratch.token.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: scratch.h.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: u_embed.as_entire_binding() },
+            ],
+        });
+        up.finish()?;
+
+        // The MRoPE tables are a property of the model, not of a slot: copy
+        // them so a fork is ready to decode without re-uploading from the host.
+        let mut enc = gpu.device.create_command_encoder(&Default::default());
+        let tbl = self.scratch.cos.size().min(scratch.cos.size());
+        enc.copy_buffer_to_buffer(&self.scratch.cos, 0, &scratch.cos, 0, tbl);
+        enc.copy_buffer_to_buffer(&self.scratch.sin, 0, &scratch.sin, 0, tbl);
+        gpu.queue.submit([enc.finish()]);
+
+        Ok(Self {
+            gpu: self.gpu.clone(),
+            cfg: self.cfg.clone(),
+            max_seq: self.max_seq,
+            cap,
+            pos: 0,
+            host_submit_ms: 0.0,
+            host_read_ms: 0.0,
+            pending: None,
+            pending_map: None,
+            pooled: false,
+            embed_table,
+            layers,
+            pipes: self.pipes.clone(),
+            int8: self.int8,
+            scratch,
+            bg_final_rms,
+            bg_gemv_lm,
+            bg_gemv_lm_norm,
+            bg_silu,
+            bg_argmax,
+            bg_embed,
+            norm_buf,
+            debug_prefill_h: None,
+            debug_l0_h: None,
+        })
+    }
+
+    /// One decode step for every slot in `slots`.
+    ///
+    /// Every slot's uniforms are written first, then **one** command buffer and
+    /// **one** compute pass carry the dispatches of layer `l` for all slots
+    /// back-to-back, then the epilogue for all slots, then **one** submit and
+    /// **one** token readback.  A slot's arithmetic never depends on another
+    /// slot, so the token stream is bit-identical to calling [`Self::step`] on
+    /// each in turn; what changes is that the weight tile slot 0 pulls into L2 is
+    /// the one the rest find there.
+    ///
+    /// `n == 1` dispatches to [`Self::step`] unchanged: the b=1 path is the old
+    /// code, not this one with a loop of length one.
+    pub fn step_batch(slots: &mut [WgpuTextDecoder]) -> Result<Vec<i32>> {
+        if slots.len() == 1 {
+            return Ok(vec![slots[0].step()?]);
+        }
+        let n = slots.len();
+        for d in slots.iter() {
+            d.write_step_uniforms(d.pos);
+        }
+        let gpu = slots[0].gpu.clone();
+        let nl = slots[0].layers.len();
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("batch_tokens"),
+            size: (4 * n) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = gpu.device.create_command_encoder(&Default::default());
+        {
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            for l in 0..nl {
+                for block in LAYER_BLOCKS {
+                    for d in slots.iter() {
+                        d.encode_into(
+                            &mut cp,
+                            d.pos,
+                            l,
+                            l + 1,
+                            l == 0 && block == LayerBlock::Qkv,
+                            false,
+                            &|b| b == block,
+                        );
+                    }
+                }
+            }
+            for d in slots.iter() {
+                d.encode_into(&mut cp, d.pos, nl, nl, false, true, &|_| true);
+            }
+        }
+        for (s, d) in slots.iter().enumerate() {
+            enc.copy_buffer_to_buffer(&d.scratch.token, 0, &staging, (s * 4) as u64, 4);
+        }
+        gpu.queue.submit([enc.finish()]);
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        gpu.device.poll(wgpu::PollType::wait_indefinitely()).context("poll batch")?;
+        rx.recv().context("map callback dropped")?.context("map batch")?;
+        let out: Vec<i32> = {
+            let d = slice.get_mapped_range()?;
+            (0..n)
+                .map(|s| i32::from_le_bytes([d[s * 4], d[s * 4 + 1], d[s * 4 + 2], d[s * 4 + 3]]))
+                .collect()
+        };
+        staging.unmap();
+        for d in slots.iter_mut() {
+            d.pos += 1;
+        }
+        Ok(out)
+    }
+}
+
+/// One allocation per layer holding every slot's KV, plus the two per-slot
+/// activation tensors attention needs to address by slot index.
+///
+/// One dispatch for every slot, each slot reading **its own buffers**.
+///
+/// The batched kernels take `binding_array`s and pick the slot with `wgid.z`
+/// ([`shaders::gemv_batch_slots`]), so a slot is *which buffer* and never an
+/// offset into a shared one.  That is the whole design: no kernel re-derives a
+/// stride, a slot reads the exact bytes it reads alone, and b only changes
+/// **when** the GPU sees a dispatch -- never what it computes.  The slots are
+/// plain [`WgpuTextDecoder::fork`]s: b costs b KV caches and b scratch sets,
+/// one copy of the weights, and nothing has to be copied from a whole-run buffer
+/// into a decode-time one.
+///
+/// What stays per slot is the work that is not a weight stream: `embed`, the
+/// three RMSNorms (one workgroup each, the shipped kernel and the shipped bind
+/// group), and `argmax`.  What is batched is exactly the linear algebra whose
+/// cost is the weight read -- `qkv`, `o`, `gu`, `dp`, `lm` -- plus `extract`,
+/// `gqa` and `silu`, which only touch per-slot rows.
+/// Most slots one batched dispatch can address (`binding_array<T, 16>`).
+///
+/// This used to be 8 because the fused norm staged every slot's row in
+/// workgroup shared memory; the weight streams now read a normalized row that
+/// already sits in each slot's own buffer, so the limit is the binding array's
+/// declared width (`binding_array<T, 32>` in the batched kernels).
+pub const MAX_BATCH: usize = 32;
+
+const MAX_BATCH_U32: u32 = MAX_BATCH as u32;
+
+pub struct BatchProjections {
+    qkv: wgpu::ComputePipeline,
+    gu: wgpu::ComputePipeline,
+    lm: wgpu::ComputePipeline,
+    o: wgpu::ComputePipeline,
+    dp: wgpu::ComputePipeline,
+    qkv_bg: Vec<wgpu::BindGroup>,
+    gu_bg: Vec<wgpu::BindGroup>,
+    lm_bg: wgpu::BindGroup,
+    o_bg: Vec<wgpu::BindGroup>,
+    dp_bg: Vec<wgpu::BindGroup>,
+    gqa256: wgpu::ComputePipeline,
+    gqa512: wgpu::ComputePipeline,
+    /// `[block width][layer]` -- width 0 is the 256-thread kernel, 1 the 512.
+    gqa_bg: [Vec<wgpu::BindGroup>; 2],
+    /// Per width: every slot's `cur_len`, indexed by the slot the `PICK` table
+    /// names.
+    gqa_cl: [wgpu::Buffer; 2],
+    /// Per width: the slots that dispatch owns, compacted.
+    gqa_pick: [wgpu::Buffer; 2],
+    gqa_u_bg: wgpu::BindGroup,
+    extract: wgpu::ComputePipeline,
+    extract_u_bg: wgpu::BindGroup,
+    extract_bg: Vec<wgpu::BindGroup>,
+    /// One `u32` per slot: this step's write position for `extract`.
+    extract_pos: wgpu::Buffer,
+    silu: wgpu::ComputePipeline,
+    silu_bg: wgpu::BindGroup,
+    silu_u_bg: wgpu::BindGroup,
+    nqh: u32,
+    g_qkv: u32,
+    g_o: u32,
+    g_gu: u32,
+    g_dp: u32,
+    g_lm: u32,
+    g_silu: (u32, u32),
+    pub batch: usize,
+}
+
+/// The slots' own buffers as one binding array, padded to the shader's 16 with
+/// slot 0: `wgid.z` never reaches the padding because the grid is `batch` deep.
+fn bind_array<'a>(buffers: &[&'a wgpu::Buffer]) -> Vec<wgpu::BufferBinding<'a>> {
+    let pad = *buffers.first().expect("a batch has at least one slot");
+    (0..MAX_BATCH)
+        .map(|i| {
+            let buffer = buffers.get(i).copied().unwrap_or(pad);
+            wgpu::BufferBinding {
+                buffer,
+                offset: 0,
+                size: wgpu::BufferSize::new(buffer.size()),
+            }
+        })
+        .collect()
+}
+
+impl BatchProjections {
+    /// Build the batched dispatches for `slots`.
+    ///
+    /// Every slot must be a [`WgpuTextDecoder::fork`] of the same decoder; the
+    /// weight buffers are read from slot 0 because a fork aliases them.
+    pub fn new(slots: &[WgpuTextDecoder]) -> Result<Self> {
+        let batch = slots.len();
+        anyhow::ensure!(batch >= 2, "BatchProjections needs two or more slots");
+        anyhow::ensure!(
+            batch <= MAX_BATCH,
+            "batch decode fits at most {MAX_BATCH} slots; use a smaller --batch"
+        );
+        let base = &slots[0];
+        let gpu = &base.gpu;
+        let cfg = &base.cfg;
+        let hs = cfg.hidden_size;
+        let q_dim = cfg.q_dim();
+        let inter = cfg.intermediate_size;
+        let vocab = cfg.vocab_size;
+        let nl = base.layers.len();
+        let buf = |f: &dyn Fn(&WgpuTextDecoder) -> &wgpu::Buffer| -> Vec<&wgpu::Buffer> {
+            slots.iter().map(f).collect()
+        };
+
+        // One layout for every weight stream: binding 0 is the matrix, 1/2 are
+        // the per-slot input/output arrays.
+        let (gemv_pl, _) = batch_layout(
+            gpu,
+            "batch_gemv",
+            &[(0, true, None), (1, true, Some(MAX_BATCH_U32)), (2, false, Some(MAX_BATCH_U32))],
+            false,
+        );
+        let o = gpu.pipeline(
+            "batch_o",
+            &shaders::gemv_batch_slots(hs, q_dim, batch, true),
+            "gemv_batch_slots",
+            Some(&gemv_pl),
+        )?;
+        let qkv = gpu.pipeline(
+            "batch_qkv",
+            &shaders::gemv_batch_slots(cfg.fused_qkv_cols(), hs, batch, false),
+            "gemv_batch_slots",
+            Some(&gemv_pl),
+        )?;
+        let gu = gpu.pipeline(
+            "batch_gu",
+            &shaders::gemv_batch_slots(2 * inter, hs, batch, false),
+            "gemv_batch_slots",
+            Some(&gemv_pl),
+        )?;
+        let lm = gpu.pipeline(
+            "batch_lm",
+            &shaders::gemv_batch_slots(vocab, hs, batch, false),
+            "gemv_batch_slots",
+            Some(&gemv_pl),
+        )?;
+        let dp = gpu.pipeline(
+            "batch_dp",
+            &shaders::gemv_batch_slots(hs, inter, batch, true),
+            "gemv_batch_slots",
+            Some(&gemv_pl),
+        )?;
+        let nqh = cfg.num_attention_heads;
+        // One shared layout for both block widths: a bind group built from one
+        // pipeline's implicit layout is rejected by the other.
+        let (gqa_pl, gqa_ubgl) = batch_layout(
+            gpu,
+            "gqa_batch",
+            &[
+                (0, true, Some(MAX_BATCH_U32)),
+                (1, true, Some(MAX_BATCH_U32)),
+                (2, true, Some(MAX_BATCH_U32)),
+                (3, false, Some(MAX_BATCH_U32)),
+                (5, true, None),
+                (6, true, None),
+            ],
+            true,
+        );
+        let gqa256 = gpu.pipeline(
+            "batch_gqa256",
+            &shaders::gqa_decode_single_slots(
+                nqh,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                256,
+                GQA_SINGLE_CAP,
+            ),
+            "gqa",
+            Some(&gqa_pl),
+        )?;
+        let gqa512 = gpu.pipeline(
+            "batch_gqa512",
+            &shaders::gqa_decode_single_slots(
+                nqh,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                512,
+                GQA_SINGLE_CAP,
+            ),
+            "gqa",
+            Some(&gqa_pl),
+        )?;
+
+        // `0` is the weight matrix (shared, read from slot 0); `1` and `2` are
+        // every slot's input / output buffer.
+        let bind = |pipe: &wgpu::ComputePipeline,
+                    w: &wgpu::Buffer,
+                    xs: &[&wgpu::Buffer],
+                    ys: &[&wgpu::Buffer]|
+         -> wgpu::BindGroup {
+            let xb = bind_array(xs);
+            let yb = bind_array(ys);
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("batch_proj"),
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: w.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::BufferArray(&xb),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::BufferArray(&yb),
+                    },
+                ],
+            })
+        };
+
+        let mut qkv_bg = Vec::with_capacity(nl);
+        let mut gu_bg = Vec::with_capacity(nl);
+        for l in 0..nl {
+            qkv_bg.push(bind(
+                &qkv,
+                &base.layers[l].qkv_w,
+                &buf(&|d| &d.scratch.norm1),
+                &buf(&|d| &d.scratch.qkv),
+            ));
+            gu_bg.push(bind(
+                &gu,
+                &base.layers[l].gu_w,
+                &buf(&|d| &d.scratch.norm2),
+                &buf(&|d| &d.scratch.gate_up),
+            ));
+        }
+        let lm_bg = bind(
+            &lm,
+            &base.embed_table,
+            &buf(&|d| &d.scratch.final_norm),
+            &buf(&|d| &d.scratch.logits),
+        );
+
+        let mut o_bg = Vec::with_capacity(nl);
+        let mut dp_bg = Vec::with_capacity(nl);
+        for l in 0..nl {
+            o_bg.push(bind(
+                &o,
+                &base.layers[l].o_w,
+                &buf(&|d| &d.scratch.attn_out),
+                &buf(&|d| &d.scratch.h),
+            ));
+            dp_bg.push(bind(
+                &dp,
+                &base.layers[l].dp_w,
+                &buf(&|d| &d.scratch.activated),
+                &buf(&|d| &d.scratch.h),
+            ));
+        }
+
+        let gqa_cl = [
+            gpu.storage("batch_cur_len", 4 * MAX_BATCH as u64),
+            gpu.storage("batch_cur_len_hi", 4 * MAX_BATCH as u64),
+        ];
+        let gqa_pick = [
+            gpu.storage("batch_pick", 4 * MAX_BATCH as u64),
+            gpu.storage("batch_pick_b", 4 * MAX_BATCH as u64),
+        ];
+        let q = buf(&|d| &d.scratch.q_out);
+        let out = buf(&|d| &d.scratch.attn_out);
+        let mut bg_a = Vec::with_capacity(nl);
+        let mut bg_b = Vec::with_capacity(nl);
+        for l in 0..nl {
+            let k = buf(&|d| &d.layers[l].k_cache);
+            let v = buf(&|d| &d.layers[l].v_cache);
+            for (g, dst) in [(0usize, &mut bg_a), (1, &mut bg_b)] {
+                let qb = bind_array(&q);
+                let kb = bind_array(&k);
+                let vb = bind_array(&v);
+                let ob = bind_array(&out);
+                dst.push(gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("batch_gqa"),
+                    layout: &gqa512.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::BufferArray(&qb),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::BufferArray(&kb),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::BufferArray(&vb),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::BufferArray(&ob),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: gqa_cl[g].as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: gqa_pick[g].as_entire_binding(),
+                        },
+                    ],
+                }));
+            }
+        }
+        let gqa_bg = [bg_a, bg_b];
+
+        let (extract_pl, extract_ubgl) = batch_layout(
+            gpu,
+            "batch_extract",
+            &[
+                (0, true, Some(MAX_BATCH_U32)),
+                (1, true, None),
+                (2, true, None),
+                (3, true, None),
+                (4, true, None),
+                (5, false, Some(MAX_BATCH_U32)),
+                (6, false, Some(MAX_BATCH_U32)),
+                (7, false, Some(MAX_BATCH_U32)),
+                (9, true, None),
+            ],
+            true,
+        );
+        let extract = gpu.pipeline(
+            "batch_extract",
+            &shaders::qkv_extract_slots(
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+            ),
+            "qkv_extract",
+            Some(&extract_pl),
+        )?;
+        let extract_pos = gpu.storage("batch_extract_pos", 4 * MAX_BATCH as u64);
+        let mut extract_bg = Vec::with_capacity(nl);
+        for l in 0..nl {
+            let qkvb = bind_array(&buf(&|d| &d.scratch.qkv));
+            let qb = bind_array(&q);
+            let kb = bind_array(&buf(&|d| &d.layers[l].k_cache));
+            let vb = bind_array(&buf(&|d| &d.layers[l].v_cache));
+            extract_bg.push(gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("batch_extract"),
+                layout: &extract.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::BufferArray(&qkvb),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: base.layers[l].qn_w.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: base.layers[l].kn_w.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: slots[0].scratch.cos.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: slots[0].scratch.sin.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::BufferArray(&qb),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::BufferArray(&kb),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::BufferArray(&vb),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: extract_pos.as_entire_binding(),
+                    },
+                ],
+            }));
+        }
+
+        let (silu_pl, silu_ubgl) = batch_layout(
+            gpu,
+            "batch_silu",
+            &[(0, true, Some(MAX_BATCH_U32)), (1, false, Some(MAX_BATCH_U32))],
+            true,
+        );
+        let silu = gpu.pipeline(
+            "batch_silu",
+            &shaders::silu_mul_split_slots(inter),
+            "silu_mul_split_slots",
+            Some(&silu_pl),
+        )?;
+        let gub = bind_array(&buf(&|d| &d.scratch.gate_up));
+        let actb = bind_array(&buf(&|d| &d.scratch.activated));
+        let silu_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("batch_silu"),
+            layout: &silu.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::BufferArray(&gub),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::BufferArray(&actb),
+                },
+            ],
+        });
+
+        // Group 1: the per-step config (the per-slot arrays own group 0).
+        let uni_bg = |layout: &wgpu::BindGroupLayout,
+                      buf: &wgpu::Buffer,
+                      label: &str|
+         -> wgpu::BindGroup {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buf.as_entire_binding(),
+                }],
+            })
+        };
+        let gqa_u_bg = uni_bg(
+            gqa_ubgl.as_ref().expect("gqa has a uniform"),
+            &slots[0].scratch.u_gqa,
+            "batch_gqa_cfg",
+        );
+        let extract_u_bg = uni_bg(
+            extract_ubgl.as_ref().expect("extract has a uniform"),
+            &slots[0].scratch.u_qkvx,
+            "batch_extract_cfg",
+        );
+        let silu_u_bg = uni_bg(
+            silu_ubgl.as_ref().expect("silu has a uniform"),
+            &slots[0].scratch.u_silu,
+            "batch_silu_cfg",
+        );
+
+        Ok(Self {
+            g_qkv: (cfg.fused_qkv_cols() / 8) as u32,
+            g_o: (hs / 8) as u32,
+            g_gu: (2 * inter / 8) as u32,
+            g_dp: (hs / 8) as u32,
+            g_lm: (vocab / 8) as u32,
+            g_silu: grid_xy((inter / 2).div_ceil(256)),
+            qkv,
+            gu,
+            lm,
+            o,
+            dp,
+            qkv_bg,
+            gu_bg,
+            lm_bg,
+            o_bg,
+            dp_bg,
+            gqa_bg,
+            gqa_cl,
+            gqa_pick,
+            gqa_u_bg,
+            silu,
+            silu_bg,
+            silu_u_bg,
+            extract,
+            extract_bg,
+            extract_u_bg,
+            extract_pos,
+            nqh: nqh as u32,
+            gqa256,
+            gqa512,
+            batch,
+        })
+    }
+
+    /// One step for every slot: five weight streams once, everything else per
+    /// slot with the shipped kernel.
+    pub fn step(&self, slots: &mut [WgpuTextDecoder]) -> Result<Vec<i32>> {
+        let n = slots.len();
+        anyhow::ensure!(n == self.batch, "BatchProjections: slot count changed");
+        let gpu = slots[0].gpu.clone();
+        for d in slots.iter() {
+            d.write_step_uniforms(d.pos);
+        }
+        let nl = slots[0].layers.len();
+
+        // The only per-slot scalars the batched kernels need: this step's write
+        // position, and which block width owns each slot.
+        let mut pos = [0u32; MAX_BATCH];
+        let mut lo = [0u32; MAX_BATCH];
+        let mut hi = [0u32; MAX_BATCH];
+        for (i, d) in slots.iter().enumerate() {
+            pos[i] = d.pos as u32;
+            let cur_len = (d.pos + 1) as u32;
+            if cur_len > 512 {
+                hi[i] = cur_len;
+            } else {
+                lo[i] = cur_len;
+            }
+        }
+        gpu.queue
+            .write_buffer(&self.extract_pos, 0, bytemuck::cast_slice(&pos));
+        // One line per width: which slots it owns, and their lengths.
+        let mut pick = [[0u32; MAX_BATCH]; 2];
+        let mut counts = [0u32; 2];
+        for (i, h) in hi.iter().enumerate() {
+            let g = usize::from(*h > 0);
+            pick[g][counts[g] as usize] = i as u32;
+            counts[g] += 1;
+        }
+        gpu.queue
+            .write_buffer(&self.gqa_cl[0], 0, bytemuck::cast_slice(&lo));
+        gpu.queue
+            .write_buffer(&self.gqa_cl[1], 0, bytemuck::cast_slice(&hi));
+        gpu.queue
+            .write_buffer(&self.gqa_pick[0], 0, bytemuck::cast_slice(&pick[0]));
+        gpu.queue
+            .write_buffer(&self.gqa_pick[1], 0, bytemuck::cast_slice(&pick[1]));
+
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("batch_tokens"),
+            size: (4 * n) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = gpu.device.create_command_encoder(&Default::default());
+        {
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            // The token the caller seeded becomes layer 0's input, exactly the
+            // dispatch `encode_step_slice(embed = true)` issues for b=1.
+            for d in slots.iter() {
+                cp.set_pipeline(&d.pipes.embed);
+                cp.set_bind_group(0, &d.bg_embed, &[]);
+                cp.dispatch_workgroups(1, 1, 1);
+            }
+            for l in 0..nl {
+                // The norm is one workgroup per slot (the shipped kernel), then
+                // one weight read for all of them.  Fusing the norm into the GEMV
+                // (`gemv_norm_batch_slots`) makes every workgroup re-stage every
+                // slot's row in shared memory, so its cost grows with b and the
+                // step stops getting cheaper past b=4; reading a normalized row
+                // that already sits in each slot's own buffer costs one pass.
+                for d in slots.iter() {
+                    cp.set_pipeline(&d.pipes.rms_norm);
+                    cp.set_bind_group(0, &d.layers[l].bg_rms1, &[]);
+                    cp.dispatch_workgroups(1, 1, 1);
+                }
+                cp.set_pipeline(&self.qkv);
+                cp.set_bind_group(0, &self.qkv_bg[l], &[]);
+                cp.dispatch_workgroups(self.g_qkv, 1, 1);
+                // RoPE + KV write, then attention: `wgid.z` is the slot, and the
+                // KV row is `POS[slot]`/`CL[slot]`, not slot 0's.
+                cp.set_pipeline(&self.extract);
+                cp.set_bind_group(0, &self.extract_bg[l], &[]);
+                cp.set_bind_group(1, &self.extract_u_bg, &[]);
+                cp.dispatch_workgroups(
+                    1,
+                    self.nqh + slots[0].cfg.num_key_value_heads as u32,
+                    self.batch as u32,
+                );
+                // The shipped step picks 256 threads for `cur_len <= 512` and 512
+                // above it, and the two reduction trees differ -- so a slot keeps
+                // the width its lone run would use.  Both dispatches cover every
+                // slot; the ones the other width owns return on `CL == 0`.
+                for (g, pipe) in [(0usize, &self.gqa256), (1usize, &self.gqa512)] {
+                    if counts[g] == 0 {
+                        continue;
+                    }
+                    cp.set_pipeline(pipe);
+                    cp.set_bind_group(0, &self.gqa_bg[g][l], &[]);
+                    cp.set_bind_group(1, &self.gqa_u_bg, &[]);
+                    cp.dispatch_workgroups(self.nqh, 1, counts[g]);
+                }
+                // Above the single kernel's cap the shipped step switches to the
+                // chunked pair + merge.  Those bind a slot's own buffers and cache
+                // state, so they run per slot rather than fused -- the same
+                // dispatches, in the same order, as that slot alone.
+                for d in slots.iter() {
+                    let cur_len = d.pos + 1;
+                    if cur_len <= crate::decoder::GQA_SINGLE_CAP {
+                        continue;
+                    }
+                    let (split, split_x, n_chunks) = d.split_attn_plan(cur_len);
+                    cp.set_pipeline(split);
+                    cp.set_bind_group(0, &d.layers[l].bg_gqa_split, &[]);
+                    cp.dispatch_workgroups(split_x, n_chunks, 1);
+                    cp.set_pipeline(&d.pipes.gqa_merge);
+                    cp.set_bind_group(0, &d.layers[l].bg_gqa_merge, &[]);
+                    cp.dispatch_workgroups(self.nqh, 1, 1);
+                }
+                cp.set_pipeline(&self.o);
+                cp.set_bind_group(0, &self.o_bg[l], &[]);
+                cp.dispatch_workgroups(self.g_o, 1, 1);
+                for d in slots.iter() {
+                    cp.set_pipeline(&d.pipes.rms_norm);
+                    cp.set_bind_group(0, &d.layers[l].bg_rms2, &[]);
+                    cp.dispatch_workgroups(1, 1, 1);
+                }
+                cp.set_pipeline(&self.gu);
+                cp.set_bind_group(0, &self.gu_bg[l], &[]);
+                cp.dispatch_workgroups(self.g_gu, 1, 1);
+                cp.set_pipeline(&self.silu);
+                cp.set_bind_group(0, &self.silu_bg, &[]);
+                cp.set_bind_group(1, &self.silu_u_bg, &[]);
+                cp.dispatch_workgroups(self.g_silu.0, self.g_silu.1, self.batch as u32);
+                cp.set_pipeline(&self.dp);
+                cp.set_bind_group(0, &self.dp_bg[l], &[]);
+                cp.dispatch_workgroups(self.g_dp, 1, 1);
+            }
+            for d in slots.iter() {
+                cp.set_pipeline(&d.pipes.rms_norm);
+                cp.set_bind_group(0, &d.bg_final_rms, &[]);
+                cp.dispatch_workgroups(1, 1, 1);
+            }
+            cp.set_pipeline(&self.lm);
+            cp.set_bind_group(0, &self.lm_bg, &[]);
+            cp.dispatch_workgroups(self.g_lm, 1, 1);
+            for d in slots.iter() {
+                cp.set_pipeline(&d.pipes.argmax);
+                cp.set_bind_group(0, &d.bg_argmax, &[]);
+                cp.dispatch_workgroups(1, 1, 1);
+            }
+        }
+        for (s, d) in slots.iter().enumerate() {
+            enc.copy_buffer_to_buffer(&d.scratch.token, 0, &staging, (s * 4) as u64, 4);
+        }
+        gpu.queue.submit([enc.finish()]);
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .context("poll batch")?;
+        rx.recv().context("map callback dropped")?.context("map batch")?;
+        let out: Vec<i32> = {
+            let d = slice.get_mapped_range()?;
+            (0..n)
+                .map(|s| i32::from_le_bytes([d[s * 4], d[s * 4 + 1], d[s * 4 + 2], d[s * 4 + 3]]))
+                .collect()
+        };
+        staging.unmap();
+        for d in slots.iter_mut() {
+            d.pos += 1;
+        }
+        Ok(out)
+    }
+}
+
+/// Layout for the batched dispatches: `stor` entries carry their binding-array
+/// `count`, which is what the shader's `binding_array<T, N>` declares and what a
+/// `BufferArray` bind group has to match.  `uni` is the optional uniform.
+fn batch_layout(
+    gpu: &Gpu,
+    label: &str,
+    stor: &[(u32, bool, Option<u32>)],
+    uniform: bool,
+) -> (wgpu::PipelineLayout, Option<wgpu::BindGroupLayout>) {
+    let mut entries: Vec<wgpu::BindGroupLayoutEntry> = stor
+        .iter()
+        .map(|&(binding, read_only, count)| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: count.and_then(std::num::NonZeroU32::new),
+        })
+        .collect();
+    entries.sort_by_key(|e| e.binding);
+    let bgl = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(&format!("{label}_bgl")),
+        entries: &entries,
+    });
+    // wgpu: "bind groups may not contain both a binding array and a uniform
+    // buffer", so the config rides group 1 on its own.
+    let ubgl = uniform.then(|| {
+        gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(&format!("{label}_ubgl")),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        })
+    });
+    let layouts: Vec<Option<&wgpu::BindGroupLayout>> =
+        std::iter::once(Some(&bgl)).chain(ubgl.as_ref().map(Some)).collect();
+    let pl = gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(&format!("{label}_pl")),
+        bind_group_layouts: &layouts,
+        immediate_size: 0,
+    });
+    (pl, ubgl)
+}
+
+/// One segment of a batched prefill: its hidden rows, and the KV it writes into.
+///
+/// The KV lives in each slot's own cache ([`WgpuTextDecoder::fork_capped`] made
+/// it), so attention for a segment reads a whole buffer and never an offset into
+/// a shared one.
+pub struct PrefillSeg<'a> {
+    pub hidden: &'a [u8],
+    pub len: usize,
+    /// Per layer, this segment's K/V caches.
+    pub k: Vec<wgpu::Buffer>,
+    pub v: Vec<wgpu::Buffer>,
+}
+
+/// Prefill several segments at once, one first-token id per segment.
+///
+/// This exists because the two halves of prefill want different shapes:
+///
+/// * **The projections are row-independent.**  `rms_norm`, `qkv`, `o`, `gu`,
+///   `silu`, `dp` compute row `i` without looking at any other row, so all
+///   segments' rows go through **one** GEMM per layer (`m = sum of lengths`)
+///   instead of one GEMM per segment.  Measured on 27x40 s segments: the
+///   projections are 89% of this phase, and they were being issued as 27 small
+///   GEMMs each layer.
+/// * **Attention is not.**  A row attends only inside its own segment, and each
+///   segment's KV is a different buffer, so this half stays per segment -- and it
+///   is the cheap half (11%).
+///
+/// The arithmetic per row is the same statements in the same order as
+/// [`WgpuTextDecoder::prefill`]; only the dispatch grouping changes.  Segments
+/// that need the slab attention path (>4096 rows) or an int8 checkpoint take the
+/// single-segment path, because those two variants would need per-segment slab
+/// bookkeeping for no measurable gain at segment lengths.
+pub fn prefill_batch(
+    slots: &mut [&mut WgpuTextDecoder],
+    plans: &[(usize, &[u8])],
+) -> Result<Vec<i32>> {
+    anyhow::ensure!(!slots.is_empty(), "prefill_batch: no slots");
+    anyhow::ensure!(slots.len() == plans.len(), "prefill_batch: slot/plan mismatch");
+    let nl = slots[0].layers.len();
+    anyhow::ensure!(nl == slots[0].cfg.num_hidden_layers as usize, "layer count");
+
+    // The clones are handles: `wgpu::Buffer` is refcounted, so a slot's KV is
+    // reachable from here without borrowing the slot itself.
+    let kv: Vec<Vec<(wgpu::Buffer, wgpu::Buffer)>> = (0..nl)
+        .map(|l| {
+            slots
+                .iter()
+                .map(|d| (d.layers[l].k_cache.clone(), d.layers[l].v_cache.clone()))
+                .collect()
+        })
+        .collect();
+
+    let flat = !slots[0].int8 && plans.iter().all(|(len, _)| !slab_path(*len));
+    if plans.len() < 2 || !flat {
+        return (0..slots.len())
+            .map(|i| slots[i].prefill(plans[i].1, plans[i].0, 0))
+            .collect();
+    }
+
+    let segs: Vec<PrefillSeg<'_>> = plans
+        .iter()
+        .enumerate()
+        .map(|(i, (len, hidden))| PrefillSeg {
+            hidden,
+            len: *len,
+            k: kv.iter().map(|per_slot| per_slot[i].0.clone()).collect(),
+            v: kv.iter().map(|per_slot| per_slot[i].1.clone()).collect(),
+        })
+        .collect();
+    slots[0].prefill_multi(&segs)
+}
+
+impl WgpuTextDecoder {
+    /// The batched body of [`prefill_batch`]; see that function for why the work
+    /// splits the way it does.
+    fn prefill_multi(&mut self, segs: &[PrefillSeg<'_>]) -> Result<Vec<i32>> {
+        let cfg = self.cfg.clone();
+        let hs = cfg.hidden_size;
+        let nqh = cfg.num_attention_heads;
+        let nkvh = cfg.num_key_value_heads;
+        let hd = cfg.head_dim;
+        let inter = cfg.intermediate_size;
+
+        // Row layout: segment i owns rows `r0[i] .. r0[i]+len[i]` of the shared
+        // activation buffers, exactly as consecutive rows of one sequence.
+        let lens: Vec<usize> = segs.iter().map(|g| g.len).collect();
+        let mut r0 = Vec::with_capacity(lens.len());
+        let mut acc = 0usize;
+        for &l in &lens {
+            r0.push(acc);
+            acc += l;
+        }
+        let s = acc;
+        let mp = s.div_ceil(128) * 128;
+        // Per-segment attention geometry, one segment at a time: sized by the
+        // longest, reused by all, so the scratch stays constant.
+        let len_max = *lens.iter().max().expect("segments");
+        let mp_max = len_max.div_ceil(128) * 128;
+        let cur_max = len_max;
+        let np_max = cur_max.div_ceil(128) * 128;
+        let cur16_max = cur_max.div_ceil(16) * 16;
+
+        let words = |rows: usize, cols: usize| (rows * cols / 2 * 4) as u64;
+        let mut up = self.gpu.uploader();
+        // Shared, batched rows.
+        let h_buf = up.storage("pb.h", words(mp, hs));
+        let normed = up.storage("pb.normed", words(mp, hs));
+        let norm2 = up.storage("pb.norm2", words(mp, hs));
+        let qkv = up.storage("pb.qkv", words(mp, cfg.fused_qkv_cols()));
+        let attn_flat = up.storage("pb.attn_flat", words(mp, nqh * hd));
+        let gu = up.storage("pb.gu", words(mp, 2 * inter));
+        let activated = up.storage("pb.activated", words(mp, inter));
+        // Attention scratch, reused across segments (they run sequentially).
+        let q_out = up.storage("pb.q_out", words(nqh * mp_max, hd));
+        let scores = up.storage("pb.scores", words(nqh * mp_max, np_max));
+        let k_rep = up.storage("pb.k_rep", words(nqh * np_max, hd));
+        let v_rep = up.storage("pb.v_rep", words(nqh * np_max, hd));
+        let attn = up.storage("pb.attn", words(nqh * mp_max, cur16_max));
+
+        const MAX_GEMMS: u64 = 512;
+        let u_gd = up.uniform("pb.gd", MAX_GEMMS * 256);
+        // One 64-byte config per segment per kernel family: the dispatch that
+        // reads it is per segment, and a single uniform written N times before
+        // submit would reach all of them with the last value.
+        let u_seg = up.uniform("pb.seg", 32 * 256);
+        let u_sl = up.uniform("pb.sl", 32 * 256);
+        let u_rk = up.uniform("pb.rk", 32 * 256);
+
+        // Hidden rows of every segment, concatenated.
+        let mut hidden = Vec::with_capacity(s * hs * 2);
+        for g in segs {
+            hidden.extend_from_slice(&g.hidden[..g.len * hs * 2]);
+        }
+        up.upload(&h_buf, &hidden)?;
+        up.finish()?;
+
+        let gpu = &self.gpu;
+        let scale = cfg.scale();
+        let eps = cfg.rms_norm_eps;
+        let max_seq = self.cap as u32;
+
+        // One config per segment per kernel family: the dispatches are per
+        // segment, and a single uniform written N times before submit would
+        // reach every one of them with the last value.
+        let cur16s: Vec<usize> = lens.iter().map(|l| l.div_ceil(16) * 16).collect();
+        let nps: Vec<usize> = lens.iter().map(|l| l.div_ceil(128) * 128).collect();
+        let mps: Vec<usize> = lens.iter().map(|l| l.div_ceil(128) * 128).collect();
+        for (i, _) in lens.iter().enumerate() {
+            self.gpu.write_at(
+                &u_seg,
+                (i * 256) as u64,
+                bytemuck::bytes_of(&QkvxCfg {
+                    max_seq,
+                    start: 0,
+                    pos_offset: 0,
+                    // `q_out` row stride: this segment's own padded row count, so
+                    // `extract` writes and the scores GEMM reads the same layout
+                    // (`bsa = mps[i]*hd/2`).  The buffer is sized by the longest
+                    // segment and each segment uses its prefix.
+                    s: mps[i] as u32,
+                    eps,
+                    _a: 0,
+                    _b: 0,
+                    _c: 0,
+                }),
+            );
+            let sm_grid = grid_xy(nqh * lens[i]);
+            self.gpu.write_at(
+                &u_sl,
+                (i * 256) as u64,
+                bytemuck::bytes_of(&SoftmaxCfg {
+                    n_w: (cur16s[i] / 2) as u32,
+                    n_x: (nps[i] / 2) as u32,
+                    valid: lens[i] as u32,
+                    m: lens[i] as u32,
+                    mp: mps[i] as u32,
+                    scale,
+                    gx: sm_grid.0,
+                    row0: 0,
+                    q_off: 0,
+                }),
+            );
+            let rk_grid = grid_xy((nqh * lens[i] * hd / 2).div_ceil(256));
+            self.gpu.write_at(
+                &u_rk,
+                (i * 256) as u64,
+                bytemuck::bytes_of(&RepeatKvCfg {
+                    nkvh: nkvh as u32,
+                    max_seq,
+                    cur: lens[i] as u32,
+                    hd: hd as u32,
+                    npw: (nps[i] * hd / 2) as u32,
+                    gx: rk_grid.0,
+                }),
+            );
+        }
+
+        let gemm_bg = |pipe: &wgpu::ComputePipeline,
+                       a: &wgpu::Buffer,
+                       w: &wgpu::Buffer,
+                       c: &wgpu::Buffer,
+                       coff: u64|
+         -> wgpu::BindGroup {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("pb.gemm"),
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: a.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: w.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: if coff == 0 {
+                            c.as_entire_binding()
+                        } else {
+                            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: c,
+                                offset: coff,
+                                size: None,
+                            })
+                        },
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &u_gd,
+                            offset: 0,
+                            size: std::num::NonZeroU64::new(64),
+                        }),
+                    },
+                ],
+            })
+        };
+
+        let mut gd_slot = 0usize;
+        macro_rules! gemm {
+            ($cp:expr, $pipe:expr, $a:expr, $w:expr, $c:expr, $coff:expr, $bounds:expr,
+             $gx:expr, $gy:expr, $gz:expr) => {{
+                let slot = gd_slot;
+                gd_slot += 1;
+                assert!(slot < MAX_GEMMS as usize, "prefill_batch: GEMM slots exhausted");
+                let off = (slot * 256) as u64;
+                gpu.queue.write_buffer(&u_gd, off, bytemuck::bytes_of(&$bounds));
+                let bg = gemm_bg($pipe, $a, $w, $c, $coff);
+                $cp.set_pipeline($pipe);
+                $cp.set_bind_group(0, &bg, &[off as u32]);
+                $cp.dispatch_workgroups($gx, $gy, $gz);
+            }};
+        }
+
+        let (silu_gx, silu_gy) = self.write_silu_rows(s);
+        let rms_bg = |x: &wgpu::Buffer, w: &wgpu::Buffer, y: &wgpu::Buffer| -> wgpu::BindGroup {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("pb.rms"),
+                layout: &self.pipes.rms_norm.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: w.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: y.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.scratch.u_rms.as_entire_binding(),
+                    },
+                ],
+            })
+        };
+
+        let mut enc = gpu.device.create_command_encoder(&Default::default());
+        let mut cp = enc.begin_compute_pass(&Default::default());
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            // front: norm + qkv over every segment's rows
+            let bg = rms_bg(&h_buf, &layer.iln_w, &normed);
+            cp.set_pipeline(&self.pipes.rms_norm);
+            cp.set_bind_group(0, &bg, &[]);
+            cp.dispatch_workgroups(s as u32, 1, 1);
+            gemm!(
+                &mut cp, &self.pipes.gemm, &normed, &layer.qkv_w, &qkv, 0u64,
+                GDims {
+                    m: s as u32,
+                    n: cfg.fused_qkv_cols() as u32,
+                    k: hs as u32,
+                    ldc: cfg.fused_qkv_cols() as u32,
+                    bsa: 0,
+                    bsb: 0,
+                    bsc: 0,
+                    beta: 0,
+                    row0: 0,
+                    lda: hs as u32,
+                    q_off: 0,
+                },
+                (cfg.fused_qkv_cols() / 128) as u32, (mp / 128) as u32, 1
+            );
+
+            // attention: per segment, each into its own KV
+            for (i, seg) in segs.iter().enumerate() {
+                let len = seg.len;
+                let mpi = mps[i];
+                let npi = nps[i];
+                let cur16i = cur16s[i];
+                let row0 = r0[i];
+
+                // RoPE + KV write, reading this segment's rows of `qkv`.
+                let qkv_off = (row0 * cfg.fused_qkv_cols() * 2) as u64;
+                let bg_ex = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("pb.extract"),
+                    layout: &self.pipes.extract.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &qkv,
+                                offset: qkv_off,
+                                size: None,
+                            }),
+                        },
+                        wgpu::BindGroupEntry { binding: 1, resource: layer.qn_w.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: layer.kn_w.as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: self.scratch.cos.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: self.scratch.sin.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry { binding: 5, resource: q_out.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 6, resource: seg.k[li].as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 7, resource: seg.v[li].as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 8,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &u_seg,
+                                offset: (i * 256) as u64,
+                                size: std::num::NonZeroU64::new(64),
+                            }),
+                        },
+                    ],
+                });
+                cp.set_pipeline(&self.pipes.extract);
+                cp.set_bind_group(0, &bg_ex, &[]);
+                cp.dispatch_workgroups(len as u32, (nqh + nkvh) as u32, 1);
+
+                // K/V repeated over the query heads, into this segment's scratch.
+                let repeat_grid = grid_xy((nqh * len * hd / 2).div_ceil(256));
+                for (cache, out) in [(&seg.k[li], &k_rep), (&seg.v[li], &v_rep)] {
+                    let bg_rk = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("pb.rk"),
+                        layout: &self.pipes.repeat_kv.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: cache.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry { binding: 1, resource: out.as_entire_binding() },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: &u_rk,
+                                    offset: (i * 256) as u64,
+                                    size: std::num::NonZeroU64::new(64),
+                                }),
+                            },
+                        ],
+                    });
+                    cp.set_pipeline(&self.pipes.repeat_kv);
+                    cp.set_bind_group(0, &bg_rk, &[]);
+                    cp.dispatch_workgroups(repeat_grid.0, repeat_grid.1, 1);
+                }
+
+                let softmax_grid = grid_xy(nqh * len);
+
+                // scores = Q . K^T, causal inside the segment.
+                gemm!(
+                    &mut cp, &self.pipes.gemm_causal, &q_out, &k_rep, &scores, 0u64,
+                    GDims {
+                        m: len as u32,
+                        n: len as u32,
+                        k: hd as u32,
+                        ldc: npi as u32,
+                        bsa: (mpi * hd / 2) as u32,
+                        bsb: (npi * hd / 2) as u32,
+                        bsc: (mpi * npi) as u32,
+                        beta: 0,
+                        row0: 0,
+                        lda: hd as u32,
+                        q_off: 0,
+                    },
+                    (npi / 128) as u32, (mpi / 128) as u32, nqh as u32
+                );
+                let (phys, tree) = softmax_blocks(len);
+                let sm_pipe = if phys == tree {
+                    &self.pipes.softmax[&(tree as usize)]
+                } else {
+                    &self.pipes.softmax_wide[&(phys as usize, tree as usize)]
+                };
+                let bg_sm = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("pb.sm"),
+                    layout: &sm_pipe.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: scores.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: attn.as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &u_sl,
+                                offset: (i * 256) as u64,
+                                size: std::num::NonZeroU64::new(64),
+                            }),
+                        },
+                    ],
+                });
+                cp.set_pipeline(sm_pipe);
+                // The softmax layout's uniform is a dynamic-offset binding (the
+                // slab path walks slab configs with it); this path puts the
+                // segment's slot in the binding itself.
+                cp.set_bind_group(0, &bg_sm, &[0]);
+                cp.dispatch_workgroups(softmax_grid.0, softmax_grid.1, 1);
+
+                // attention . V into this segment's rows of the shared buffer,
+                // which is what lets the `o` GEMM see every segment at once.
+                let out_off = (row0 * nqh * hd * 2) as u64;
+                gemm!(
+                    &mut cp, &self.pipes.gemm_av_causal, &attn, &v_rep, &attn_flat, out_off,
+                    GDims {
+                        m: len as u32,
+                        n: hd as u32,
+                        k: cur16i as u32,
+                        ldc: (nqh * hd) as u32,
+                        bsa: (mpi * cur16i / 2) as u32,
+                        bsb: (npi * hd / 2) as u32,
+                        bsc: hd as u32,
+                        beta: 0,
+                        row0: 0,
+                        lda: cur16i as u32,
+                        q_off: 0,
+                    },
+                    1, (mpi / 128) as u32, nqh as u32
+                );
+            }
+
+            // o over every row, then the FFN
+            gemm!(
+                &mut cp, &self.pipes.gemm_acc, &attn_flat, &layer.o_w, &h_buf, 0u64,
+                GDims {
+                    m: s as u32,
+                    n: hs as u32,
+                    k: (nqh * hd) as u32,
+                    ldc: hs as u32,
+                    bsa: 0,
+                    bsb: 0,
+                    bsc: 0,
+                    beta: 0,
+                    row0: 0,
+                    lda: (nqh * hd) as u32,
+                    q_off: 0,
+                },
+                (hs / 128) as u32, (mp / 128) as u32, 1
+            );
+            let bg2 = rms_bg(&h_buf, &layer.pln_w, &norm2);
+            cp.set_pipeline(&self.pipes.rms_norm);
+            cp.set_bind_group(0, &bg2, &[]);
+            cp.dispatch_workgroups(s as u32, 1, 1);
+            gemm!(
+                &mut cp, &self.pipes.gemm, &norm2, &layer.gu_w, &gu, 0u64,
+                GDims {
+                    m: s as u32,
+                    n: (2 * inter) as u32,
+                    k: hs as u32,
+                    ldc: (2 * inter) as u32,
+                    bsa: 0,
+                    bsb: 0,
+                    bsc: 0,
+                    beta: 0,
+                    row0: 0,
+                    lda: hs as u32,
+                    q_off: 0,
+                },
+                ((2 * inter) / 128) as u32, (mp / 128) as u32, 1
+            );
+            let bg_silu = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("pb.silu"),
+                layout: &self.pipes.silu.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: gu.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: activated.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.scratch.u_silu.as_entire_binding(),
+                    },
+                ],
+            });
+            cp.set_pipeline(&self.pipes.silu);
+            cp.set_bind_group(0, &bg_silu, &[]);
+            cp.dispatch_workgroups(silu_gx, silu_gy, 1);
+            gemm!(
+                &mut cp, &self.pipes.gemm_acc, &activated, &layer.dp_w, &h_buf, 0u64,
+                GDims {
+                    m: s as u32,
+                    n: hs as u32,
+                    k: inter as u32,
+                    ldc: hs as u32,
+                    bsa: 0,
+                    bsb: 0,
+                    bsc: 0,
+                    beta: 0,
+                    row0: 0,
+                    lda: inter as u32,
+                    q_off: 0,
+                },
+                (hs / 128) as u32, (mp / 128) as u32, 1
+            );
+
+            // The GEMM uniform is a slot array; a layer spends `4 + 2*segs.len()`
+            // of them, so submit and recycle well before it fills.
+            if (li + 1) % 4 == 0 && li + 1 < self.layers.len() {
+                drop(cp);
+                gpu.queue.submit([enc.finish()]);
+                enc = gpu.device.create_command_encoder(&Default::default());
+                cp = enc.begin_compute_pass(&Default::default());
+                gd_slot = 0;
+            }
+        }
+
+        // Tail: each segment's last row through the final norm, `lm_head` and
+        // argmax.  The last row is the only one that predicts a next token.
+        let mut tokens = Vec::with_capacity(segs.len());
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pb.tokens"),
+            size: (4 * segs.len()) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        drop(cp);
+        for (i, seg) in segs.iter().enumerate() {
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            let last = ((r0[i] + seg.len - 1) * hs * 2) as u64;
+            let bg_fn = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("pb.final_rms"),
+                layout: &self.pipes.rms_norm.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &h_buf,
+                            offset: last,
+                            size: std::num::NonZeroU64::new((hs * 2) as u64),
+                        }),
+                    },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.norm_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.scratch.final_norm.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.scratch.u_rms.as_entire_binding(),
+                    },
+                ],
+            });
+            cp.set_pipeline(&self.pipes.rms_norm);
+            cp.set_bind_group(0, &bg_fn, &[]);
+            cp.dispatch_workgroups(1, 1, 1);
+            cp.set_pipeline(&self.pipes.gemv_lm);
+            cp.set_bind_group(0, &self.bg_gemv_lm, &[]);
+            cp.dispatch_workgroups((cfg.vocab_size / 8) as u32, 1, 1);
+            cp.set_pipeline(&self.pipes.argmax);
+            cp.set_bind_group(0, &self.bg_argmax, &[]);
+            cp.dispatch_workgroups(1, 1, 1);
+            drop(cp);
+            enc.copy_buffer_to_buffer(&self.scratch.token, 0, &staging, (i * 4) as u64, 4);
+        }
+        gpu.queue.submit([enc.finish()]);
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .context("poll prefill_batch")?;
+        rx.recv().context("map callback dropped")?.context("map prefill_batch")?;
+        {
+            let d = slice.get_mapped_range()?;
+            for i in 0..segs.len() {
+                tokens.push(i32::from_le_bytes([
+                    d[i * 4],
+                    d[i * 4 + 1],
+                    d[i * 4 + 2],
+                    d[i * 4 + 3],
+                ]));
+            }
+        }
+        staging.unmap();
+        Ok(tokens)
     }
 }
 
