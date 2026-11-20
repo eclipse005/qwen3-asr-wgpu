@@ -72,7 +72,7 @@ The run prints the device in use (GPU or CPU), timings and the recognized langua
 | `--wav <file>` | Audio to transcribe; any sample rate, resampled to 16 kHz internally |
 | `--lang <name>` | Language such as `zh` or `English`; omit for automatic detection |
 | `--prompt <text>` | Context / hot words (domain terms, names) that bias transcription through the system message |
-| `--max-new <n>` | Generation cap, default 2048 |
+| `--max-new <n>` | Generation cap in tokens, default 2048 |
 | `--device <name>` | `auto` (default: discrete GPU, then integrated, else CPU), `cpu`, `gpu` (discrete then integrated, error if none opens), or `vulkan[:i]` / `dx12` / a name substring |
 | `--list-devices` | List the devices usable on this machine |
 
@@ -91,7 +91,7 @@ transcribe_batch --model ./Qwen3-ASR-1.7B-hf --batch 16 \
 |------|---------|
 | `--wav <file...>` | the audio list; its order is the output order |
 | `--batch <n>` | segments decoded at once, default `1` (the per-segment path) |
-| `--max-new <n>` | generation cap per segment, default 256 |
+| `--max-new <n>` | **token** cap per segment (not seconds), default 256; a 60 s segment needs ~150–260, and `stop=max-tokens` in the output means it was not enough |
 | `--compare` | also run `--batch 1` and diff segment by segment, non-zero exit on any difference |
 | `--timings` | print the `mel / encoder / prefill / decode` breakdown |
 | `--out <file>` | write one transcript per line, in input order |

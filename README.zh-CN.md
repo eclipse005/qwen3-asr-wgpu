@@ -72,7 +72,7 @@ transcribe --model ./Qwen3-ASR-0.6B-hf --wav ./audio.wav
 | `--wav <file>` | 要转写的音频；任意采样率，内部自动重采样到 16 kHz |
 | `--lang <name>` | 语言，如 `zh`、`English`；不填则自动识别 |
 | `--prompt <text>` | 上下文 / 热词（领域词、人名），经 system 消息偏置转写结果 |
-| `--max-new <n>` | 生成上限，默认 2048 |
+| `--max-new <n>` | 生成上限（token 数），默认 2048 |
 | `--device <name>` | `auto`（默认：先独显再集显，都打不开才用 CPU）、`cpu`、`gpu`（先独显再集显，没有或打不开就报错），或 `vulkan[:i]` / `dx12` / 适配器名子串 |
 | `--list-devices` | 列出本机可用设备 |
 
@@ -90,7 +90,7 @@ transcribe_batch --model ./Qwen3-ASR-1.7B-hf --batch 16 \
 |------|------|
 | `--wav <file...>` | 音频列表，顺序即输出顺序 |
 | `--batch <n>` | 同时解码几段，默认 `1`（逐段路径） |
-| `--max-new <n>` | 每段生成上限，默认 256 |
+| `--max-new <n>` | 每段生成的 **token** 上限（不是秒），默认 256；60 s 段约需 150–260，跑完看 `stop=max-tokens` 判断是否够用 |
 | `--compare` | 再跑一遍 `--batch 1` 并逐段 diff，有差异即非零退出 |
 | `--timings` | 打印 `mel / encoder / prefill / decode` 四段耗时 |
 | `--out <file>` | 把文本按行写入文件（与输入同序） |
