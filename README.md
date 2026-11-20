@@ -96,7 +96,7 @@ per slot), so pick it against your card.
 | `--wav <file...>` | the audio list (repeatable); its order is the output order |
 | `--manifest <jsonl>` | one audio per line, with optional per-item settings |
 | `--batch <n>` | segments decoded at once, default `1` |
-| `--max-new <n>` | token cap per segment, default 512; `stop=max-tokens` means it truncated |
+| `--max-new <n>` | token cap per segment, default 2048 (same as the library); `stop=max-tokens` means it truncated |
 | `--out <file>` | one transcript per line, in input order |
 | `--out-format <text\|jsonl>` | `jsonl` writes `{"audio","language","stop","text"}` per line |
 | `--compare` | re-run the same list at `--batch 1` and diff it, non-zero exit on any difference |

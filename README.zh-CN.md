@@ -96,7 +96,7 @@ transcribe --model ./Qwen3-ASR-1.7B-hf --manifest items.jsonl --batch 16 \
 | `--wav <file...>` | 音频列表（可出现多次），顺序即输出顺序 |
 | `--manifest <jsonl>` | 每行一个音频及其可选参数，见下 |
 | `--batch <n>` | 同时解码几段，默认 `1` |
-| `--max-new <n>` | 每段生成的 token 上限，默认 512；跑完看 `stop=max-tokens` 判断是否截断 |
+| `--max-new <n>` | 每段生成的 token 上限，默认 2048（与库/单文件一致）；跑完看 `stop=max-tokens` 判断是否截断 |
 | `--out <file>` | 按输入顺序写文本，一行一段 |
 | `--out-format <text\|jsonl>` | `jsonl` 时每行输出 `{"audio","language","stop","text"}` |
 | `--compare` | 同一列表再跑一遍 `--batch 1` 并逐段对比，有差异即非零退出 |

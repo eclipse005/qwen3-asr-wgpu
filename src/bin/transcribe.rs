@@ -281,9 +281,12 @@ pub fn run(args: Vec<String>) -> Result<()> {
             .or_else(|| std::env::var("QASR_DEVICE").ok().filter(|s| !s.is_empty()))
             .unwrap_or_else(|| "auto".to_string())
     };
+    // The library's default (`TranscribeOptions::default()`), not a number of its
+    // own: a CLI default lower than the library's silently truncates audio the
+    // library path would finish (a 4-minute clip is ~1036 tokens).
     let max_new: usize = arg(&args, "--max-new")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(512);
+        .unwrap_or_else(|| TranscribeOptions::default().max_new_tokens);
     let cpu_enc = flag(&args, "--cpu-enc");
 
     println!("model: {}", model.display());
