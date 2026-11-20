@@ -69,8 +69,8 @@ pub use backend::Backend;
 pub use error::{AsrError, Result};
 pub use gpu::{list_devices, DeviceInfo, DeviceSelector, DeviceTarget, Gpu};
 pub use inference::{
-    resolve_model_dir, supported_languages, AsrInference, EncoderBackend, StreamToken,
-    TranscribeOptions,
+    resolve_model_dir, supported_languages, AsrInference, AudioSpec, BatchTimings, EncoderBackend,
+    StreamToken, TranscribeOptions,
 };
 pub use mel::load_audio_wav;
 pub use processor::{AsrTranscription, Decoded, ReturnFormat, TranscriptionRequest};

@@ -76,36 +76,55 @@ The run prints the device in use (GPU or CPU), timings and the recognized langua
 | `--device <name>` | `auto` (default: discrete GPU, then integrated, else CPU), `cpu`, `gpu` (discrete then integrated, error if none opens), or `vulkan[:i]` / `dx12` / a name substring |
 | `--list-devices` | List the devices usable on this machine |
 
-### Batch transcription
+### One file, a list, or a manifest
 
-When the audio is already segmented upstream (e.g. FireRedVAD: 60 s target blocks cut
-at silence midpoints, 3 min per segment at most), `transcribe_batch` takes the list and
-returns the transcripts **in the same order**:
+`transcribe` takes all three; `--batch` is just one of its flags:
 
 ```bash
-transcribe_batch --model ./Qwen3-ASR-1.7B-hf --batch 16 \
-                 --wav segs/part000.wav segs/part001.wav ... --out texts.txt
+transcribe --model ./Qwen3-ASR-1.7B-hf --wav speech.wav                    # single file
+transcribe --model ./Qwen3-ASR-1.7B-hf --batch 16            --wav segs/part000.wav segs/part001.wav ... --out texts.txt     # list
+transcribe --model ./Qwen3-ASR-1.7B-hf --manifest items.jsonl --batch 16 \
+           --out texts.jsonl --out-format jsonl                            # manifest
 ```
+
+`--batch N` decodes N segments at once: the default `1` is the per-segment path, and `N>1`
+reads each weight once per step for all N slots. VRAM grows linearly with N (one KV cache
+per slot), so pick it against your card.
 
 | Flag | Meaning |
 |------|---------|
-| `--wav <file...>` | the audio list; its order is the output order |
-| `--batch <n>` | segments decoded at once, default `1` (the per-segment path) |
-| `--max-new <n>` | token cap per segment, default as in `transcribe` (2048); `stop=max-tokens` in the output means it truncated. It also sizes each slot's KV (`prompt + max_new + 8`), so lower it when running many slots on a small card |
-| `--compare` | also run `--batch 1` and diff segment by segment, non-zero exit on any difference |
+| `--wav <file...>` | the audio list (repeatable); its order is the output order |
+| `--manifest <jsonl>` | one audio per line, with optional per-item settings |
+| `--batch <n>` | segments decoded at once, default `1` |
+| `--max-new <n>` | token cap per segment, default 512; `stop=max-tokens` means it truncated |
+| `--out <file>` | one transcript per line, in input order |
+| `--out-format <text\|jsonl>` | `jsonl` writes `{"audio","language","stop","text"}` per line |
+| `--compare` | re-run the same list at `--batch 1` and diff it, non-zero exit on any difference |
 | `--timings` | print the `mel / encoder / prefill / decode` breakdown |
-| `--out <file>` | write one transcript per line, in input order |
-| `--model` / `--device` | as in `transcribe` |
 
-`--batch N` decodes N segments at once: the default `1` is the per-segment path, and
-`N>1` reads each weight once per step for all N slots. VRAM grows linearly with N (one
-KV cache per slot), so pick it against your card.
+#### Manifest format
 
-**The output is byte-identical to `--batch 1`** — by construction, not by luck: every
-slot reads its own buffers (`binding_array` indexed by `wgpu.z`), so batching changes
-only how many segments one dispatch covers, never the order a segment accumulates in.
-`--compare` re-runs the list at `--batch 1` and diffs it segment by segment, exiting
-non-zero on any difference.
+```jsonl
+{"audio":"segs/p000.wav"}
+{"audio":"segs/p001.wav","language":"English"}
+{"audio":"segs/p002.wav","prompt":"Vocabulary: swing points.","max_new":768}
+```
+
+| Field | Required | Meaning |
+|------|------|---------|
+| `audio` | ✓ | path, resolved against the manifest's directory when relative |
+| `language` / `lang` | | forced language for this item, overrides `--lang` |
+| `prompt` / `context` | | hotwords / context for this item, overrides `--prompt` |
+| `max_new` | | generation cap for this item, overrides `--max-new`; the batch's KV is sized by the largest |
+
+Unknown fields, a missing `audio`, and a missing file are all **line-numbered errors** rather
+than silently ignored settings. The command line's `--lang` / `--prompt` / `--max-new` still
+apply to every item; manifest fields only override per item.
+
+**The output is byte-identical to `--batch 1`**, by construction: every slot reads its own
+buffers (`binding_array` indexed by `wgpu.z`), so batching changes only how many segments one
+dispatch covers, never the order a segment accumulates in. `--compare` is that guarantee's
+self-check.
 
 | Limit | Value |
 |---|---|
@@ -113,8 +132,13 @@ non-zero on any difference.
 | Segment length on the batched path | `prompt + max_new <= 4096` (KV memory); longer segments fall back to the per-segment path instead of failing |
 | VRAM | roughly `4.8 GiB model + 0.2 GiB × N` for 60 s segments |
 
-The library entry point is `AsrInference::transcribe_wavs_batch(wavs, opts, batch)`
-(plus `transcribe_wavs_batch_timed` for a per-phase breakdown).
+Diagnostic modes (`--stream`, `--session`, `--mel`, `--embeds`, ...) need a single file and say
+so when given a list. The old `transcribe_batch` still runs: it prints one deprecation line and
+forwards to the same implementation.
+
+Library entry points: `AsrInference::transcribe_wavs_batch(wavs, opts, batch)`, and
+`transcribe_specs(&[AudioSpec], opts, batch)` when items need their own settings (both have
+`_timed` variants).
 
 ### Library
 

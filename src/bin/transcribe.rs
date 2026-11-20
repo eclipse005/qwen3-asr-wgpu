@@ -3,7 +3,8 @@ use std::time::Instant;
 
 use anyhow::Result;
 use qwen3_asr_wgpu::{
-    diagnostics, AsrInference, Backend, DeviceSelector, EncoderBackend, TranscribeOptions,
+    diagnostics, AsrInference, AudioSpec, Backend, DeviceSelector, EncoderBackend,
+    TranscribeOptions,
 };
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -51,8 +52,192 @@ fn required(args: &[String], name: &str, env: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("{name} is required (or set {env})"))
 }
 
+
+/// Every `--wav` value: variadic (a list) and repeatable, so both
+/// `--wav a.wav b.wav` and `--wav a.wav --wav b.wav` work.
+fn collect_wavs(args: &[String]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--wav" {
+            let mut j = i + 1;
+            while j < args.len() && !args[j].starts_with("--") {
+                out.push(PathBuf::from(&args[j]));
+                j += 1;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// One manifest line.  `audio` is required; the rest fall back to the command
+/// line, so `--lang`/`--prompt`/`--max-new` still mean "for every item".
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestLine {
+    audio: PathBuf,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    lang: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    max_new: Option<usize>,
+}
+
+/// Read a JSONL manifest into specs, resolving relative paths against the
+/// manifest's own directory and rejecting unknown fields so a typo is an error
+/// rather than a silently ignored setting.
+fn load_manifest(
+    path: &std::path::Path,
+    default_lang: Option<&str>,
+    default_ctx: &str,
+    default_max_new: usize,
+) -> Result<Vec<AudioSpec>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    let base = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut out = Vec::new();
+    for (no, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut de = serde_json::Deserializer::from_str(line);
+        let item: ManifestLine = serde::Deserialize::deserialize(&mut de)
+            .map_err(|e| anyhow::anyhow!("{}:{}: {e}", path.display(), no + 1))?;
+        de.end()
+            .map_err(|e| anyhow::anyhow!("{}:{}: {e}", path.display(), no + 1))?;
+        let audio = if item.audio.is_absolute() { item.audio } else { base.join(&item.audio) };
+        anyhow::ensure!(
+            audio.is_file(),
+            "{}:{}: audio not found: {}",
+            path.display(),
+            no + 1,
+            audio.display()
+        );
+        out.push(AudioSpec {
+            audio,
+            language: item.language.or(item.lang).or_else(|| default_lang.map(str::to_string)),
+            context: item
+                .prompt
+                .or(item.context)
+                .unwrap_or_else(|| default_ctx.to_string()),
+            max_new_tokens: item.max_new.unwrap_or(default_max_new),
+        });
+    }
+    anyhow::ensure!(!out.is_empty(), "{}: no items", path.display());
+    Ok(out)
+}
+
+/// The list half: one call, one transcript per item, in input order.
+fn run_list(
+    asr: &AsrInference,
+    opts: &TranscribeOptions,
+    specs: &[AudioSpec],
+    batch: usize,
+    compare: bool,
+    timings: bool,
+    out_path: Option<&std::path::Path>,
+    jsonl: bool,
+) -> Result<()> {
+    let mut audio = 0.0f64;
+    for sp in specs {
+        let rd = hound::WavReader::open(&sp.audio)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", sp.audio.display()))?;
+        audio += rd.duration() as f64 / rd.spec().sample_rate as f64;
+    }
+    let t = Instant::now();
+    let (rs, ph) = asr.transcribe_specs_timed(specs, opts, batch)?;
+    let secs = t.elapsed().as_secs_f64();
+    if timings {
+        println!(
+            "phases  mel={:.2}s encoder={:.2}s prefill={:.2}s decode={:.2}s",
+            ph.mel.as_secs_f64(),
+            ph.encoder.as_secs_f64(),
+            ph.prefill.as_secs_f64(),
+            ph.decode.as_secs_f64()
+        );
+    }
+    println!(
+        "batch={batch} files={} audio={audio:.1}s elapsed={secs:.2}s RTFx={:.2}",
+        specs.len(),
+        audio / secs
+    );
+    if !jsonl {
+        for (sp, r) in specs.iter().zip(rs.iter()) {
+            let name = sp.audio.display().to_string();
+            println!("  {name} : {}", r.text.chars().take(40).collect::<String>());
+        }
+    }
+    if let Some(p) = out_path {
+        let body = if jsonl {
+            let mut v = String::new();
+            for (sp, r) in specs.iter().zip(rs.iter()) {
+                let stop = match r.stop_reason {
+                    qwen3_asr_wgpu::StopReason::Eos => "eos",
+                    qwen3_asr_wgpu::StopReason::MaxTokens => "max-tokens",
+                };
+                v.push_str(&serde_json::json!({
+                    "audio": sp.audio.display().to_string(),
+                    "language": r.language,
+                    "stop": stop,
+                    "text": r.text,
+                })
+                .to_string());
+                v.push(NL);
+            }
+            v
+        } else {
+            let mut v: String =
+                rs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join(&NL.to_string());
+            v.push(NL);
+            v
+        };
+        std::fs::write(p, body).map_err(|e| anyhow::anyhow!("{}: {e}", p.display()))?;
+    }
+    if compare {
+        // The batched path's own gate: the same list at `--batch 1` has to match
+        // segment by segment, or a "faster" run changed a transcript.
+        let (one, _) = asr.transcribe_specs_timed(specs, opts, 1)?;
+        let mut bad = 0usize;
+        let mut chars = (0usize, 0usize);
+        for (a, b) in one.iter().zip(rs.iter()) {
+            chars.0 += a.text.chars().count();
+            if a.text != b.text {
+                bad += 1;
+                println!("  DIFF {}", a.text.chars().take(40).collect::<String>());
+                println!("   vs {}", b.text.chars().take(40).collect::<String>());
+            }
+        }
+        let _ = chars;
+        println!(
+            "vs b=1: {bad} of {} segments differ{}",
+            rs.len(),
+            if bad == 0 { ", transcripts identical" } else { "" }
+        );
+        if bad > 0 {
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+const NL: char = '\n';
+
+#[allow(dead_code)] // also compiled as a module by the `transcribe_batch` shim
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+    run(std::env::args().collect())
+}
+
+/// The whole CLI as a function, so `transcribe_batch` can forward to it.
+pub fn run(args: Vec<String>) -> Result<()> {
     // These two answer without a model, so they run before the paths are
     // required — `transcribe --list-devices` on a fresh machine is the first
     // thing anyone types.
@@ -70,7 +255,26 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let model = PathBuf::from(required(&args, "--model", "QASR_MODEL")?);
-    let wav = PathBuf::from(required(&args, "--wav", "QASR_WAV")?);
+    // Inputs: `--manifest items.jsonl`, or `--wav a.wav [b.wav ...]`.  One wav
+    // keeps the single-file behaviour byte for byte; more than one (or a
+    // manifest) goes through the list path.
+    let manifest = arg(&args, "--manifest");
+    let wavs = collect_wavs(&args);
+    anyhow::ensure!(
+        manifest.is_some() || !wavs.is_empty(),
+        "--wav <file...> or --manifest <jsonl> is required"
+    );
+    let list_mode = manifest.is_some() || wavs.len() > 1;
+    let wav = wavs
+        .first()
+        .cloned()
+        .or_else(|| std::env::var("QASR_WAV").ok().filter(|s| !s.is_empty()).map(PathBuf::from))
+        .unwrap_or_default();
+    if !list_mode {
+        let diag = ["--stream", "--session", "--tokens", "--mel", "--embeds", "--diag-enc",
+                    "--baseline", "--compare-enc"];
+        let _ = diag;
+    }
     // `--cpu-dec` is the whole host path. Otherwise `auto` may fall back,
     // `gpu` must open a GPU, and a runtime or name is that adapter or an error.
     let spec = if flag(&args, "--cpu-dec") {
@@ -87,7 +291,14 @@ fn main() -> Result<()> {
     let cpu_enc = flag(&args, "--cpu-enc");
 
     println!("model: {}", model.display());
-    println!("wav:   {}", wav.display());
+    if let Some(m) = &manifest {
+        println!("manifest: {m}");
+    } else if list_mode {
+        println!("inputs: {} file(s)", wavs.len());
+    }
+    if !list_mode {
+        println!("wav:   {}", wav.display());
+    }
     let t_load = Instant::now();
     let asr = load_asr(&model, &spec, cpu_enc)?;
     println!(
@@ -96,6 +307,45 @@ fn main() -> Result<()> {
         if asr.gpu_encoder_active() { "gpu" } else { "cpu" }
     );
 
+    let batch: usize = arg(&args, "--batch").and_then(|v| v.parse().ok()).unwrap_or(1);
+    let out_path = arg(&args, "--out").map(PathBuf::from);
+    let jsonl = arg(&args, "--out-format").map(|f| f.eq_ignore_ascii_case("jsonl")).unwrap_or(false);
+    let want_compare = flag(&args, "--compare");
+    let want_timings = flag(&args, "--timings");
+    if list_mode {
+        for f in ["--stream", "--session", "--tokens", "--mel", "--embeds", "--diag-enc",
+                  "--baseline", "--compare-enc"] {
+            anyhow::ensure!(
+                !flag(&args, f),
+                "{f} is a single-file mode; give it one --wav"
+            );
+        }
+        let default_lang = arg(&args, "--language").or_else(|| arg(&args, "--lang"));
+        let default_ctx = arg(&args, "--prompt")
+            .or_else(|| arg(&args, "--context"))
+            .unwrap_or_default();
+        let specs = match &manifest {
+            Some(m) => load_manifest(std::path::Path::new(m), default_lang.as_deref(),
+                                     &default_ctx, max_new)?,
+            None => wavs
+                .iter()
+                .map(|w| AudioSpec {
+                    audio: w.clone(),
+                    language: default_lang.clone(),
+                    context: default_ctx.clone(),
+                    max_new_tokens: max_new,
+                })
+                .collect(),
+        };
+        let mut opts = TranscribeOptions::default().with_max_new_tokens(max_new);
+        opts = opts
+            .with_language(default_lang.as_deref().unwrap_or(""))
+            .with_context(&default_ctx);
+        return run_list(
+            &asr, &opts, &specs, batch.max(1), want_compare, want_timings,
+            out_path.as_deref(), jsonl,
+        );
+    }
     let mut opts = TranscribeOptions::default().with_max_new_tokens(max_new);
     // Official name first: transformers `apply_transcription_request(prompt=…)`
     // and the chat-template system message; `--context` is the qwen-asr

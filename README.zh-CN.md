@@ -76,42 +76,65 @@ transcribe --model ./Qwen3-ASR-0.6B-hf --wav ./audio.wav
 | `--device <name>` | `auto`（默认：先独显再集显，都打不开才用 CPU）、`cpu`、`gpu`（先独显再集显，没有或打不开就报错），或 `vulkan[:i]` / `dx12` / 适配器名子串 |
 | `--list-devices` | 列出本机可用设备 |
 
-### 批量转写（多段并发解码）
+### 单个 / 列表 / manifest
 
-上游已经用 VAD 分好段（比如 FireRedVAD：60 s 目标块、在静音中点切、单段上限 3 分钟）时，
-用 `transcribe_batch` 一次喂一个列表，返回**同序**的文本：
+`transcribe` 一个入口吃三种输入，`--batch` 只是其中一个参数：
 
 ```bash
-transcribe_batch --model ./Qwen3-ASR-1.7B-hf --batch 16 \
-                 --wav segs/part000.wav segs/part001.wav ... --out texts.txt
+transcribe --model ./Qwen3-ASR-1.7B-hf --wav speech.wav                    # 单文件（原来的行为）
+transcribe --model ./Qwen3-ASR-1.7B-hf --batch 16            --wav segs/part000.wav segs/part001.wav ... --out texts.txt     # 列表
+transcribe --model ./Qwen3-ASR-1.7B-hf --manifest items.jsonl --batch 16 \
+           --out texts.jsonl --out-format jsonl                            # manifest
 ```
+
+上游已经用 VAD 分好段（FireRedVAD：60 s 目标块、静音中点切、单段上限 3 分钟）时用后两种。
+**`--batch N` 指同时解码几段**：默认 1 走逐段路径；`N>1` 时每一步的权重只读一次、喂给 N 段，
+显存随 N 线性增长（每段一份 KV）。
 
 | 参数 | 说明 |
 |------|------|
-| `--wav <file...>` | 音频列表，顺序即输出顺序 |
-| `--batch <n>` | 同时解码几段，默认 `1`（逐段路径） |
-| `--max-new <n>` | 每段生成的 token 上限，默认与 `transcribe` 相同（2048）；跑完看 `stop=max-tokens` 判断是否截断。 它也决定每槽 KV 大小（`prompt + max_new + 8`），槽位多或显存紧时调小即可 |
-| `--compare` | 再跑一遍 `--batch 1` 并逐段 diff，有差异即非零退出 |
+| `--wav <file...>` | 音频列表（可出现多次），顺序即输出顺序 |
+| `--manifest <jsonl>` | 每行一个音频及其可选参数，见下 |
+| `--batch <n>` | 同时解码几段，默认 `1` |
+| `--max-new <n>` | 每段生成的 token 上限，默认 512；跑完看 `stop=max-tokens` 判断是否截断 |
+| `--out <file>` | 按输入顺序写文本，一行一段 |
+| `--out-format <text\|jsonl>` | `jsonl` 时每行输出 `{"audio","language","stop","text"}` |
+| `--compare` | 同一列表再跑一遍 `--batch 1` 并逐段对比，有差异即非零退出 |
 | `--timings` | 打印 `mel / encoder / prefill / decode` 四段耗时 |
-| `--out <file>` | 把文本按行写入文件（与输入同序） |
-| `--model` / `--device` | 同 `transcribe` |
 
-`--batch N` 指同时解码几段：默认 1 走逐段路径；`N>1` 时每一步的权重只读一次、喂给 N 段，
-显存随 N 线性增长（每段一份 KV），按自己显卡显存选即可。
+#### manifest 格式
 
-**输出与 `--batch 1` 逐字节相同** —— 不是近似，是构造上保证：每个 slot 读的是它自己那块
-buffer（`binding_array` 按 `wgpu.z` 索引），batch 只改变"一次 dispatch 覆盖几段"，不改变
-任何一段的累加顺序。加 `--compare` 会自己再跑一遍 `--batch 1` 并逐段 diff，任何一段不同
-即非零退出。
+```jsonl
+{"audio":"segs/p000.wav"}
+{"audio":"segs/p001.wav","language":"English"}
+{"audio":"segs/p002.wav","prompt":"热词：舒心 天海酒吧","max_new":768}
+```
+
+| 字段 | 必需 | 说明 |
+|------|------|------|
+| `audio` | ✓ | 路径；相对路径按 manifest 所在目录解析 |
+| `language` / `lang` | | 该段强制语言，覆盖 `--lang` |
+| `prompt` / `context` | | 该段热词/上下文，覆盖 `--prompt` |
+| `max_new` | | 该段生成上限，覆盖 `--max-new`；同批按最大值定 KV |
+
+字段名写错、缺 `audio`、路径不存在都会报出**带行号**的错误；未知字段不会静默忽略。
+命令行的 `--lang` / `--prompt` / `--max-new` 仍然对列表里的所有项生效，manifest 里的字段是逐项覆盖。
+
+**输出与 `--batch 1` 逐字节相同**，不是近似：每个 slot 读的是它自己那块 buffer
+（`binding_array` 按 `wgpu.z` 索引），batch 只改变"一次 dispatch 覆盖几段"，不改变任何一段的
+累加顺序。`--compare` 就是这条保证的自检。
 
 | 限制 | 值 |
 |---|---|
 | 每批槽位上限 | 32（`binding_array` 宽度）；再大不会更快，只多占显存 |
-| 批量路径的单段长度 | `prompt + max_new ≤ 4096`（受每槽 KV 显存限制）；超出的段自动退回逐段路径，不会失败 |
+| 批量路径的单段长度 | `prompt + max_new ≤ 4096`（每槽 KV 显存）；超出的段自动退回逐段路径，不会失败 |
 | 显存 | 约 `模型 4.8 GiB + 0.2 GiB × N`（60 s 段的典型值） |
 
-库里的等价入口是 `AsrInference::transcribe_wavs_batch(wavs, opts, batch)`（以及带阶段
-计时的 `transcribe_wavs_batch_timed`）。
+`--stream` / `--session` / `--mel` / `--embeds` 等诊断模式只对单文件有意义，给列表会直接报错。
+旧的 `transcribe_batch` 仍可用，会打一行弃用提示然后转发到同一份实现。
+
+库里的入口是 `AsrInference::transcribe_wavs_batch(wavs, opts, batch)`；
+需要逐项参数时用 `transcribe_specs(&[AudioSpec], opts, batch)`（两者都有 `_timed` 变体）。
 
 ### 作为库使用
 

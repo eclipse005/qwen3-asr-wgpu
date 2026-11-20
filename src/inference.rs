@@ -462,15 +462,25 @@ impl AsrInference {
         opts: &TranscribeOptions,
         batch: usize,
     ) -> crate::Result<Vec<TranscribeResult>> {
+        let specs: Vec<AudioSpec> = wavs
+            .iter()
+            .map(|w| AudioSpec::from_options(w.clone(), opts))
+            .collect();
+        self.transcribe_specs(&specs, opts, batch)
+    }
+
+    /// [`Self::transcribe_wavs_batch`] with per-item options: each item's
+    /// `language`, `context` and `max_new_tokens` win over `opts`, which supplies
+    /// everything a call shares (streaming knobs, decoder choice).
+    pub fn transcribe_specs(
+        &self,
+        specs: &[AudioSpec],
+        opts: &TranscribeOptions,
+        batch: usize,
+    ) -> crate::Result<Vec<TranscribeResult>> {
         let mut g = self.lock()?;
-        g.transcribe_wavs_batch_inner(
-            wavs,
-            opts.max_new_tokens,
-            opts,
-            batch,
-            &mut BatchTimings::default(),
-        )
-        .map_err(crate::AsrError::Inference)
+        g.transcribe_specs_inner(specs, opts, batch, &mut BatchTimings::default())
+            .map_err(crate::AsrError::Inference)
     }
 
     /// [`Self::transcribe_wavs_batch_inner`] with a phase breakdown.
@@ -480,10 +490,24 @@ impl AsrInference {
         opts: &TranscribeOptions,
         batch: usize,
     ) -> crate::Result<(Vec<TranscribeResult>, BatchTimings)> {
+        let specs: Vec<AudioSpec> = wavs
+            .iter()
+            .map(|w| AudioSpec::from_options(w.clone(), opts))
+            .collect();
+        self.transcribe_specs_timed(&specs, opts, batch)
+    }
+
+    /// [`Self::transcribe_specs`] with a phase breakdown.
+    pub fn transcribe_specs_timed(
+        &self,
+        specs: &[AudioSpec],
+        opts: &TranscribeOptions,
+        batch: usize,
+    ) -> crate::Result<(Vec<TranscribeResult>, BatchTimings)> {
         let mut t = BatchTimings::default();
         let mut g = self.lock()?;
         let out = g
-            .transcribe_wavs_batch_inner(wavs, opts.max_new_tokens, opts, batch, &mut t)
+            .transcribe_specs_inner(specs, opts, batch, &mut t)
             .map_err(crate::AsrError::Inference)?;
         Ok((out, t))
     }
@@ -685,6 +709,37 @@ fn fill_slots(
     }
 }
 
+/// One transcription input: its audio, plus the options a **manifest** can set
+/// per line.
+///
+/// A plain list of paths is the common case and uses the command line's values
+/// for all of them; a manifest exists because some pipelines do not: different
+/// languages in one batch, or a hotword list that only applies to one item.
+/// Per-item values win over the caller's [`TranscribeOptions`].
+#[derive(Debug, Clone)]
+pub struct AudioSpec {
+    pub audio: std::path::PathBuf,
+    /// Forced language for this item; `None` keeps detection.
+    pub language: Option<String>,
+    /// Hotword / context string for this item.
+    pub context: String,
+    /// Generation cap for this item.  A batch's per-slot KV is sized by the
+    /// largest of these in the group.
+    pub max_new_tokens: usize,
+}
+
+impl AudioSpec {
+    /// An item that takes everything from `opts`.
+    pub fn from_options(audio: std::path::PathBuf, opts: &TranscribeOptions) -> Self {
+        Self {
+            audio,
+            language: opts.language.clone(),
+            context: opts.context.clone(),
+            max_new_tokens: opts.max_new_tokens,
+        }
+    }
+}
+
 /// Where the wall clock of a batched transcription goes.
 ///
 /// The phases are sequential and each waits for the previous one -- mel on
@@ -701,6 +756,21 @@ pub struct BatchTimings {
     pub decode: std::time::Duration,
 }
 
+
+/// `opts` with one item's manifest fields applied, for the shipped
+/// single-sequence path (which reads all three out of the options struct).
+fn item_opts(
+    opts: &TranscribeOptions,
+    i: usize,
+    langs: &[Option<String>],
+    specs: &[AudioSpec],
+) -> TranscribeOptions {
+    let mut o = opts.clone();
+    o.max_new_tokens = specs[i].max_new_tokens;
+    o.language = langs[i].clone();
+    o.context = specs[i].context.clone();
+    o
+}
 
 impl Inner {
     pub fn load_with_selector(
@@ -1613,18 +1683,17 @@ impl Inner {
     /// and every projection reads its weight once for all of them.  The token
     /// streams are the ones the b=1 path produces -- the batch only changes when
     /// a dispatch reaches the GPU (see [`crate::decoder::BatchProjections`]).
-    pub(crate) fn transcribe_wavs_batch_inner(
+    pub(crate) fn transcribe_specs_inner(
         &mut self,
-        wavs: &[std::path::PathBuf],
-        max_new_tokens: usize,
+        specs: &[AudioSpec],
         opts: &TranscribeOptions,
         batch: usize,
         t: &mut BatchTimings,
     ) -> Result<Vec<TranscribeResult>> {
         // Every mel first, then every encoder: the encoder's transformer takes a
         // group as one pass, so it must not be called per segment.
-        let mut mels = Vec::with_capacity(wavs.len());
-        for w in wavs {
+        let mut mels = Vec::with_capacity(specs.len());
+        for w in specs.iter().map(|sp| &sp.audio) {
             let t0 = std::time::Instant::now();
             let samples = crate::mel::load_audio_wav(w, MEL_SAMPLE_RATE)?;
             let (mel, n_mels, n_frames) = self.mel.extract(&samples)?;
@@ -1634,21 +1703,31 @@ impl Inner {
         let t0 = std::time::Instant::now();
         let embeds = self.run_encoder_batch(&mels)?;
         t.encoder += t0.elapsed();
-        self.decode_batch_embeds(&embeds, max_new_tokens, opts, batch, t)
+        self.decode_batch_embeds(&embeds, specs, opts, batch, t)
     }
+
 
     /// The decode half of [`Self::transcribe_wavs_batch_inner`].
     pub(crate) fn decode_batch_embeds(
         &mut self,
         embeds: &[Vec<f32>],
-        max_new_tokens: usize,
+        specs: &[AudioSpec],
         opts: &TranscribeOptions,
         batch: usize,
         t: &mut BatchTimings,
     ) -> Result<Vec<TranscribeResult>> {
         use crate::decoder::{BatchProjections, WgpuTextDecoder};
         let hs = self.config.thinker_config.text_config.hidden_size;
-        let language = opts.forced_language()?;
+        anyhow::ensure!(embeds.len() == specs.len(), "spec/embed count mismatch");
+        // Per item: the manifest's language and context, or the call's.
+        let langs: Vec<Option<String>> = specs
+            .iter()
+            .map(|sp| match sp.language.as_deref().map(str::trim) {
+                Some(l) if !l.is_empty() => Ok(Some(prompt::resolve_language(l)?)),
+                _ => Ok(None),
+            })
+            .collect::<Result<_>>()?;
+        let max_news: Vec<usize> = specs.iter().map(|sp| sp.max_new_tokens).collect();
         let eos = [ENDOFTEXT_TOKEN_ID as i32, IM_END_TOKEN_ID as i32];
         let batch = batch.max(1);
         let mut out: Vec<Option<TranscribeResult>> = (0..embeds.len()).map(|_| None).collect();
@@ -1663,7 +1742,7 @@ impl Inner {
             .get("thinker.model.embed_tokens.weight")
             .ok_or_else(|| anyhow::anyhow!("missing embed table"))?;
         let mut plans: Vec<(usize, Vec<u8>)> = Vec::with_capacity(embeds.len());
-        for emb in embeds {
+        for (i, emb) in embeds.iter().enumerate() {
             let nat = emb.len() / hs;
             let (input_ids, asp) = prompt::build_prompt(
                 &self.tokenizer,
@@ -1671,8 +1750,8 @@ impl Inner {
                 self.config.thinker_config.audio_token_id,
                 self.config.thinker_config.audio_end_token_id,
                 nat,
-                language.as_deref(),
-                &opts.context,
+                langs[i].as_deref(),
+                &specs[i].context,
                 None,
             )?;
             let mut hidden: Vec<u8> = Vec::with_capacity(input_ids.len() * hs * 2);
@@ -1695,11 +1774,10 @@ impl Inner {
         // `max_new` at 256 that leaves ~60 s of audio per segment, which is what
         // the VAD pipeline targets anyway.
         let step = crate::decoder::KV_STEP;
-        let fits = |len: usize| {
-            (len + max_new_tokens + 8).div_ceil(step) * step <= crate::decoder::BATCH_SEQ_CAP
-        };
+        let cap_of = |i: usize| (plans[i].0 + max_news[i] + 8).div_ceil(step) * step;
+        let fits = |i: usize| cap_of(i) <= crate::decoder::BATCH_SEQ_CAP;
         let (long, batchable): (Vec<usize>, Vec<usize>) =
-            (0..plans.len()).partition(|&i| !fits(plans[i].0));
+            (0..plans.len()).partition(|&i| !fits(i));
         if std::env::var("QASR_BATCH_DEBUG").is_ok() {
             eprintln!(
                 "[batch] segments={} long={} batchable={} max_len_batchable={}",
@@ -1712,7 +1790,7 @@ impl Inner {
         if !long.is_empty() {
             let t0 = std::time::Instant::now();
             for &i in &long {
-                let gen = self.generate_from_embeds(&embeds[i], max_new_tokens, opts, None)?;
+                let gen = self.generate_from_embeds(&embeds[i], max_news[i], &item_opts(opts, i, &langs, &specs), None)?;
                 out[i] = Some(prompt::decode_result(&self.tokenizer, &gen.ids, gen.stop_reason)?);
             }
             t.decode += t0.elapsed();
@@ -1725,7 +1803,7 @@ impl Inner {
         if nslots < 2 {
             let t0 = std::time::Instant::now();
             for &i in &batchable {
-                let gen = self.generate_from_embeds(&embeds[i], max_new_tokens, opts, None)?;
+                let gen = self.generate_from_embeds(&embeds[i], max_news[i], &item_opts(opts, i, &langs, &specs), None)?;
                 out[i] = Some(prompt::decode_result(&self.tokenizer, &gen.ids, gen.stop_reason)?);
             }
             t.decode += t0.elapsed();
@@ -1736,9 +1814,7 @@ impl Inner {
         // `ensure_capacity`: the batched kernels take `max_seq` from a single
         // uniform, so a slot that rounded further would put its K rows where its
         // neighbours do not look.
-        let seq_max = batchable.iter().map(|&i| plans[i].0).max().unwrap_or(0);
-        let step = crate::decoder::KV_STEP;
-        let cap = (seq_max + max_new_tokens + 8).div_ceil(step) * step;
+        let cap = batchable.iter().map(|&i| cap_of(i)).max().unwrap_or(step);
         anyhow::ensure!(
             cap <= crate::decoder::BATCH_SEQ_CAP,
             "batch decode needs seq + max_new <= {} (got {cap}); use shorter segments",
@@ -1795,7 +1871,7 @@ impl Inner {
                     if eos.contains(&tok) {
                         stop[seg] = StopReason::Eos;
                         active[s] = None;
-                    } else if gen[seg].len() >= max_new_tokens {
+                    } else if gen[seg].len() >= max_news[seg] {
                         stop[seg] = StopReason::MaxTokens;
                         active[s] = None;
                     } else {
