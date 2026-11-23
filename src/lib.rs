@@ -53,6 +53,9 @@ pub mod processor;
 pub mod audio_encoder;
 pub mod audio_encoder_gpu;
 pub mod config;
+/// Accelerate `cblas_sgemm` for the CPU decoder's prefill GEMMs; aarch64 macOS only.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+mod cblas;
 pub mod cpu_decoder;
 pub mod cpu_tensor;
 pub mod decoder;

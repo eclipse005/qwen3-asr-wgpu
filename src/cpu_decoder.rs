@@ -559,6 +559,33 @@ fn gemm_row_major(out: &mut [f32], x: &[f32], w: &[f32], m: usize, n: usize, k: 
     debug_assert_eq!(out.len(), m * n);
     debug_assert_eq!(x.len(), m * k);
     debug_assert_eq!(w.len(), n * k);
+    // Below this row count the BLAS call's launch and threading overhead
+    // outweighs its SIMD gain, so those shapes keep the `gemm` crate path.
+    // Note the `gemm` crate's scalars are the opposite of BLAS's: its 13th
+    // argument multiplies the destination, its 14th multiplies the product,
+    // which is why `1.0` becomes the cblas alpha and `beta` the cblas beta.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        if m >= 16 {
+            unsafe {
+                crate::cblas::sgemm_rm(
+                    m,
+                    n,
+                    k,
+                    1.0,
+                    x.as_ptr(),
+                    k,
+                    true,
+                    w.as_ptr(),
+                    k,
+                    beta,
+                    out.as_mut_ptr(),
+                    n,
+                );
+            }
+            return;
+        }
+    }
     unsafe {
         gemm::gemm(
             m,
