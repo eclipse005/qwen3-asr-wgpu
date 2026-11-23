@@ -1,6 +1,12 @@
 use gemm::{gemm, Parallelism};
 use rayon::prelude::*;
 
+// On Apple Silicon, we can optionally use Accelerate framework for BLAS
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+const USE_ACCELERATE_HINT: bool = true;
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+const USE_ACCELERATE_HINT: bool = false;
+
 pub struct CpuTensor {
     pub data: Vec<f32>,
     pub shape: Vec<usize>,
@@ -31,7 +37,13 @@ pub struct CpuWeightF16 {
 
 impl CpuWeightF16 {
     pub fn to_f32(&self) -> CpuWeight {
-        let data: Vec<f32> = self.data.iter().map(|v| v.to_f32()).collect();
+        // On Apple Silicon, conversion can benefit from NEON intrinsics
+        let data: Vec<f32> = if USE_ACCELERATE_HINT && self.data.len() > 1024 {
+            // Use parallel conversion for large tensors
+            self.data.par_iter().map(|v| v.to_f32()).collect()
+        } else {
+            self.data.iter().map(|v| v.to_f32()).collect()
+        };
         CpuWeight {
             data,
             rows: self.rows,

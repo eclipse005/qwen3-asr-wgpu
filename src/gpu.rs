@@ -117,7 +117,13 @@ fn is_real_gpu(info: &wgpu::AdapterInfo) -> bool {
 fn rank(info: &wgpu::AdapterInfo) -> (u8, u8) {
     let class = device_class(info.device_type);
     let api = match info.backend {
+        #[cfg(target_os = "macos")]
+        wgpu::Backend::Metal => 0,     // Native on macOS
+        #[cfg(target_os = "macos")]
+        wgpu::Backend::Vulkan => 1,    // MoltenVK fallback
+        #[cfg(not(target_os = "macos"))]
         wgpu::Backend::Vulkan => 0,
+        #[cfg(not(target_os = "macos"))]
         wgpu::Backend::Metal => 1,
         wgpu::Backend::Dx12 => 2,
         wgpu::Backend::Gl => 3,
@@ -127,6 +133,17 @@ fn rank(info: &wgpu::AdapterInfo) -> (u8, u8) {
 }
 
 /// The runtimes in the order [`rank`] prefers them.
+/// On macOS (Apple Silicon), Metal is native and should be preferred over Vulkan (MoltenVK).
+#[cfg(target_os = "macos")]
+const API_RANK_ORDER: [wgpu::Backend; 5] = [
+    wgpu::Backend::Metal,    // Native API on macOS - highest priority
+    wgpu::Backend::Vulkan,   // MoltenVK translation layer - fallback
+    wgpu::Backend::Dx12,
+    wgpu::Backend::Gl,
+    wgpu::Backend::BrowserWebGpu,
+];
+
+#[cfg(not(target_os = "macos"))]
 const API_RANK_ORDER: [wgpu::Backend; 5] = [
     wgpu::Backend::Vulkan,
     wgpu::Backend::Metal,

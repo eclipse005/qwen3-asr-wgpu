@@ -39,6 +39,11 @@ gemm = "0.18"
 rayon = "1.10"
 libm = "0.2"
 thiserror = "2"
+
+# Apple Silicon: Use Accelerate.framework for optimized BLAS/LAPACK
+[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
+accelerate-src = "0.3"
+
 # `hub` feature only: download a model from HuggingFace (src/hub.rs).
 reqwest = { version = "0.12", features = ["blocking"], optional = true }
 
@@ -52,3 +57,5 @@ cmake = "0.1"
 
 [profile.release]
 debug = false
+opt-level = 3
+lto = "thin"

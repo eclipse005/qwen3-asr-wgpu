@@ -1,3 +1,9 @@
 [env]
 # Vendored soxr CMakeLists is 3.5; newer CMake still honors this floor.
 CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+
+# Apple Silicon optimizations
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "target-cpu=native",
+]
