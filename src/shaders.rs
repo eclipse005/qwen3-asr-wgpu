@@ -84,7 +84,10 @@ fn half_at(v: vec2<f32>, i: u32) -> f32 { return select(v.y, v.x, (i & 1u) == 0u
 /// tail is irrelevant because every model dim is even), the `s`-halving tree, and
 /// the two passes reading `x` twice.
 pub fn rms_norm(last: usize, bs: usize) -> String {
-    assert!(last % 2 == 0 && last >= bs, "rms_norm: last must be even and >= bs");
+    assert!(
+        last % 2 == 0 && last >= bs,
+        "rms_norm: last must be even and >= bs"
+    );
     format!(
         "{HALF_AT}
 struct Cfg {{ eps: f32, _a: f32, _b: f32, _c: f32 }};
@@ -142,9 +145,19 @@ fn rms_norm(@builtin(workgroup_id) wgid: vec3<u32>,
 /// Why: at b=8 the step issued 456 one-workgroup norm dispatches (two per layer
 /// per slot plus the final one).
 pub fn rms_norm_slots(last: usize, bs: usize, slot_words: usize, batch: usize) -> String {
-    assert!(last % 2 == 0 && last >= bs, "rms_norm_slots: last must be even and >= bs");
-    assert!((1..=16).contains(&batch), "rms_norm_slots: batch must be 1..=16");
-    assert_eq!(slot_words, last / 2, "rms_norm_slots: slot stride must be last/2 words");
+    assert!(
+        last % 2 == 0 && last >= bs,
+        "rms_norm_slots: last must be even and >= bs"
+    );
+    assert!(
+        (1..=16).contains(&batch),
+        "rms_norm_slots: batch must be 1..=16"
+    );
+    assert_eq!(
+        slot_words,
+        last / 2,
+        "rms_norm_slots: slot stride must be last/2 words"
+    );
     format!(
         "{HALF_AT}
 struct Cfg {{ eps: f32, _a: f32, _b: f32, _c: f32 }};
@@ -209,7 +222,11 @@ pub fn gemv_split(n: usize, k: usize, subgroup: bool, splits: usize) -> String {
     gemv_split_mode(
         n,
         k,
-        if subgroup { SubgroupMode::Warp32 } else { SubgroupMode::None },
+        if subgroup {
+            SubgroupMode::Warp32
+        } else {
+            SubgroupMode::None
+        },
         splits,
     )
 }
@@ -220,7 +237,11 @@ pub fn gemv_split_mode(n: usize, k: usize, mode: SubgroupMode, splits: usize) ->
     let kg = k / 8;
     assert_eq!(kg % 32, 0, "gemv_split: k/8 must be a multiple of 32");
     let granules_per_lane = kg / 32;
-    assert_eq!(granules_per_lane % splits, 0, "gemv_split: granules/lane must divide by splits");
+    assert_eq!(
+        granules_per_lane % splits,
+        0,
+        "gemv_split: granules/lane must divide by splits"
+    );
     let gpt = granules_per_lane / splits;
 
     let bfly = bfly_fragments(mode, 256, "256");
@@ -327,10 +348,26 @@ fn gemv_merge(@builtin(global_invocation_id) gid: vec3<u32>) {{
 /// `n` must be a multiple of 8 (all model shapes are) so no partial workgroup
 /// exists; `k/8` must be a multiple of 32 so the granule loop divides evenly.
 pub fn gemv(n: usize, k: usize, accum: bool, subgroup: bool, rows_per_wg: usize) -> String {
-    gemv_mode(n, k, accum, if subgroup { SubgroupMode::Warp32 } else { SubgroupMode::None }, rows_per_wg)
+    gemv_mode(
+        n,
+        k,
+        accum,
+        if subgroup {
+            SubgroupMode::Warp32
+        } else {
+            SubgroupMode::None
+        },
+        rows_per_wg,
+    )
 }
 
-pub fn gemv_mode(n: usize, k: usize, accum: bool, mode: SubgroupMode, rows_per_wg: usize) -> String {
+pub fn gemv_mode(
+    n: usize,
+    k: usize,
+    accum: bool,
+    mode: SubgroupMode,
+    rows_per_wg: usize,
+) -> String {
     gemv_impl(n, k, accum, mode, rows_per_wg, 1, false)
 }
 
@@ -357,7 +394,18 @@ pub fn gemv_rpwr(
     rows_per_wg: usize,
     rows_per_warp: usize,
 ) -> String {
-    gemv_rpwr_mode(n, k, accum, if subgroup { SubgroupMode::Warp32 } else { SubgroupMode::None }, rows_per_wg, rows_per_warp)
+    gemv_rpwr_mode(
+        n,
+        k,
+        accum,
+        if subgroup {
+            SubgroupMode::Warp32
+        } else {
+            SubgroupMode::None
+        },
+        rows_per_wg,
+        rows_per_warp,
+    )
 }
 
 pub fn gemv_rpwr_mode(
@@ -387,10 +435,26 @@ pub fn gemv_rpwr_mode(
 /// `cols` being a multiple of 4 keeps rows word-aligned, and `k % 8 == 0` keeps
 /// the granule grid exact.
 pub fn gemv_w8(n: usize, k: usize, accum: bool, subgroup: bool, rows_per_wg: usize) -> String {
-    gemv_w8_mode(n, k, accum, if subgroup { SubgroupMode::Warp32 } else { SubgroupMode::None }, rows_per_wg)
+    gemv_w8_mode(
+        n,
+        k,
+        accum,
+        if subgroup {
+            SubgroupMode::Warp32
+        } else {
+            SubgroupMode::None
+        },
+        rows_per_wg,
+    )
 }
 
-pub fn gemv_w8_mode(n: usize, k: usize, accum: bool, mode: SubgroupMode, rows_per_wg: usize) -> String {
+pub fn gemv_w8_mode(
+    n: usize,
+    k: usize,
+    accum: bool,
+    mode: SubgroupMode,
+    rows_per_wg: usize,
+) -> String {
     gemv_impl(n, k, accum, mode, rows_per_wg, 1, true)
 }
 
@@ -404,7 +468,18 @@ pub fn gemv_w8_rpwr(
     rows_per_wg: usize,
     rows_per_warp: usize,
 ) -> String {
-    gemv_w8_rpwr_mode(n, k, accum, if subgroup { SubgroupMode::Warp32 } else { SubgroupMode::None }, rows_per_wg, rows_per_warp)
+    gemv_w8_rpwr_mode(
+        n,
+        k,
+        accum,
+        if subgroup {
+            SubgroupMode::Warp32
+        } else {
+            SubgroupMode::None
+        },
+        rows_per_wg,
+        rows_per_warp,
+    )
 }
 
 pub fn gemv_w8_rpwr_mode(
@@ -478,7 +553,11 @@ fn gemv_impl(
     assert_eq!(kg % 32, 0, "gemv: k/8 must be a multiple of 32");
     assert_eq!(k % 8, 0, "gemv: k must be a multiple of 8");
     let tiles = kg / 32;
-    assert_eq!(tiles % 4, 0, "gemv: k/256 must be a multiple of 4 (unrolled x4)");
+    assert_eq!(
+        tiles % 4,
+        0,
+        "gemv: k/256 must be a multiple of 4 (unrolled x4)"
+    );
     // One warp per row is what fixes the reduction tree, so `rows_per_wg` only
     // chooses how many rows share a workgroup -- and therefore how many
     // workgroups the dispatch has.  Every warp still walks its own row with the
@@ -489,12 +568,20 @@ fn gemv_impl(
         rows_per_wg.is_power_of_two() && (2..=32).contains(&rows_per_wg),
         "gemv: rows_per_wg must be 2/4/8/16/32"
     );
-    assert_eq!(n % rows_per_wg, 0, "gemv: rows must be a multiple of rows_per_wg");
+    assert_eq!(
+        n % rows_per_wg,
+        0,
+        "gemv: rows must be a multiple of rows_per_wg"
+    );
     assert!(
         rows_per_warp.is_power_of_two() && (1..=4).contains(&rows_per_warp),
         "gemv: rows_per_warp must be 1/2/4"
     );
-    assert_eq!(n % rows_per_warp, 0, "gemv: rows must be a multiple of rows_per_warp");
+    assert_eq!(
+        n % rows_per_warp,
+        0,
+        "gemv: rows must be a multiple of rows_per_warp"
+    );
     let rows_per_wg_tot = rows_per_wg * rows_per_warp;
     let threads = rows_per_wg * 32;
     let accum_lit = if accum { 1u32 } else { 0u32 };
@@ -639,8 +726,15 @@ pub fn gemv_batch(n: usize, k: usize, batch: usize) -> String {
     assert_eq!(kg % 32, 0, "gemv_batch: k/8 must be a multiple of 32");
     let tiles = kg / 32;
     assert_eq!(tiles % 4, 0, "gemv_batch: k/256 must be a multiple of 4");
-    assert_eq!(n % (RPW * 2), 0, "gemv_batch: rows must be a multiple of 16");
-    assert!((1..=16).contains(&batch), "gemv_batch: batch must be 1..=16");
+    assert_eq!(
+        n % (RPW * 2),
+        0,
+        "gemv_batch: rows must be a multiple of 16"
+    );
+    assert!(
+        (1..=16).contains(&batch),
+        "gemv_batch: batch must be 1..=16"
+    );
     let rowsw = RPW / 2;
     let rowsn = batch * THREADS;
 
@@ -658,7 +752,9 @@ pub fn gemv_batch(n: usize, k: usize, batch: usize) -> String {
     }
     for t in 0..4 {
         for (wi, comp) in ["x", "y", "z", "w"].iter().enumerate() {
-            body.push_str(&format!("        let w{t}{wi} = unpack2x16float(wv{t}.{comp});\n"));
+            body.push_str(&format!(
+                "        let w{t}{wi} = unpack2x16float(wv{t}.{comp});\n"
+            ));
         }
     }
     for b in 0..batch {
@@ -808,9 +904,20 @@ pub fn gemv_batch_slots_mode(
     assert_eq!(k % 256, 0, "gemv_batch_slots: k must be a multiple of 256");
     assert_eq!(kg % 32, 0, "gemv_batch_slots: k/8 must be a multiple of 32");
     let tiles = kg / 32;
-    assert_eq!(tiles % 4, 0, "gemv_batch_slots: k/256 must be a multiple of 4");
-    assert_eq!(n % (RPW * 2), 0, "gemv_batch_slots: rows must be a multiple of 16");
-    assert!((2..=32).contains(&batch), "gemv_batch_slots: batch must be 2..=32");
+    assert_eq!(
+        tiles % 4,
+        0,
+        "gemv_batch_slots: k/256 must be a multiple of 4"
+    );
+    assert_eq!(
+        n % (RPW * 2),
+        0,
+        "gemv_batch_slots: rows must be a multiple of 16"
+    );
+    assert!(
+        (2..=32).contains(&batch),
+        "gemv_batch_slots: batch must be 2..=32"
+    );
     let rowsw = RPW / 2;
     let rowsn = batch * THREADS;
     let accum_lit = if accum { 1u32 } else { 0u32 };
@@ -845,7 +952,9 @@ pub fn gemv_batch_slots_mode(
     }
     for t in 0..4 {
         for (wi, comp) in ["x", "y", "z", "w"].iter().enumerate() {
-            body.push_str(&format!("        let w{t}{wi} = unpack2x16float(wv{t}.{comp});\n"));
+            body.push_str(&format!(
+                "        let w{t}{wi} = unpack2x16float(wv{t}.{comp});\n"
+            ));
         }
     }
     for s in 0..batch {
@@ -986,7 +1095,11 @@ pub fn gemv_norm(
         n,
         k,
         accum,
-        if subgroup { SubgroupMode::Warp32 } else { SubgroupMode::None },
+        if subgroup {
+            SubgroupMode::Warp32
+        } else {
+            SubgroupMode::None
+        },
         last,
         bs,
         eps,
@@ -1020,7 +1133,11 @@ pub fn gemv_norm_w8(
         n,
         k,
         accum,
-        if subgroup { SubgroupMode::Warp32 } else { SubgroupMode::None },
+        if subgroup {
+            SubgroupMode::Warp32
+        } else {
+            SubgroupMode::None
+        },
         last,
         bs,
         eps,
@@ -1056,7 +1173,12 @@ fn gemv_norm_impl(
     let tiles = kg / 32;
     assert_eq!(tiles % 4, 0, "gemv_norm: k/256 must be a multiple of 4");
     let last2 = last / 2;
-    assert_eq!(last2, kg * 4, "gemv_norm: activation row {last2} words != k/2 {kg_expected}", kg_expected = k / 2);
+    assert_eq!(
+        last2,
+        kg * 4,
+        "gemv_norm: activation row {last2} words != k/2 {kg_expected}",
+        kg_expected = k / 2
+    );
     let vc = bs / 256;
     assert!(
         [1usize, 2, 4].contains(&vc) && bs == vc * 256,
@@ -1246,17 +1368,43 @@ pub fn gemv_norm_batch_slots_mode(
     eps: f32,
     mode: SubgroupMode,
 ) -> String {
-    assert_eq!(n % 8, 0, "gemv_norm_batch_slots: rows must be a multiple of 8");
+    assert_eq!(
+        n % 8,
+        0,
+        "gemv_norm_batch_slots: rows must be a multiple of 8"
+    );
     let kg = k / 8;
-    assert_eq!(k % 256, 0, "gemv_norm_batch_slots: k must be a multiple of 256");
+    assert_eq!(
+        k % 256,
+        0,
+        "gemv_norm_batch_slots: k must be a multiple of 256"
+    );
     let tiles = kg / 32;
-    assert_eq!(tiles % 4, 0, "gemv_norm_batch_slots: k/256 must be a multiple of 4");
+    assert_eq!(
+        tiles % 4,
+        0,
+        "gemv_norm_batch_slots: k/256 must be a multiple of 4"
+    );
     let last2 = last / 2;
-    assert_eq!(last2, kg * 4, "gemv_norm_batch_slots: activation row != k/2 words");
-    assert!((2..=32).contains(&batch), "gemv_norm_batch_slots: batch must be 2..=16");
+    assert_eq!(
+        last2,
+        kg * 4,
+        "gemv_norm_batch_slots: activation row != k/2 words"
+    );
+    assert!(
+        (2..=32).contains(&batch),
+        "gemv_norm_batch_slots: batch must be 2..=16"
+    );
     let vc = bs / 256;
-    assert_eq!(bs, vc * 256, "gemv_norm_batch_slots: block size must be 256/512/1024");
-    assert!([1usize, 2, 4].contains(&vc), "gemv_norm_batch_slots: block size");
+    assert_eq!(
+        bs,
+        vc * 256,
+        "gemv_norm_batch_slots: block size must be 256/512/1024"
+    );
+    assert!(
+        [1usize, 2, 4].contains(&vc),
+        "gemv_norm_batch_slots: block size"
+    );
     let accum_lit = u32::from(accum);
     let bfly = bfly_fragments(mode, 256, "256");
     let subgroup_body = bfly.body;
@@ -1343,7 +1491,9 @@ struct Arr32 { v: array<u32> };
     }
     for t in 0..4 {
         for (wi, comp) in ["x", "y", "z", "w"].iter().enumerate() {
-            body.push_str(&format!("        let w{t}{wi} = unpack2x16float(wv{t}.{comp});\n"));
+            body.push_str(&format!(
+                "        let w{t}{wi} = unpack2x16float(wv{t}.{comp});\n"
+            ));
         }
     }
     for s in 0..batch {
@@ -1584,11 +1734,7 @@ fn qkv_extract(@builtin(workgroup_id) wgid: vec3<u32>,
 /// the two cache writes; every other expression -- the head RMSNorm, the
 /// rotate-half RoPE, the f16 packing -- is the shipped kernel's, so each slot's
 /// KV rows and q_out bytes are the ones a lone run would have written.
-pub fn qkv_extract_slots(
-    nqh: usize,
-    nkvh: usize,
-    d: usize,
-) -> String {
+pub fn qkv_extract_slots(nqh: usize, nkvh: usize, d: usize) -> String {
     assert_eq!(d % 2, 0);
     let total_cols = (nqh + 2 * nkvh) * d;
     let q_dim = nqh * d;
@@ -1962,7 +2108,6 @@ fn expf_bt(x: f32) -> f32 {
 }
 ";
 
-
 pub fn gqa_decode_single(nqh: usize, nkvh: usize, d: usize, bs: usize, cap: usize) -> String {
     let tchunks = (bs / d).max(1);
     assert_eq!(d % 2, 0);
@@ -2108,13 +2253,7 @@ fn gqa(@builtin(workgroup_id) wgid: vec3<u32>,
 /// still walks its own slot's rows in the same order with the same trees, and
 /// the only new input is that slot's `cur_len`, so a batched slot is
 /// bit-identical to a lone one.
-pub fn gqa_decode_single_slots(
-    nqh: usize,
-    nkvh: usize,
-    d: usize,
-    bs: usize,
-    cap: usize,
-) -> String {
+pub fn gqa_decode_single_slots(nqh: usize, nkvh: usize, d: usize, bs: usize, cap: usize) -> String {
     let tchunks = (bs / d).max(1);
     assert_eq!(d % 2, 0);
     assert_eq!(bs % d, 0);
@@ -2544,7 +2683,10 @@ pub fn gqa_decode_split_p1_pair(
     depth: usize,
 ) -> String {
     assert_eq!(d % 2, 0);
-    assert_eq!(rep, 2, "paired split handles exactly the 2 q heads of a kv head");
+    assert_eq!(
+        rep, 2,
+        "paired split handles exactly the 2 q heads of a kv head"
+    );
     let t_split = 256 / d;
     assert!(t_split >= 1);
     // `row0` points every K read at row 0, so the whole workgroup shares one
@@ -2715,13 +2857,13 @@ pub fn gqa_decode_split_p1_pair(
                  \x20       }\n",
             );
         } else {
-        if pf {
-            // Same arithmetic, loads issued one word early: the FMA sequence and
-            // every operand are untouched, only when the next `KC4`/`Q4` word is
-            // fetched moves.  If load latency is what costs, this is the cheapest
-            // bit-identical way to give it something to overlap with.
-            t.push_str(
-                "        for (var t = lid.x; t < chunk_len; t = t + BS) {\n\
+            if pf {
+                // Same arithmetic, loads issued one word early: the FMA sequence and
+                // every operand are untouched, only when the next `KC4`/`Q4` word is
+                // fetched moves.  If load latency is what costs, this is the cheapest
+                // bit-identical way to give it something to overlap with.
+                t.push_str(
+                    "        for (var t = lid.x; t < chunk_len; t = t + BS) {\n\
                  \x20       var da = 0.0;\n\
                  \x20       var db = 0.0;\n\
                  \x20       let row4 = (kbase + (t_start + t) * D2) >> 2u;\n\
@@ -2736,49 +2878,53 @@ pub fn gqa_decode_split_p1_pair(
                  \x20           kp = KC4[row4 + jn];\n\
                  \x20           qap = Q4[qa4 + jn];\n\
                  \x20           qbp = Q4[qb4 + jn];\n",
-            );
-        } else {
-            t.push_str(
-                "        for (var t = lid.x; t < chunk_len; t = t + BS) {\n\
+                );
+            } else {
+                t.push_str(
+                    "        for (var t = lid.x; t < chunk_len; t = t + BS) {\n\
                  \x20       var da = 0.0;\n\
                  \x20       var db = 0.0;\n\
                  \x20       let row4 = (kbase + (t_start + t) * D2) >> 2u;\n\
                  \x20       for (var j4 = 0u; j4 < D4; j4 = j4 + 1u) {\n",
-            );
-            t.push_str(&format!("            let kv = KC4[{kv_index}];\n"));
-            t.push_str("            let qa = Q4[qa4 + j4];\n");
-            t.push_str("            let qb = Q4[qb4 + j4];\n");
-        }
-        for j in 0..4 {
-            t.push_str(&format!(
-                "            let k{j} = unpack2x16float(kv.{});\n",
-                ['x', 'y', 'z', 'w'][j]
-            ));
-        }
-        for j in 0..4 {
-            t.push_str(&format!(
-                "            let a{j} = unpack2x16float(qa.{});\n",
-                ['x', 'y', 'z', 'w'][j]
-            ));
-        }
-        for j in 0..4 {
-            t.push_str(&format!("            da = da + (a{j}.x * k{j}.x + a{j}.y * k{j}.y);\n"));
-        }
-        for j in 0..4 {
-            t.push_str(&format!(
-                "            let b{j} = unpack2x16float(qb.{});\n",
-                ['x', 'y', 'z', 'w'][j]
-            ));
-        }
-        for j in 0..4 {
-            t.push_str(&format!("            db = db + (b{j}.x * k{j}.x + b{j}.y * k{j}.y);\n"));
-        }
-        t.push_str(
-            "        }\n\
+                );
+                t.push_str(&format!("            let kv = KC4[{kv_index}];\n"));
+                t.push_str("            let qa = Q4[qa4 + j4];\n");
+                t.push_str("            let qb = Q4[qb4 + j4];\n");
+            }
+            for j in 0..4 {
+                t.push_str(&format!(
+                    "            let k{j} = unpack2x16float(kv.{});\n",
+                    ['x', 'y', 'z', 'w'][j]
+                ));
+            }
+            for j in 0..4 {
+                t.push_str(&format!(
+                    "            let a{j} = unpack2x16float(qa.{});\n",
+                    ['x', 'y', 'z', 'w'][j]
+                ));
+            }
+            for j in 0..4 {
+                t.push_str(&format!(
+                    "            da = da + (a{j}.x * k{j}.x + a{j}.y * k{j}.y);\n"
+                ));
+            }
+            for j in 0..4 {
+                t.push_str(&format!(
+                    "            let b{j} = unpack2x16float(qb.{});\n",
+                    ['x', 'y', 'z', 'w'][j]
+                ));
+            }
+            for j in 0..4 {
+                t.push_str(&format!(
+                    "            db = db + (b{j}.x * k{j}.x + b{j}.y * k{j}.y);\n"
+                ));
+            }
+            t.push_str(
+                "        }\n\
              \x20       sc_a[t] = da * cfg.scale;\n\
              \x20       sc_b[t] = db * cfg.scale;\n\
              \x20       }\n",
-        );
+            );
         }
         t
     };
@@ -3041,8 +3187,7 @@ fn argmax(@builtin(local_invocation_id) lid: vec3<u32>) {{
 /// `embed_lookup_single_i32_f16` — gather one embedding row using a token id that
 /// never left the GPU.
 pub fn embed_lookup_single() -> String {
-    format!(
-        "struct Cfg {{ slot: u32, d2: u32, _a: u32, _b: u32 }};
+    "struct Cfg { slot: u32, d2: u32, _a: u32, _b: u32 };
 
 @group(0) @binding(0) var<storage, read>       Table: array<u32>;
 @group(0) @binding(1) var<storage, read>       Ids:   array<i32>;
@@ -3052,15 +3197,15 @@ pub fn embed_lookup_single() -> String {
 const BS: u32 = 1024u;
 
 @compute @workgroup_size(1024)
-fn embed(@builtin(local_invocation_id) lid: vec3<u32>) {{
+fn embed(@builtin(local_invocation_id) lid: vec3<u32>) {
     let id = u32(Ids[cfg.slot]);
     let base = id * cfg.d2;
-    for (var w = lid.x; w < cfg.d2; w = w + BS) {{
+    for (var w = lid.x; w < cfg.d2; w = w + BS) {
         Out[w] = Table[base + w];
-    }}
-}}
+    }
+}
 "
-    )
+    .to_string()
 }
 
 /// Format an f32 so WGSL parses back the exact same value (hex float, exact).
@@ -3077,94 +3222,104 @@ pub fn format_f32(v: f32) -> String {
     format!("{sign}0x1.{man:06x}p{e}")
 }
 
-/// Prefill GEMM:  C[m,n] f16 = A[m,k] f16 × W[n,k]ᵀ (or × W[n,k] when
-/// `transb`), f32 accumulate, one f16 rounding.  Tile 128×128 per workgroup
-/// (16×16 threads, 8×8 micro-tile), BK=16, software-pipelined (next tile
-/// prefetched into registers during compute).  `beta=1` folds the residual add
-/// into the epilogue: acc + f16(C_in), one rounding.
-/// Tile of [`prefill_gemm`], as a single source of truth.
-///
-/// The kernel's own `BM`/`BN`/`BK` constants and **every caller's** padding and
-/// dispatch grids must agree.  They are exported here so a caller cannot drift:
-/// passing 64 where the kernel uses 128 leaves half of each axis uncomputed and
-/// the result is silently wrong rather than an error.
+/// Default 128×128 tile micro-geometry and K step, shared with callers.
 pub const PREFILL_GEMM_TM: usize = 8;
 pub const PREFILL_GEMM_TN: usize = 8;
 pub const PREFILL_GEMM_BK: usize = 16;
-/// M tile width — `m` must be padded to a multiple of this.
 pub const PREFILL_GEMM_BM: usize = 16 * PREFILL_GEMM_TM;
-/// N tile width — `n` (the weight's row count) must be padded to a multiple.
 pub const PREFILL_GEMM_BN: usize = 16 * PREFILL_GEMM_TN;
 
-/// `bias = 1` adds the per-column `Bias` vector (binding 4) to every output
-/// before the `beta` residual — the audio tower's linears ship with biases and
-/// a plain GEMM silently drops them.
+/// Prefill GEMM family: `C[m,n] f16 = A[m,k] f16 × W[n,k]ᵀ` (or `× W[n,k]`
+/// when `transb`), f32 accumulate, one f16 rounding.
 ///
-/// `ldc` = C row stride in elements; `bsa`/`bsb` = per-batch operand strides in
-/// **words** (the shader indexes `array<u32>` directly) and `bsc` = the per-batch
-/// C stride in **elements** (the epilogue divides the flat C index by 2).  Batch
-/// index is `wgid.z`; it is 1 for the plain GEMMs, where the units cannot show,
-/// and 28 for the audio tower's attention — where a `bsc` given as words shifted
-/// every block but the first by half a block.  `transb=1` reads W as a [k, n] f16
-/// matrix instead of [n, k] (attention AV: V is [cur, d]).
+/// `tile64` selects a 64×64 tile (16×16 threads, 4×4 micro-tile) for short
+/// prefills on high-SM devices; the default 128×128 tile (8×8 micro-tile) is
+/// unchanged.  `use_f16` keeps the shared operand tiles as `vec4<f16>` and
+/// widens each read to `vec4<f32>` before the f32 FMAs.  Both forms have the
+/// same accumulation order and epilogue, so the output is bit-identical.
 ///
-/// `lda` is the A row stride in elements — `k` everywhere except the slabbed AV,
-/// whose A operand (a score slab) is `T` wide while the tile it sweeps is
-/// narrower.  `row0` shifts the B operand's rows (K or V rows = key positions)
-/// and, on the two causal variants, the diagonal they test against.
+/// `beta=1` folds the residual add into the epilogue; `bias=1` adds the
+/// per-column `Bias` vector (binding 4); `causal_skip` / `causal_k` are the
+/// two attention tile skips; `w8` reads an int8-resident W operand with f32
+/// per-row scales (binding 4) and dequantizes to f16 exactly as the host does.
 ///
-/// The tile geometry comes from the `PREFILL_GEMM_*` constants above; callers
-/// must pad `m`, `n` and the operand row strides with those same values.
+/// The kernel's own `BM`/`BN`/`BK` constants and every caller's padding and
+/// dispatch grids must agree.  The 128×128 shape is exported as
+/// [`PREFILL_GEMM_TM`]/[`PREFILL_GEMM_TN`]/[`PREFILL_GEMM_BM`]/[`PREFILL_GEMM_BN`].
+pub fn prefill_gemm_cfg(
+    transb: bool,
+    beta: bool,
+    bias: bool,
+    causal_skip: bool,
+    causal_k: bool,
+    w8: bool,
+    tile64: bool,
+    use_f16: bool,
+) -> String {
+    prefill_gemm_impl(
+        transb,
+        beta,
+        bias,
+        causal_skip,
+        causal_k,
+        w8,
+        tile64,
+        use_f16,
+    )
+}
+
+/// The shipped 128×128, f32-shared-tile form (backward-compatible entry point).
 pub fn prefill_gemm(transb: bool, beta: bool) -> String {
-    prefill_gemm_impl(transb, beta, false, false, false, false)
+    prefill_gemm_cfg(transb, beta, false, false, false, false, false, false)
 }
 
-/// [`prefill_gemm`] with an **int8-resident** W operand (the M3 decoder
-/// weights).  Only the B side changes: a thread's four weight rows are read as
-/// u32 words (4 int8 per word, `gd.k/4` words per row — the same four-word
-/// loads the f16 form issues), unpacked, scaled by `S8[row]`, rounded to f16 by
-/// `pack2x16float` (the GEMV's own rounding, and the host dequant's), and
-/// stored into the same f32 chunk tile the compute loop consumes.  The A tile,
-/// the compute loop and the epilogue are untouched, so the accumulation order
-/// is the f16 GEMM's.
-///
-/// The byte position within a word is `ck % 4` — a per-thread constant, since
-/// `kx` steps by `BK` (a multiple of 4) and the chunk's `ck` is fixed — and the
-/// four scales are hoisted out of the k loop entirely.
-///
-/// Restricted to the plain weight form (`transb = 0`, no bias, no causal
-/// skip): the attention GEMMs stay f16 and the bias form is unused by the
-/// decoder.  Requires the v4 chunk tile (the default; `QASR_GEMM_V4=0` is the
-/// scalar debug tile and does not have an int8 form).
+/// [`prefill_gemm`] with an int8-resident W operand and per-row f32 scales.
 pub fn prefill_gemm_w8(beta: bool) -> String {
-    prefill_gemm_impl(false, beta, false, false, false, true)
+    prefill_gemm_cfg(false, beta, false, false, false, true, false, false)
 }
 
-/// [`prefill_gemm`] with the causal-attention tile skip: a tile wholly above the
-/// diagonal (`n0 + row0 > m0 + BM - 1`, `row0` = the key offset of the score
-/// slab) is entirely masked by the causal softmax, which never reads columns
-/// past `row + 1`, so skipping it is bit-identical — it just stops writing ~half
-/// of the `s × cur` score matrix.
+/// [`prefill_gemm`] with the causal score-tile skip.
 pub fn prefill_gemm_causal() -> String {
-    prefill_gemm_impl(false, false, false, true, false, false)
+    prefill_gemm_cfg(false, false, false, true, false, false, false, false)
 }
 
-/// [`prefill_gemm_bias`]-style AV form (`transb = 1`) with the causal *k* bound:
-/// the A operand is the softmax output, whose columns past `row + 1` are exactly
-/// zero, so a row block only has to sweep `k < m0 + BM - row0` (`row0` = the
-/// slab's key offset; zero on the flat path).  Skipping exact zeros from a sum is
-/// bit-identical.
+/// [`prefill_gemm`] with the causal AV k bound.
 pub fn prefill_gemm_causal_av() -> String {
-    prefill_gemm_impl(true, false, false, false, true, false)
+    prefill_gemm_cfg(true, false, false, false, true, false, false, false)
 }
 
-/// As [`prefill_gemm`], plus the per-column bias add (binding 4).  A separate
-/// entry point rather than a flag on the shared one: the binding must be
-/// *declared* only for the variants that read it, and a declared-but-unbound
-/// binding fails pipeline validation even when the read is dead code.
+/// [`prefill_gemm`] plus a per-column bias (binding 4).
 pub fn prefill_gemm_bias(transb: bool, beta: bool) -> String {
-    prefill_gemm_impl(transb, beta, true, false, false, false)
+    prefill_gemm_cfg(transb, beta, true, false, false, false, false, false)
 }
+
+/// 64×64 f32-shared-tile variant of [`prefill_gemm`].
+pub fn prefill_gemm_64(transb: bool, beta: bool, use_f16: bool) -> String {
+    prefill_gemm_cfg(transb, beta, false, false, false, false, true, use_f16)
+}
+
+/// 64×64 int8-weight variant of [`prefill_gemm_w8`].
+pub fn prefill_gemm_w8_64(beta: bool, use_f16: bool) -> String {
+    prefill_gemm_cfg(false, beta, false, false, false, true, true, use_f16)
+}
+
+/// 64×64 f16/f32-shared variant of [`prefill_gemm_causal`].
+pub fn prefill_gemm_causal_64(use_f16: bool) -> String {
+    prefill_gemm_cfg(false, false, false, true, false, false, true, use_f16)
+}
+
+/// 64×64 f16/f32-shared variant of [`prefill_gemm_causal_av`].
+pub fn prefill_gemm_causal_av_64(use_f16: bool) -> String {
+    prefill_gemm_cfg(true, false, false, false, true, false, true, use_f16)
+}
+
+/// 64×64 f16/f32-shared variant of [`prefill_gemm_bias`].
+pub fn prefill_gemm_bias_64(transb: bool, beta: bool, use_f16: bool) -> String {
+    prefill_gemm_cfg(transb, beta, true, false, false, false, true, use_f16)
+}
+
+// Keep the 128×128 constants above as the exported defaults; the 64×64 tile's
+// geometry is derived in the generator (tm = tn = 4).
 
 /// `QASR_GEMM_V4` -- the prefill/encoder GEMM's shared-memory tile: the default
 /// (`1`) is the k-major 16-byte chunk tile, `0` restores the scalar per-(row, k)
@@ -3172,7 +3327,9 @@ pub fn prefill_gemm_bias(transb: bool, beta: bool) -> String {
 /// exists to re-run the A/B rather than to be set in production.  See the note in
 /// [`prefill_gemm_impl`] for the measurements.
 fn gemm_v4() -> bool {
-    std::env::var("QASR_GEMM_V4").map(|s| s != "0").unwrap_or(true)
+    std::env::var("QASR_GEMM_V4")
+        .map(|s| s != "0")
+        .unwrap_or(true)
 }
 
 /// `QASR_GEMM_UNROLL` -- the k-unroll factor for the prefill/encoder GEMM.
@@ -3194,75 +3351,53 @@ fn prefill_gemm_impl(
     causal_skip: bool,
     causal_k: bool,
     w8: bool,
+    tile64: bool,
+    use_f16: bool,
 ) -> String {
-    let tm = PREFILL_GEMM_TM;
-    let tn = PREFILL_GEMM_TN;
+    let tm = if tile64 { 4 } else { PREFILL_GEMM_TM };
+    let tn = if tile64 { 4 } else { PREFILL_GEMM_TN };
     let bk = PREFILL_GEMM_BK;
     let bm = 16 * tm;
     let bn = 16 * tn;
     let pad = bk + 1;
     let n_as = bm * bk / 256;
     let n_bs = bn * bk / 256;
-
-    // ---- the vec4 (chunk) tile -------------------------------------------
-    //
-    // `gemm_bench`'s `V` column: the tile is stored **k-major in 16-byte
-    // chunks** instead of one f32 per (row, k), so a thread's eight A values
-    // and eight B values each become two `vec4` shared loads instead of eight
-    // scalar ones.  `fma_probe` prices the difference with everything else held
-    // fixed -- 16 scalar loads per 64 FMAs and 4 `vec4` loads per 80, moving the
-    // same two kilobytes per warp per iteration -- at 2.66 against 3.80 TFLOP/s,
-    // and the real GEMM sat at the 2.66 arm before this.  Across `gemm_bench`'s
-    // ten shapes the change is **+26%** (mean 2.31 -> 2.91 TFLOP/s).
-    //
-    // A chunk is four rows at one k.  For A, chunk `q*AQ + r/4` holds rows
-    // `4*(r/4) .. +3` at k = `q`, and a thread wants rows `8*ty .. +7` -- chunks
-    // `q*AQ + 2*ty` and `+1`.  Its address depends only on `ty`, so the eight
-    // lanes of a phase all want the same sixteen bytes: a broadcast.
-    //
-    // For B the same layout would have the sixteen `tx` lanes stride eight
-    // words and land on two bank groups per phase, so the row *groups* are
-    // permuted: chunk `q*BQ + pos(g, s)` holds `8*g + 4*s .. +3` with
-    // `pos(g, s) = (g & 7) + 8*s + 16*(g >> 3)` -- the same job the scalar
-    // form's `16*j + tx` permutation does, for the same reason.
-    //
-    // A `f32` array cannot be read as `vec4`, so the tile is *declared*
-    // `array<vec4<f32>, ..>` and every store writes a whole chunk.  That forces
-    // the load stage to gather four rows at one k per thread, which reads each
-    // global word twice (both k of a word now have their own thread).  These
-    // GEMMs are compute-bound by two orders of magnitude on every shape this
-    // pipeline runs -- `m2304 k1024 n4096` is 1073 FLOP/byte -- so the trade is
-    // free here and would not be for a memory-bound shape.
-    //
-    // Values, accumulation order and FMA count are untouched: bit-identical,
-    // and `gemm_bench` checks that against a CPU matmul on every variant.
-    //
-    // The other operand of a `transb = 1` GEMM (the attention `A@V`, and the
-    // encoder conv stem's im2col operand) is stored `[k][n]`, so four
-    // consecutive `n` at one k is *two* words whose half-word parity alternates
-    // per row instead of being one flag per thread.  That makes its chunk build a
-    // different expression -- two registers and four `halve`s -- rather than a
-    // different constant, and it reads half the words the row-major path does.
-    //
-    // Derived for `TM = TN = 8` (512 chunks over 256 threads is two per thread).
     let v4 = gemm_v4();
     let (aq, bq) = (bm / 4, bn / 4);
     let cstep = bm * bk / 4 / 2;
+    let f16_tile = v4 && use_f16;
     if w8 {
-        assert!(!transb && !bias && !causal_skip && !causal_k,
-            "prefill_gemm_w8 supports only the plain weight operand (the attention GEMMs stay f16)");
-        assert!(v4, "prefill_gemm_w8 requires the v4 chunk tile (QASR_GEMM_V4 != 0)");
+        assert!(
+            !transb && !bias && !causal_skip && !causal_k,
+            "prefill_gemm_w8 supports only the plain weight operand (the attention GEMMs stay f16)"
+        );
+        assert!(
+            v4,
+            "prefill_gemm_w8 requires the v4 chunk tile (QASR_GEMM_V4 != 0)"
+        );
     }
-    assert_eq!(tm, 8, "the vec4 chunk store is derived for TM = 8");
-    assert_eq!(tn, 8, "the vec4 chunk store is derived for TN = 8");
-    assert_eq!(bk % 16, 0, "the vec4 chunk store assumes 8 k per chunk half");
-    assert_eq!(n_as, 8, "the v4 A store assumes two chunks per thread");
-    // Both B layouts move eight rows per thread; the k-major one needs four
-    // words to do it (two per chunk) and the row-major one eight.
-    assert_eq!(n_bs, 8, "the v4 B store assumes two chunks per thread");
+    assert!(tm == 4 || tm == 8, "unsupported GEMM micro-tile M");
+    assert!(tn == 4 || tn == 8, "unsupported GEMM micro-tile N");
+    assert_eq!(
+        bk % 16,
+        0,
+        "the vec4 chunk store assumes 8 k per chunk half"
+    );
+    assert!(
+        n_as == (if tile64 { 4 } else { 8 }),
+        "unexpected v4 A tile shape"
+    );
+    assert!(
+        n_bs == (if tile64 { 4 } else { 8 }),
+        "unexpected v4 B tile shape"
+    );
+
     let mut s = String::new();
+    if f16_tile {
+        s.push_str("enable f16;\n");
+    }
     s.push_str(
-        "struct GDims { m: u32, n: u32, k: u32, ldc: u32, bsa: u32, bsb: u32, bsc: u32, beta: u32, row0: u32, lda: u32, q_off: u32 };\n\
+        "struct GDims { m: u32, n: u32, k: u32, ldc: u32, bsa: u32, bsb: u32, bsc: u32, beta: u32, row0: u32, lda: u32, q_off: u32, gqa_group: u32 };\n\
          @group(0) @binding(0) var<storage, read>       A: array<u32>;\n\
          @group(0) @binding(1) var<storage, read>       W: array<u32>;\n\
          @group(0) @binding(2) var<storage, read_write> C: array<u32>;\n\
@@ -3287,32 +3422,54 @@ fn prefill_gemm_impl(
         u32::from(causal_k),
     ));
     if v4 {
-        s.push_str(&format!("var<workgroup> A4: array<vec4<f32>, {}>;\n", bm * bk / 4));
-        s.push_str(&format!("var<workgroup> B4: array<vec4<f32>, {}>;\n", bn * bk / 4));
+        let ty = if f16_tile { "f16" } else { "f32" };
+        s.push_str(&format!(
+            "var<workgroup> A4: array<vec4<{ty}>, {}>;\n",
+            bm * bk / 4
+        ));
+        s.push_str(&format!(
+            "var<workgroup> B4: array<vec4<{ty}>, {}>;\n",
+            bn * bk / 4
+        ));
     } else {
         s.push_str(&format!("var<workgroup> As: array<f32, {}>;\n", bm * pad));
         s.push_str(&format!("var<workgroup> Bs: array<f32, {}>;\n", bn * pad));
     }
-    s.push_str(
-        "fn halve(w: u32, odd: bool) -> f32 {\n\
-         \x20 let p = unpack2x16float(w);\n\
-         \x20 return select(p.x, p.y, odd);\n\
-         }\n",
-    );
-    if w8 {
-        // The int8 unpack and the f16-rounded dequant — `q8` takes the
-        // left-shift that brings a byte to the top of the word, `wq` the byte
-        // *index* (`24 - 8*by` is its shift) and produces the same
-        // `f16(q * s)` value the host dequant produced for M2 (pack2x16float
-        // rounds to f16 nearest-even).
+    if f16_tile {
         s.push_str(
-            "fn q8(w: u32, sh: u32) -> f32 {\n\
-             \x20 return f32((bitcast<i32>(w << sh)) >> 24u);\n\
-             }\n\
-             fn wq(w: u32, by: u32, sc: f32) -> f32 {\n\
-             \x20 return unpack2x16float(pack2x16float(vec2<f32>(q8(w, 24u - 8u * by) * sc, 0.0))).x;\n\
+            "fn halve_f16(w: u32, odd: bool) -> f16 {\n\
+             \x20 let p = bitcast<vec2<f16>>(w);\n\
+             \x20 return select(p.x, p.y, odd);\n\
              }\n",
         );
+    } else {
+        s.push_str(
+            "fn halve(w: u32, odd: bool) -> f32 {\n\
+             \x20 let p = unpack2x16float(w);\n\
+             \x20 return select(p.x, p.y, odd);\n\
+             }\n",
+        );
+    }
+    if w8 {
+        if f16_tile {
+            s.push_str(
+                "fn q8(w: u32, sh: u32) -> f32 {\n\
+                 \x20 return f32((bitcast<i32>(w << sh)) >> 24u);\n\
+                 }\n\
+                 fn wq_f16(w: u32, by: u32, sc: f32) -> f16 {\n\
+                 \x20 return f16(q8(w, 24u - 8u * by) * sc);\n\
+                 }\n",
+            );
+        } else {
+            s.push_str(
+                "fn q8(w: u32, sh: u32) -> f32 {\n\
+                 \x20 return f32((bitcast<i32>(w << sh)) >> 24u);\n\
+                 }\n\
+                 fn wq(w: u32, by: u32, sc: f32) -> f32 {\n\
+                 \x20 return unpack2x16float(pack2x16float(vec2<f32>(q8(w, 24u - 8u * by) * sc, 0.0))).x;\n\
+                 }\n",
+            );
+        }
     }
 
     s.push_str(&format!(
@@ -3322,249 +3479,256 @@ fn prefill_gemm_impl(
          let tx = lid.x;\n let ty = lid.y;\n\
          let m0 = wid.y * BM;\n let n0 = wid.x * BN;\n let kk = gd.k / {kkd}u;\n\
          let alda = gd.lda / 2u;\n\
-         let abase = wid.z * gd.bsa;\n let wb = wid.z * gd.bsb;\n\
+         let abase = wid.z * gd.bsa;\n\
+         let wb = (wid.z / max(gd.gqa_group, 1u)) * gd.bsb;\n\
          let cbase = wid.z * gd.bsc;\n\
          if (CAUSAL == 1u && n0 + gd.row0 > gd.q_off + m0 + BM - 1u) {{ return; }}\n\
          let klim = select(gd.k, min(gd.k, max(gd.q_off + m0 + BM, gd.row0) - gd.row0), CAUSAL_K == 1u);\n",
         kkd = if w8 { 4 } else { 2 },
     ));
     if v4 {
-        // The chunk index and half-word parity every store path is written in
-        // terms of: thread (tx, ty) owns chunks `c0` and `c0 + CSTEP`, i.e.
-        // `(k, rg) = (c0/AQ, c0%AQ)` and `(k+8, rg)`.  Both are the same four
-        // rows at two `k`, so one parity flag covers all eight global words.
-        // `bop`/`bog`/`bos` invert the B tile's `pos(g, s)` for chunk `c0`.
-        s.push_str(
-            " let c0 = ty * 16u + tx;\n\
-             \x20 let crg = c0 % AQ;\n let ck = c0 / AQ;\n\
-             \x20 let cvodd = ((ck & 1u) == 1u);\n\
-             \x20 let bop = c0 % BQ;\n\
-             \x20 let bog = ((bop >> 4u) << 3u) | (bop & 7u);\n\
-             \x20 let bos = (bop >> 3u) & 1u;\n",
-        );
-        if w8 {
-            // The int8 B tile: the thread's four weight rows (the same rows for
-            // `c0` and `c0 + CSTEP`), their scales, and the byte position —
-            // `kx` steps by `BK` (a multiple of 4), so `ck % 4` is the whole
-            // k loop's byte-in-word index.
+        s.push_str(" let c0 = ty * 16u + tx;\n");
+        if tile64 {
+            // One chunk per thread: c0's 16 k-columns and 16 four-row groups
+            // cover the whole BK×BN tile with no second half.
             s.push_str(
-                " let brow = gd.row0 + n0 + 8u * bog + 4u * bos;\n\
-                 \x20 let s0 = S8[brow]; let s1 = S8[brow + 1u]; let s2 = S8[brow + 2u]; let s3 = S8[brow + 3u];\n\
-                 \x20 let by = ck % 4u;\n",
+                " let crg = c0 % AQ;\n let ck = c0 / AQ;\n\
+                 \x20 let cvodd = ((ck & 1u) == 1u);\n\
+                 \x20 let bop = c0 % BQ;\n",
             );
+            if w8 {
+                s.push_str(
+                    " let brow = gd.row0 + n0 + 4u * bop;\n\
+                     \x20 let s0 = S8[brow]; let s1 = S8[brow + 1u]; let s2 = S8[brow + 2u]; let s3 = S8[brow + 3u];\n\
+                     \x20 let by = ck % 4u;\n",
+                );
+            }
+        } else {
+            s.push_str(
+                " let crg = c0 % AQ;\n let ck = c0 / AQ;\n\
+                 \x20 let cvodd = ((ck & 1u) == 1u);\n\
+                 \x20 let bop = c0 % BQ;\n\
+                 \x20 let bog = ((bop >> 4u) << 3u) | (bop & 7u);\n\
+                 \x20 let bos = (bop >> 3u) & 1u;\n",
+            );
+            if w8 {
+                s.push_str(
+                    " let brow = gd.row0 + n0 + 8u * bog + 4u * bos;\n\
+                     \x20 let s0 = S8[brow]; let s1 = S8[brow + 1u]; let s2 = S8[brow + 2u]; let s3 = S8[brow + 3u];\n\
+                     \x20 let by = ck % 4u;\n",
+                );
+            }
         }
     }
 
     for i in 0..tm {
         for j in 0..tn {
-            s.push_str(&format!("var c{i}{j} = 0.0;\n"));
+            s.push_str(&format!("var c{i}{j}: f32 = 0.0;\n"));
         }
     }
 
-    let load_as = |kx: &str| -> String {
-        let mut t = String::new();
-        if v4 {
-            for half in 0..2 {
-                let kw = format!("({kx} + ck + {}u)", half * 8);
-                let mut comps = String::new();
-                for e in 0..4 {
-                    comps.push_str(&format!(
-                        "\x20 halve(A[abase + (m0 + 4u * crg + {e}u) * alda + {kw} / 2u], cvodd),"
-                    ));
-                }
-                t.push_str(&format!(
-                    "  A4[c0{}] = vec4<f32>({comps});\n",
-                    if half == 0 { String::new() } else { " + CSTEP".into() }
-                ));
-            }
-            return t;
-        }
-        for e in 0..n_as {
-            t.push_str(&format!(
-                "  As[(ty + {}u) * PAD + tx] = halve(A[abase + (m0 + ty + {}u) * alda + ({kx} + tx) / 2u], (tx & 1u) == 1u);\n",
-                e * 16, e * 16
-            ));
-        }
-        t
-    };
-    // ---- B tile row permutation -------------------------------------------
-    //
-    // The compute loop reads `Bs[(tx * TN + j) * PAD + q]`, so for a fixed `j`
-    // the sixteen `tx` lanes of a warp stride `TN * PAD = 8 * 17 = 136` words.
-    // `136 mod 32 = 8`, so those lanes land on banks `{0, 8, 16, 24}` -- four
-    // banks for sixteen lanes, a **4-way shared-memory conflict** costing four
-    // LDS cycles per load.  A k-step issues 8 B loads and 64 FMAs, i.e. 32
-    // banks-cycles of shared traffic against 16 issue cycles for the FMAs
-    // (4 warps/SM/clock): shared memory, not FLOPs, set the rate.
-    //
-    // No padding fixes it: `8 * PAD mod 32` is always a multiple of 8, so the
-    // sixteen lanes can never reach more than four banks.  Permuting the tile
-    // does.  Value `B[n0 + 8*tx + j]` is stored in slot `16*j + tx` instead of
-    // slot `8*tx + j`, and the compute read becomes
-    // `Bs[(16*j + tx) * PAD + q]`.  `16 * 17 = 272 mod 32 = 16` moves `j` in
-    // whole sixteen-word blocks while `tx` walks `17*tx mod 32` -- sixteen
-    // distinct banks.  The store's row `v = ty + 16e` therefore goes to slot
-    // `16*(v % tn) + v / tn` -- powers of two, so it folds to a mask and a shift.
-    //
-    // Each thread still reads the same eight values, still accumulates them in
-    // the same order, and issues the same FMAs: bit-identical by construction.
-    // `gemm_bench`'s `P` column prices it at +10% to +29% per shape.
-    let bslot = |e: usize| -> String {
+    let vec = |parts: &[String]| -> String {
         format!(
-            "(16u * ((ty + {off}u) % {tn}u) + (ty + {off}u) / {tn}u)",
-            off = e * 16
+            "vec4<{}>({})",
+            if f16_tile { "f16" } else { "f32" },
+            parts.join(",")
         )
     };
-    let load_bs = |kx: &str| -> String {
-        let mut t = String::new();
-        if v4 {
-            if transb {
-                // The k-major operand: four consecutive `n` at one k is *two*
-                // words, and their half-word parity alternates per row rather
-                // than being one flag per thread.  So this chunk is built from
-                // two registers with the parity spelled out, and it reads half
-                // the words the row-major path does.
-                for half in 0..2 {
-                    let base = format!(
-                        "wb + (gd.row0 + {kx} + ck{}) * (gd.n / 2u)",
-                        if half == 0 { String::new() } else { " + 8u".into() }
-                    );
-                    t.push_str(&format!(
-                        "  B4[c0{cs}] = vec4<f32>(halve(W[{base} + {wo}], false), halve(W[{base} + {wo}], true), halve(W[{base} + {wo} + 1u], false), halve(W[{base} + {wo} + 1u], true));\n",
-                        cs = if half == 0 { String::new() } else { " + CSTEP".into() },
-                        wo = "(n0 + 8u * bog + 4u * bos) / 2u"
-                    ));
-                }
-                return t;
-            }
-            if w8 {
-                // The same four rows at one k, but each value is now a byte of
-                // its row's word `(kx + ck + 8*half) / 4` — the byte position
-                // itself is the per-thread constant `by`.
-                for half in 0..2 {
-                    let wo = format!("({kx} + ck + {}u) / 4u", half * 8);
-                    let mut comps = String::new();
-                    for e in 0..4 {
-                        comps.push_str(&format!(
-                            "\x20 wq(W[wb + (gd.row0 + n0 + 8u * bog + 4u * bos + {e}u) * kk + {wo}], by, s{e}),"
-                        ));
-                    }
-                    t.push_str(&format!(
-                        "  B4[c0{}] = vec4<f32>({comps});\n",
-                        if half == 0 { String::new() } else { " + CSTEP".into() }
-                    ));
-                }
-                return t;
-            }
-            for half in 0..2 {
-                let kw = format!("({kx} + ck + {}u)", half * 8);
-                let mut comps = String::new();
-                for e in 0..4 {
-                    comps.push_str(&format!(
-                        "\x20 halve(W[wb + (gd.row0 + n0 + 8u * bog + 4u * bos + {e}u) * kk + {kw} / 2u], cvodd),"
-                    ));
-                }
-                t.push_str(&format!(
-                    "  B4[c0{}] = vec4<f32>({comps});\n",
-                    if half == 0 { String::new() } else { " + CSTEP".into() }
-                ));
-            }
-            return t;
-        }
-        if !transb {
-            for e in 0..n_bs {
-                t.push_str(&format!(
-                    "  Bs[{slot} * PAD + tx] = halve(W[wb + (gd.row0 + n0 + ty + {row}u) * kk + ({kx} + tx) / 2u], (tx & 1u) == 1u);\n",
-                    slot = bslot(e),
-                    row = e * 16
-                ));
-            }
+    let halve_call = |word: &str, odd: String| {
+        if f16_tile {
+            format!("halve_f16({word}, {odd})")
         } else {
-            for e in 0..n_bs {
-                t.push_str(&format!(
-                    "  Bs[{slot} * PAD + tx] = halve(W[wb + (gd.row0 + {kx} + tx) * (gd.n / 2u) + (n0 + ty + {row}u) / 2u], ((n0 + ty + {row}u) & 1u) == 1u);\n",
-                    slot = bslot(e),
-                    row = e * 16
-                ));
-            }
+            format!("halve({word}, {odd})")
         }
-        t
     };
-    let pf_as = |kx: &str| -> String {
+    let wq_call = |word: &str, e: usize| {
+        if f16_tile {
+            format!("wq_f16({word}, by, s{e})")
+        } else {
+            format!("wq({word}, by, s{e})")
+        }
+    };
+    let a4_call = |suffix: &str, comps: &[String]| format!("A4[c0{suffix}] = {};\n", vec(comps));
+    let b4_call = |suffix: &str, comps: &[String]| format!("B4[c0{suffix}] = {};\n", vec(comps));
+
+    // Store expressions for A and B, for both the initial load and the
+    // software-pipelined prefetch (the latter reads `pfa*`/`pfb*` registers).
+    let a_group = |e: usize| -> String { format!("4u * crg + {e}u") };
+    let b_rows = |e: usize| -> String {
+        if tile64 {
+            format!("4u * bop + {e}u")
+        } else {
+            format!("8u * bog + 4u * bos + {e}u")
+        }
+    };
+    let transb_wo = if tile64 {
+        "(n0 + 4u * bop) / 2u".to_string()
+    } else {
+        "(n0 + 8u * bog + 4u * bos) / 2u".to_string()
+    };
+
+    let load_as = |kx: &str, pf: bool| -> String {
         let mut t = String::new();
         if v4 {
-            for half in 0..2 {
-                let kw = format!("({kx} + ck + {}u)", half * 8);
+            let halves: Vec<(String, String)> = if tile64 {
+                vec![(String::new(), "0u".to_string())]
+            } else {
+                vec![
+                    (String::new(), "0u".to_string()),
+                    (" + CSTEP".into(), "8u".to_string()),
+                ]
+            };
+            for (idx, (suffix, kadd)) in halves.iter().enumerate() {
+                let mut comps = Vec::new();
                 for e in 0..4 {
-                    t.push_str(&format!(
-                        "   pfa{} = A[abase + (m0 + 4u * crg + {e}u) * alda + {kw} / 2u];\n",
-                        half * 4 + e
-                    ));
+                    let (word, odd) = if pf {
+                        (format!("pfa{}", idx * 4 + e), "cvodd".to_string())
+                    } else {
+                        (
+                            format!(
+                                "A[abase + (m0 + {}) * alda + ({kx} + ck + {kadd}) / 2u]",
+                                a_group(e)
+                            ),
+                            "cvodd".to_string(),
+                        )
+                    };
+                    comps.push(halve_call(&word, odd));
                 }
+                t.push_str(&a4_call(suffix, &comps));
             }
             return t;
         }
         for e in 0..n_as {
+            let (word, odd) = if pf {
+                (format!("pfa{e}"), "(tx & 1u) == 1u".to_string())
+            } else {
+                (
+                    format!(
+                        "A[abase + (m0 + ty + {}u) * alda + ({kx} + tx) / 2u]",
+                        e * 16
+                    ),
+                    "((tx & 1u) == 1u)".to_string(),
+                )
+            };
             t.push_str(&format!(
-                "   pfa{e} = A[abase + (m0 + ty + {}u) * alda + ({kx} + tx) / 2u];\n", e * 16
+                "  As[(ty + {}u) * PAD + tx] = {};\n",
+                e * 16,
+                halve_call(&word, odd)
             ));
         }
         t
     };
-    let pf_bs = |kx: &str| -> String {
+    let load_bs = |kx: &str, pf: bool| -> String {
         let mut t = String::new();
         if v4 {
-            if transb {
-                // Two words per chunk, four registers total.
-                for half in 0..2 {
-                    let base = format!(
-                        "wb + (gd.row0 + {kx} + ck{}) * (gd.n / 2u)",
-                        if half == 0 { String::new() } else { " + 8u".into() }
-                    );
-                    t.push_str(&format!(
-                        "   pfb{} = W[{base} + {wo}];\n   pfb{} = W[{base} + {wo} + 1u];\n",
-                        half * 2,
-                        half * 2 + 1,
-                        wo = "(n0 + 8u * bog + 4u * bos) / 2u"
-                    ));
-                }
-                return t;
-            }
-            if w8 {
-                for half in 0..2 {
-                    let wo = format!("({kx} + ck + {}u) / 4u", half * 8);
-                    for e in 0..4 {
+            let halves: Vec<(String, String)> = if tile64 {
+                vec![(String::new(), "0u".to_string())]
+            } else {
+                vec![
+                    (String::new(), "0u".to_string()),
+                    (" + CSTEP".into(), "8u".to_string()),
+                ]
+            };
+            for (idx, (suffix, kadd)) in halves.iter().enumerate() {
+                if transb {
+                    let base = format!("wb + (gd.row0 + {kx} + ck + {kadd}) * (gd.n / 2u)");
+                    let w0 = if pf {
+                        format!("pfb{}", idx * 2)
+                    } else {
+                        format!("W[{base} + {transb_wo}]")
+                    };
+                    let w1 = if pf {
+                        format!("pfb{}", idx * 2 + 1)
+                    } else {
+                        format!("W[{base} + {transb_wo} + 1u]")
+                    };
+                    if f16_tile {
+                        let scope = if pf { "p" } else { "i" };
                         t.push_str(&format!(
-                            "   pfb{} = W[wb + (gd.row0 + n0 + 8u * bog + 4u * bos + {e}u) * kk + {wo}];\n",
-                            half * 4 + e
+                            "let tp_{scope}_{idx}_0 = bitcast<vec2<f16>>({w0}); let tp_{scope}_{idx}_1 = bitcast<vec2<f16>>({w1}); B4[c0{suffix}] = vec4<f16>(tp_{scope}_{idx}_0.x, tp_{scope}_{idx}_0.y, tp_{scope}_{idx}_1.x, tp_{scope}_{idx}_1.y);\n"
                         ));
+                        continue;
                     }
+                    let comps = vec![
+                        halve_call(&w0, "false".to_string()),
+                        halve_call(&w0, "true".to_string()),
+                        halve_call(&w1, "false".to_string()),
+                        halve_call(&w1, "true".to_string()),
+                    ];
+                    t.push_str(&b4_call(suffix, &comps));
+                    continue;
                 }
-                return t;
-            }
-            for half in 0..2 {
-                let kw = format!("({kx} + ck + {}u)", half * 8);
+                if w8 {
+                    let mut comps = Vec::new();
+                    for e in 0..4 {
+                        let word = if pf {
+                            format!("pfb{}", idx * 4 + e)
+                        } else {
+                            format!(
+                                "W[wb + (gd.row0 + n0 + {}) * kk + ({kx} + ck + {kadd}) / 4u]",
+                                b_rows(e)
+                            )
+                        };
+                        comps.push(wq_call(&word, e));
+                    }
+                    t.push_str(&b4_call(suffix, &comps));
+                    continue;
+                }
+                let mut comps = Vec::new();
                 for e in 0..4 {
-                    t.push_str(&format!(
-                        "   pfb{} = W[wb + (gd.row0 + n0 + 8u * bog + 4u * bos + {e}u) * kk + {kw} / 2u];\n",
-                        half * 4 + e
-                    ));
+                    let (word, odd) = if pf {
+                        (format!("pfb{}", idx * 4 + e), "cvodd".to_string())
+                    } else {
+                        (
+                            format!(
+                                "W[wb + (gd.row0 + n0 + {}) * kk + ({kx} + ck + {kadd}) / 2u]",
+                                b_rows(e)
+                            ),
+                            "cvodd".to_string(),
+                        )
+                    };
+                    comps.push(halve_call(&word, odd));
                 }
+                t.push_str(&b4_call(suffix, &comps));
             }
             return t;
         }
-        if !transb {
-            for e in 0..n_bs {
-                t.push_str(&format!(
-                    "   pfb{e} = W[wb + (gd.row0 + n0 + ty + {}u) * kk + ({kx} + tx) / 2u];\n", e * 16
-                ));
-            }
-        } else {
-            for e in 0..n_bs {
-                t.push_str(&format!(
-                    "   pfb{e} = W[wb + (gd.row0 + {kx} + tx) * (gd.n / 2u) + (n0 + ty + {}u) / 2u];\n", e * 16
-                ));
-            }
+        for e in 0..n_bs {
+            let slot = format!(
+                "(16u * ((ty + {}u) % {tn}u) + (ty + {}u) / {tn}u)",
+                e * 16,
+                e * 16
+            );
+            let (word, odd) = if pf {
+                (
+                    format!("pfb{e}"),
+                    if transb {
+                        format!("((n0 + ty + {}u) & 1u) == 1u", e * 16)
+                    } else {
+                        "(tx & 1u) == 1u".to_string()
+                    },
+                )
+            } else if transb {
+                (
+                    format!(
+                        "W[wb + (gd.row0 + {kx} + tx) * (gd.n / 2u) + (n0 + ty + {}u) / 2u]",
+                        e * 16
+                    ),
+                    format!("((n0 + ty + {}u) & 1u) == 1u", e * 16),
+                )
+            } else {
+                (
+                    format!(
+                        "W[wb + (gd.row0 + n0 + ty + {}u) * kk + ({kx} + tx) / 2u]",
+                        e * 16
+                    ),
+                    "(tx & 1u) == 1u".to_string(),
+                )
+            };
+            t.push_str(&format!(
+                "  Bs[{slot} * PAD + tx] = {};\n",
+                halve_call(&word, odd)
+            ));
         }
         t
     };
@@ -3578,97 +3742,83 @@ fn prefill_gemm_impl(
         }
         t
     };
-    let store_as = || {
+    let pf_as = |kx: &str| -> String {
         let mut t = String::new();
         if v4 {
-            for half in 0..2 {
-                let mut comps = String::new();
+            let halves: Vec<u32> = if tile64 { vec![0] } else { vec![0, 8] };
+            for (idx, hadd) in halves.iter().enumerate() {
                 for e in 0..4 {
-                    comps.push_str(&format!("\x20 halve(pfa{}, cvodd),", half * 4 + e));
+                    t.push_str(&format!(
+                        "   pfa{} = A[abase + (m0 + {}) * alda + ({kx} + ck + {hadd}u) / 2u];\n",
+                        idx * 4 + e,
+                        a_group(e)
+                    ));
                 }
-                t.push_str(&format!(
-                    "   A4[c0{}] = vec4<f32>({comps});\n",
-                    if half == 0 { String::new() } else { " + CSTEP".into() }
-                ));
             }
             return t;
         }
         for e in 0..n_as {
             t.push_str(&format!(
-                "   As[(ty + {}u) * PAD + tx] = halve(pfa{e}, (tx & 1u) == 1u);\n", e * 16
+                "   pfa{e} = A[abase + (m0 + ty + {}u) * alda + ({kx} + tx) / 2u];\n",
+                e * 16
             ));
         }
         t
     };
-    let store_bs = || {
+    let pf_bs = |kx: &str| -> String {
         let mut t = String::new();
         if v4 {
-            if transb {
-                for half in 0..2 {
-                    t.push_str(&format!(
-                        "   B4[c0{cs}] = vec4<f32>(halve(pfb{r}, false), halve(pfb{r}, true), halve(pfb{r2}, false), halve(pfb{r2}, true));\n",
-                        cs = if half == 0 { String::new() } else { " + CSTEP".into() },
-                        r = half * 2,
-                        r2 = half * 2 + 1
-                    ));
-                }
-                return t;
-            }
-            if w8 {
-                for half in 0..2 {
-                    let mut comps = String::new();
-                    for e in 0..4 {
-                        comps.push_str(&format!("\x20 wq(pfb{}, by, s{e}),", half * 4 + e));
+            let halves: Vec<u32> = if tile64 { vec![0] } else { vec![0, 8] };
+            for (idx, hadd) in halves.iter().enumerate() {
+                if transb {
+                    let base = format!("wb + (gd.row0 + {kx} + ck + {hadd}u) * (gd.n / 2u)");
+                    for w in 0..2 {
+                        t.push_str(&format!(
+                            "   pfb{} = W[{base} + {transb_wo}{}];\n",
+                            idx * 2 + w,
+                            if w == 0 {
+                                String::new()
+                            } else {
+                                " + 1u".into()
+                            }
+                        ));
                     }
-                    t.push_str(&format!(
-                        "   B4[c0{}] = vec4<f32>({comps});\n",
-                        if half == 0 { String::new() } else { " + CSTEP".into() }
-                    ));
+                } else if w8 {
+                    for e in 0..4 {
+                        t.push_str(&format!(
+                            "   pfb{} = W[wb + (gd.row0 + n0 + {}) * kk + ({kx} + ck + {hadd}u) / 4u];\n",
+                            idx * 4 + e,
+                            b_rows(e)
+                        ));
+                    }
+                } else {
+                    for e in 0..4 {
+                        t.push_str(&format!(
+                            "   pfb{} = W[wb + (gd.row0 + n0 + {}) * kk + ({kx} + ck + {hadd}u) / 2u];\n",
+                            idx * 4 + e,
+                            b_rows(e)
+                        ));
+                    }
                 }
-                return t;
-            }
-            for half in 0..2 {
-                let mut comps = String::new();
-                for e in 0..4 {
-                    comps.push_str(&format!("\x20 halve(pfb{}, cvodd),", half * 4 + e));
-                }
-                t.push_str(&format!(
-                    "   B4[c0{}] = vec4<f32>({comps});\n",
-                    if half == 0 { String::new() } else { " + CSTEP".into() }
-                ));
             }
             return t;
         }
         for e in 0..n_bs {
-            let sel = if transb {
-                format!("((n0 + ty + {}u) & 1u) == 1u", e * 16)
+            if transb {
+                t.push_str(&format!(
+                    "   pfb{e} = W[wb + (gd.row0 + {kx} + tx) * (gd.n / 2u) + (n0 + ty + {}u) / 2u];\n", e * 16
+                ));
             } else {
-                "(tx & 1u) == 1u".to_string()
-            };
-            t.push_str(&format!(
-                "   Bs[{slot} * PAD + tx] = halve(pfb{e}, {sel});\n",
-                slot = bslot(e)
-            ));
+                t.push_str(&format!(
+                    "   pfb{e} = W[wb + (gd.row0 + n0 + ty + {}u) * kk + ({kx} + tx) / 2u];\n",
+                    e * 16
+                ));
+            }
         }
         t
     };
+
     // ---- k-step unrolling -------------------------------------------------
-    //
-    // The q-loop was a runtime `loop { if (q >= BK) break; ... q += 1 }`.  Four
-    // steps at a time is worth **5-10% per shape** over the runtime form -- and,
-    // measured separately, so is any other factor: `gemm_bench`'s U2/U4/U8/U16
-    // columns land at 2.29/2.33/2.30/2.36 mean TFLOP/s, i.e. inside each other's
-    // noise.  So the win is not "more unrolling", it is letting the compiler see
-    // past one k-step boundary at all: it can hoist the next step's shared loads
-    // above the current step's FMAs, which a loop that may exit at any iteration
-    // forbids.  Four is the smallest factor that buys it, so four it is.
-    //
-    // It is *only* worth anything together with the B permutation above: the
-    // same unroll on the unpermuted tile measured 1.89 against 2.02
-    // (`8x8DU16` vs `8x8D`), because with four lanes per bank there is nothing
-    // to overlap.  The accumulation order per output is untouched -- each
-    // `c{i}{j}` still takes its k contributions in ascending order -- so this is
-    // bit-identical.
     let mut unroll_q = gemm_unroll();
     if unroll_q < 2 {
         unroll_q = 1;
@@ -3678,28 +3828,38 @@ fn prefill_gemm_impl(
     }
     let compute = || {
         let mut t = String::new();
-        // The v4 read: two chunks per operand -- rows `8*ty .. +7` of A and
-        // `8*tx .. +7` of B -- with the same values, the same FMA count and the
-        // same ascending-k accumulation order as the scalar form.
         let v4_read = |t: &mut String, idx: &str, tag: &str| {
-            t.push_str(&format!("   let av{tag} = A4[{idx} * AQ + ty * 2u];\n"));
-            t.push_str(&format!("   let aw{tag} = A4[{idx} * AQ + ty * 2u + 1u];\n"));
-            t.push_str(&format!(
-                "   let bv{tag} = B4[{idx} * BQ + (tx & 7u) + 16u * (tx >> 3u)];\n"
-            ));
-            t.push_str(&format!(
-                "   let bw{tag} = B4[{idx} * BQ + (tx & 7u) + 8u + 16u * (tx >> 3u)];\n"
-            ));
+            if tile64 {
+                t.push_str(&format!(
+                    "   let av{tag} = vec4<f32>(A4[{idx} * AQ + ty]);\n"
+                ));
+                t.push_str(&format!(
+                    "   let bv{tag} = vec4<f32>(B4[{idx} * BQ + tx]);\n"
+                ));
+            } else {
+                t.push_str(&format!(
+                    "   let av{tag} = vec4<f32>(A4[{idx} * AQ + ty * 2u]);\n"
+                ));
+                t.push_str(&format!(
+                    "   let aw{tag} = vec4<f32>(A4[{idx} * AQ + ty * 2u + 1u]);\n"
+                ));
+                t.push_str(&format!(
+                    "   let bv{tag} = vec4<f32>(B4[{idx} * BQ + (tx & 7u) + 16u * (tx >> 3u)]);\n"
+                ));
+                t.push_str(&format!(
+                    "   let bw{tag} = vec4<f32>(B4[{idx} * BQ + (tx & 7u) + 8u + 16u * (tx >> 3u)]);\n"
+                ));
+            }
         };
         let v4_fma = |t: &mut String, tag: &str| {
             for i in 0..tm {
-                let a = if i < 4 {
+                let a = if i < 4 || tile64 {
                     format!("av{tag}[{i}]")
                 } else {
                     format!("aw{tag}[{}]", i - 4)
                 };
                 for j in 0..tn {
-                    let b = if j < 4 {
+                    let b = if j < 4 || tile64 {
                         format!("bv{tag}[{j}]")
                     } else {
                         format!("bw{tag}[{}]", j - 4)
@@ -3720,9 +3880,7 @@ fn prefill_gemm_impl(
                     ));
                 }
                 for j in 0..tn {
-                    t.push_str(&format!(
-                        "   let b{j} = Bs[(16u * {j}u + tx) * PAD + q];\n"
-                    ));
+                    t.push_str(&format!("   let b{j} = Bs[(16u * {j}u + tx) * PAD + q];\n"));
                 }
                 for i in 0..tm {
                     for j in 0..tn {
@@ -3752,9 +3910,7 @@ fn prefill_gemm_impl(
             }
             for i in 0..tm {
                 for j in 0..tn {
-                    t.push_str(&format!(
-                        "   c{i}{j} = c{i}{j} + a{i}_{u} * b{j}_{u};\n"
-                    ));
+                    t.push_str(&format!("   c{i}{j} = c{i}{j} + a{i}_{u} * b{j}_{u};\n"));
                 }
             }
         }
@@ -3763,8 +3919,8 @@ fn prefill_gemm_impl(
     };
 
     s.push_str(" var k0: u32 = 0u;\n");
-    s.push_str(&load_as("k0"));
-    s.push_str(&load_bs("k0"));
+    s.push_str(&load_as("k0", false));
+    s.push_str(&load_bs("k0", false));
     s.push_str(" workgroupBarrier();\n");
     s.push_str(" loop {\n  if (k0 >= klim) { break; }\n");
     s.push_str("  let kn = k0 + BK;\n");
@@ -3776,8 +3932,8 @@ fn prefill_gemm_impl(
     s.push_str(&compute());
     s.push_str("  workgroupBarrier();\n");
     s.push_str("  if (kn < klim) {\n");
-    s.push_str(&store_as());
-    s.push_str(&store_bs());
+    s.push_str(&load_as("kn", true));
+    s.push_str(&load_bs("kn", true));
     s.push_str("  }\n  workgroupBarrier();\n");
     s.push_str("  k0 = kn;\n }\n");
 
@@ -3791,9 +3947,7 @@ fn prefill_gemm_impl(
             s.push_str(&format!(
                 "let we{i}_{e} = (cbase + row{i} * gd.ldc + n0 + tx * {tn}u + {je}u) / 2u;\n"
             ));
-            s.push_str(&format!(
-                "var v{i}{e} = vec2<f32>(c{i}{je}, c{i}{jo});\n"
-            ));
+            s.push_str(&format!("var v{i}{e} = vec2<f32>(c{i}{je}, c{i}{jo});\n"));
             if bias {
                 s.push_str(&format!(
                     "v{i}{e} = v{i}{e} + unpack2x16float(Bias[(n0 + tx * {tn}u + {je}u) / 2u]);\n"
@@ -3802,9 +3956,7 @@ fn prefill_gemm_impl(
             s.push_str(&format!(
                 "if (BETA == 1u) {{\n  let old = unpack2x16float(C[we{i}_{e}]);\n  v{i}{e} = v{i}{e} + old;\n}}\n"
             ));
-            s.push_str(&format!(
-                "C[we{i}_{e}] = pack2x16float(v{i}{e});\n"
-            ));
+            s.push_str(&format!("C[we{i}_{e}] = pack2x16float(v{i}{e});\n"));
         }
     }
     s.push_str("}\n");
@@ -3853,9 +4005,7 @@ pub fn softmax_causal_tree_mode(bp: usize, bt: usize, mode: SubgroupMode) -> Str
     match mode {
         SubgroupMode::Warp32 => softmax_causal_tree_legacy(bp, bt, true),
         SubgroupMode::None => softmax_causal_tree_legacy(bp, bt, false),
-        SubgroupMode::Warp64 | SubgroupMode::Generic => {
-            softmax_causal_tree_generic(bp, bt)
-        }
+        SubgroupMode::Warp64 | SubgroupMode::Generic => softmax_causal_tree_generic(bp, bt),
     }
 }
 
@@ -3866,10 +4016,19 @@ pub fn softmax_causal_tree_mode(bp: usize, bt: usize, mode: SubgroupMode) -> Str
 /// The arithmetic that feeds the reductions — the lane loop, the `r = bt / bp`
 /// fold and the causal bound — is the same as the legacy tree's.
 fn softmax_causal_tree_generic(bp: usize, bt: usize) -> String {
-    assert!(bt >= bp && bt % bp == 0, "softmax_causal_tree: bt must be a multiple of bp");
+    assert!(
+        bt >= bp && bt % bp == 0,
+        "softmax_causal_tree: bt must be a multiple of bp"
+    );
     let r = bt / bp;
-    assert!(r.is_power_of_two(), "softmax_causal_tree: the emulation factor must be a power of two");
-    assert!(bp >= 32, "softmax_causal_tree: the shuffle tail needs 32 lanes");
+    assert!(
+        r.is_power_of_two(),
+        "softmax_causal_tree: the emulation factor must be a power of two"
+    );
+    assert!(
+        bp >= 32,
+        "softmax_causal_tree: the shuffle tail needs 32 lanes"
+    );
     let n_sg = "(BP + SG - 1u) / SG";
 
     let mut max_accs = String::new();
@@ -3908,22 +4067,14 @@ fn softmax_causal_tree_generic(bp: usize, bt: usize) -> String {
             }
             cur.pop().unwrap()
         };
-        max_body.push_str(&format!(
-            "    }}\n    let lmax = {};\n",
-            fold("m", "max")
-        ));
-        sum_body.push_str(&format!(
-            "    }}\n    let lsum = {};\n",
-            fold("s", "sum")
-        ));
+        max_body.push_str(&format!("    }}\n    let lmax = {};\n", fold("m", "max")));
+        sum_body.push_str(&format!("    }}\n    let lsum = {};\n", fold("s", "sum")));
         // The `for` opening is emitted here so the closing brace above lands
         // in the right scope; the r==1 path has no fold loop.
-        max_body = format!(
-            "    for (var base = 0u; base < valid; base = base + BT) {{\n{max_body}"
-        );
-        sum_body = format!(
-            "    for (var base = 0u; base < valid; base = base + BT) {{\n{sum_body}"
-        );
+        max_body =
+            format!("    for (var base = 0u; base < valid; base = base + BT) {{\n{max_body}");
+        sum_body =
+            format!("    for (var base = 0u; base < valid; base = base + BT) {{\n{sum_body}");
     }
 
     format!(
@@ -4016,12 +4167,20 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
 }
 
 fn softmax_causal_tree_legacy(bp: usize, bt: usize, subgroup: bool) -> String {
-    assert!(bt >= bp && bt % bp == 0, "softmax_causal_tree: bt must be a multiple of bp");
+    assert!(
+        bt >= bp && bt % bp == 0,
+        "softmax_causal_tree: bt must be a multiple of bp"
+    );
     let r = bt / bp;
-    assert!(r.is_power_of_two(), "softmax_causal_tree: the emulation factor must be a power of two");
-    assert!(bp >= 32, "softmax_causal_tree: the shuffle tail needs 32 lanes");
+    assert!(
+        r.is_power_of_two(),
+        "softmax_causal_tree: the emulation factor must be a power of two"
+    );
+    assert!(
+        bp >= 32,
+        "softmax_causal_tree: the shuffle tail needs 32 lanes"
+    );
     let (max_tail, sum_tail) = if subgroup {
-
         (
             "    if (lid.x < 32u) {\n\
              \x20       var t = red_max[lid.x];\n\
@@ -4082,7 +4241,11 @@ fn softmax_causal_tree_legacy(bp: usize, bt: usize, subgroup: bool) -> String {
                     .replace("{bt}", &bt.to_string())
             };
         }
-        let init = if op == "max" { "bitcast<f32>(0xFF800000u)" } else { "0.0" };
+        let init = if op == "max" {
+            "bitcast<f32>(0xFF800000u)"
+        } else {
+            "0.0"
+        };
         // The two passes share a function scope, so the accumulators need
         // different names (m* and s*, not both *).
         let pre = if op == "max" { "m" } else { "s" };
@@ -4098,7 +4261,9 @@ fn softmax_causal_tree_legacy(bp: usize, bt: usize, subgroup: bool) -> String {
                 "            let v{k} = half_at(unpack2x16float(X[base_x + (j{k} >> 1u)]), j{k});\n"
             ));
             if op == "max" {
-                body.push_str(&format!("            {pre}{k} = max({pre}{k}, v{k} * scale);\n"));
+                body.push_str(&format!(
+                    "            {pre}{k} = max({pre}{k}, v{k} * scale);\n"
+                ));
             } else {
                 body.push_str(&format!(
                     "            {pre}{k} = {pre}{k} + exp(v{k} * scale - row_max);\n"
@@ -4221,7 +4386,11 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
 pub fn softmax_causal(bs: usize, subgroup: bool) -> String {
     softmax_causal_mode(
         bs,
-        if subgroup { SubgroupMode::Warp32 } else { SubgroupMode::None },
+        if subgroup {
+            SubgroupMode::Warp32
+        } else {
+            SubgroupMode::None
+        },
     )
 }
 
@@ -4243,7 +4412,10 @@ pub fn softmax_causal_mode(bs: usize, mode: SubgroupMode) -> String {
 /// `row0` doubles as the slab index (`row0 / T`), which is how the dispatch
 /// knows its slot without a second uniform field.
 pub fn slab_stats(bs: usize, t: usize) -> String {
-    assert!(t.is_power_of_two(), "slab_stats: the slab width must be a power of two");
+    assert!(
+        t.is_power_of_two(),
+        "slab_stats: the slab width must be a power of two"
+    );
     assert!(bs.is_power_of_two() && bs <= t, "slab_stats: block size");
     format!(
         "struct StatsCfg {{ n_x: u32, valid: u32, m: u32, mp: u32, scale: f32, row0: u32, gx: u32, rows: u32, q_off: u32 }};
@@ -4896,7 +5068,7 @@ fn softmax(@builtin(global_invocation_id) gid: vec3<u32>) {
 ///
 /// Bindings: 0 = h, 1 = PE `[tpc, d]`, 2 = dst, 3 = `PeCfg { d, tpc, s_pad }`.
 pub fn audio_add_pe() -> String {
-    "struct PeCfg { d: u32, tpc: u32, s_pad: u32, _a: u32 };
+    "struct PeCfg { d: u32, tpc: u32, s_pad: u32, rows: u32, dst_row: u32, _p0: u32, _p1: u32, _p2: u32 };
 
 @group(0) @binding(0) var<storage, read>       H:   array<u32>;
 @group(0) @binding(1) var<storage, read>       Pe:  array<u32>;
@@ -4912,10 +5084,12 @@ fn add_pe(@builtin(workgroup_id) wid: vec3<u32>,
     let d2 = cfg.d / 2u;
     if (w >= d2) { return; }
     let tok = wid.x;
+    // Rows past `rows` are the caller's (e.g. the next utterance's block).
+    if (tok >= cfg.rows) { return; }
     let v = unpack2x16float(H[tok * (cfg.s_pad / 2u) + w])
           + unpack2x16float(Pe[(tok % cfg.tpc) * d2 + w]);
     let packed = pack2x16float(v);
-    Dst[tok * (cfg.s_pad / 2u) + w] = packed;
+    Dst[(cfg.dst_row + tok) * (cfg.s_pad / 2u) + w] = packed;
 }
 "
     .to_string()
@@ -5037,10 +5211,22 @@ mod stage2_subgroup_tests {
             ("gemv", gemv_mode(64, 1024, true, mode, 8)),
             ("gemv_rpwr", gemv_rpwr_mode(64, 1024, true, mode, 8, 2)),
             ("gemv_w8", gemv_w8_mode(64, 1024, true, mode, 8)),
-            ("gemv_w8_rpwr", gemv_w8_rpwr_mode(64, 1024, true, mode, 8, 2)),
-            ("gemv_norm", gemv_norm_mode(64, 1024, true, mode, 1024, 1024, 1e-5)),
-            ("gemv_norm_w8", gemv_norm_w8_mode(64, 1024, true, mode, 1024, 1024, 1e-5)),
-            ("gemv_batch_slots", gemv_batch_slots_mode(64, 1024, 4, true, mode)),
+            (
+                "gemv_w8_rpwr",
+                gemv_w8_rpwr_mode(64, 1024, true, mode, 8, 2),
+            ),
+            (
+                "gemv_norm",
+                gemv_norm_mode(64, 1024, true, mode, 1024, 1024, 1e-5),
+            ),
+            (
+                "gemv_norm_w8",
+                gemv_norm_w8_mode(64, 1024, true, mode, 1024, 1024, 1e-5),
+            ),
+            (
+                "gemv_batch_slots",
+                gemv_batch_slots_mode(64, 1024, 4, true, mode),
+            ),
             (
                 "gemv_norm_batch_slots",
                 gemv_norm_batch_slots_mode(64, 1024, 4, true, 1024, 1024, 1e-5, mode),
@@ -5050,13 +5236,34 @@ mod stage2_subgroup_tests {
 
     #[test]
     fn legacy_gemv_wrappers_are_byte_identical() {
-        assert_eq!(gemv_split(64, 1024, true, 2), gemv_split_mode(64, 1024, SubgroupMode::Warp32, 2));
-        assert_eq!(gemv_split(64, 1024, false, 2), gemv_split_mode(64, 1024, SubgroupMode::None, 2));
-        assert_eq!(gemv(64, 1024, true, true, 8), gemv_mode(64, 1024, true, SubgroupMode::Warp32, 8));
-        assert_eq!(gemv(64, 1024, true, false, 8), gemv_mode(64, 1024, true, SubgroupMode::None, 8));
-        assert_eq!(gemv_rpwr(64, 1024, true, true, 8, 2), gemv_rpwr_mode(64, 1024, true, SubgroupMode::Warp32, 8, 2));
-        assert_eq!(gemv_w8(64, 1024, true, true, 8), gemv_w8_mode(64, 1024, true, SubgroupMode::Warp32, 8));
-        assert_eq!(gemv_w8_rpwr(64, 1024, true, false, 8, 2), gemv_w8_rpwr_mode(64, 1024, true, SubgroupMode::None, 8, 2));
+        assert_eq!(
+            gemv_split(64, 1024, true, 2),
+            gemv_split_mode(64, 1024, SubgroupMode::Warp32, 2)
+        );
+        assert_eq!(
+            gemv_split(64, 1024, false, 2),
+            gemv_split_mode(64, 1024, SubgroupMode::None, 2)
+        );
+        assert_eq!(
+            gemv(64, 1024, true, true, 8),
+            gemv_mode(64, 1024, true, SubgroupMode::Warp32, 8)
+        );
+        assert_eq!(
+            gemv(64, 1024, true, false, 8),
+            gemv_mode(64, 1024, true, SubgroupMode::None, 8)
+        );
+        assert_eq!(
+            gemv_rpwr(64, 1024, true, true, 8, 2),
+            gemv_rpwr_mode(64, 1024, true, SubgroupMode::Warp32, 8, 2)
+        );
+        assert_eq!(
+            gemv_w8(64, 1024, true, true, 8),
+            gemv_w8_mode(64, 1024, true, SubgroupMode::Warp32, 8)
+        );
+        assert_eq!(
+            gemv_w8_rpwr(64, 1024, true, false, 8, 2),
+            gemv_w8_rpwr_mode(64, 1024, true, SubgroupMode::None, 8, 2)
+        );
         assert_eq!(
             gemv_norm(64, 1024, true, true, 1024, 1024, 1e-5),
             gemv_norm_mode(64, 1024, true, SubgroupMode::Warp32, 1024, 1024, 1e-5)
@@ -5077,10 +5284,22 @@ mod stage2_subgroup_tests {
 
     #[test]
     fn legacy_softmax_wrappers_are_byte_identical() {
-        assert_eq!(softmax_causal(256, true), softmax_causal_mode(256, SubgroupMode::Warp32));
-        assert_eq!(softmax_causal(256, false), softmax_causal_mode(256, SubgroupMode::None));
-        assert_eq!(softmax_causal_tree(64, 256, true), softmax_causal_tree_mode(64, 256, SubgroupMode::Warp32));
-        assert_eq!(softmax_causal_tree(64, 256, false), softmax_causal_tree_mode(64, 256, SubgroupMode::None));
+        assert_eq!(
+            softmax_causal(256, true),
+            softmax_causal_mode(256, SubgroupMode::Warp32)
+        );
+        assert_eq!(
+            softmax_causal(256, false),
+            softmax_causal_mode(256, SubgroupMode::None)
+        );
+        assert_eq!(
+            softmax_causal_tree(64, 256, true),
+            softmax_causal_tree_mode(64, 256, SubgroupMode::Warp32)
+        );
+        assert_eq!(
+            softmax_causal_tree(64, 256, false),
+            softmax_causal_tree_mode(64, 256, SubgroupMode::None)
+        );
     }
 
     #[test]
@@ -5144,9 +5363,9 @@ mod stage2_subgroup_tests {
 
     #[test]
     fn vulkan_validates_all_stage2_modes() {
-        let gpu = match pollster::block_on(
-            crate::gpu::Gpu::new_with(crate::gpu::DeviceSelector::parse("vulkan").unwrap()),
-        ) {
+        let gpu = match pollster::block_on(crate::gpu::Gpu::new_with(
+            crate::gpu::DeviceSelector::parse("vulkan").unwrap(),
+        )) {
             Ok(gpu) => gpu,
             Err(e) => {
                 eprintln!("skip Vulkan WGSL validation test: {e}");
@@ -5169,8 +5388,16 @@ mod stage2_subgroup_tests {
                 ("gemv", gemv_mode(64, 1024, true, *mode, 8), "gemv"),
                 ("gemv_w8", gemv_w8_mode(64, 1024, true, *mode, 8), "gemv"),
                 ("gemv_split", gemv_split_mode(64, 1024, *mode, 2), "gemv"),
-                ("gemv_norm", gemv_norm_mode(64, 1024, true, *mode, 1024, 1024, 1e-5), "gemv"),
-                ("gemv_norm_w8", gemv_norm_w8_mode(64, 1024, true, *mode, 1024, 1024, 1e-5), "gemv"),
+                (
+                    "gemv_norm",
+                    gemv_norm_mode(64, 1024, true, *mode, 1024, 1024, 1e-5),
+                    "gemv",
+                ),
+                (
+                    "gemv_norm_w8",
+                    gemv_norm_w8_mode(64, 1024, true, *mode, 1024, 1024, 1e-5),
+                    "gemv",
+                ),
             ];
             for (name, src, entry) in jobs {
                 gpu.pipeline(&label(name), &src, entry, None)
@@ -5208,3 +5435,456 @@ mod stage2_subgroup_tests {
     }
 }
 
+#[cfg(test)]
+mod stage3_gemm_tests {
+    use super::*;
+
+    #[test]
+    fn prefill_gemm_variants_are_wgsl_type_safe_and_gqa_aware() {
+        let variants = [
+            ("plain", false, false, false, false, false, false),
+            ("beta", false, true, false, false, false, false),
+            ("transb", true, false, false, false, false, false),
+            ("causal", false, false, false, true, false, false),
+            ("causal_av", true, false, false, false, true, false),
+            ("bias", false, false, true, false, false, false),
+            ("beta_bias", false, true, true, false, false, false),
+            ("w8", false, false, false, false, false, true),
+            ("w8_beta", false, true, false, false, false, true),
+        ];
+        for (name, transb, beta, bias, causal, causal_k, w8) in variants {
+            for (tile64, use_f16) in [(false, false), (true, false), (false, true), (true, true)] {
+                let src =
+                    prefill_gemm_cfg(transb, beta, bias, causal, causal_k, w8, tile64, use_f16);
+                let tag = format!(
+                    "{name}/{}/{}",
+                    if tile64 { "64" } else { "128" },
+                    if use_f16 { "f16" } else { "f32" }
+                );
+                assert_eq!(src.starts_with("enable f16;\n"), use_f16, "{tag}");
+                assert!(!src.contains("enable subgroups;"), "{tag}");
+                assert!(src.contains("gqa_group: u32 }"), "{tag}");
+                assert!(src.contains("wid.z / max(gd.gqa_group, 1u)"), "{tag}");
+                if use_f16 {
+                    assert!(src.contains("array<vec4<f16>"), "{tag}");
+                    assert!(src.contains("vec4<f32>(A4["), "{tag}");
+                    assert!(src.contains("vec4<f32>(B4["), "{tag}");
+                    assert!(src.contains("var c00: f32 = 0.0;"), "{tag}");
+                    assert!(src.contains("fn halve_f16"), "{tag}");
+                    assert!(
+                        !src.contains("unpack2x16float(pack2x16float(vec2<f32>("),
+                        "{tag}"
+                    );
+                }
+                if tile64 {
+                    assert!(
+                        src.contains(
+                            "const BM: u32 = 64u;\nconst BN: u32 = 64u;\nconst BK: u32 = 16u;"
+                        ),
+                        "{tag}"
+                    );
+                    assert!(
+                        src.contains("const TM: u32 = 4u;\nconst TN: u32 = 4u;"),
+                        "{tag}"
+                    );
+                    assert!(
+                        src.contains("const AQ: u32 = 16u;\nconst BQ: u32 = 16u;"),
+                        "{tag}"
+                    );
+                    assert!(!src.contains("A4[c0 + CSTEP]"), "{tag}");
+                    assert!(!src.contains("B4[c0 + CSTEP]"), "{tag}");
+                } else {
+                    assert!(
+                        src.contains("const BM: u32 = 128u;\nconst BN: u32 = 128u;"),
+                        "{tag}"
+                    );
+                    assert!(
+                        src.contains("const TM: u32 = 8u;\nconst TN: u32 = 8u;"),
+                        "{tag}"
+                    );
+                    assert!(src.contains("A4[c0 + CSTEP]"), "{tag}");
+                    assert!(src.contains("B4[c0 + CSTEP]"), "{tag}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_gemm_legacy_builders_are_bitwise_128_f32() {
+        assert_eq!(
+            prefill_gemm(false, false),
+            prefill_gemm_cfg(false, false, false, false, false, false, false, false)
+        );
+        assert_eq!(
+            prefill_gemm(true, true),
+            prefill_gemm_cfg(true, true, false, false, false, false, false, false)
+        );
+        assert_eq!(
+            prefill_gemm_w8(true),
+            prefill_gemm_cfg(false, true, false, false, false, true, false, false)
+        );
+        assert_eq!(
+            prefill_gemm_causal(),
+            prefill_gemm_cfg(false, false, false, true, false, false, false, false)
+        );
+        assert_eq!(
+            prefill_gemm_causal_av(),
+            prefill_gemm_cfg(true, false, false, false, true, false, false, false)
+        );
+        assert_eq!(
+            prefill_gemm_bias(true, false),
+            prefill_gemm_cfg(true, false, true, false, false, false, false, false)
+        );
+    }
+
+    #[test]
+    fn vulkan_validates_all_prefill_gemm_variants() {
+        let gpu = match pollster::block_on(crate::gpu::Gpu::new_with(
+            crate::gpu::DeviceSelector::parse("vulkan").unwrap(),
+        )) {
+            Ok(gpu) => gpu,
+            Err(e) => {
+                eprintln!("skip Vulkan GEMM validation test: {e}");
+                return;
+            }
+        };
+        let variants = [
+            ("plain", false, false, false, false, false, false),
+            ("beta", false, true, false, false, false, false),
+            ("transb", true, false, false, false, false, false),
+            ("causal", false, false, false, true, false, false),
+            ("causal_av", true, false, false, false, true, false),
+            ("bias", false, false, true, false, false, false),
+            ("beta_bias", false, true, true, false, false, false),
+            ("w8", false, false, false, false, false, true),
+            ("w8_beta", false, true, false, false, false, true),
+        ];
+        let mut f16_variants = vec![false];
+        if gpu.has_f16() {
+            f16_variants.push(true);
+        }
+        for (name, transb, beta, bias, causal, causal_k, w8) in variants {
+            for tile64 in [false, true] {
+                for use_f16 in &f16_variants {
+                    let src = prefill_gemm_cfg(
+                        transb, beta, bias, causal, causal_k, w8, tile64, *use_f16,
+                    );
+                    let label = format!(
+                        "stage3_{name}_{}_{}",
+                        if tile64 { "64" } else { "128" },
+                        if *use_f16 { "f16" } else { "f32" }
+                    );
+                    gpu.pipeline(&label, &src, "gemm", None)
+                        .unwrap_or_else(|e| panic!("{label} failed: {e}"));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod stage3_gemm_numeric_tests {
+    use super::*;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct Gd {
+        m: u32,
+        n: u32,
+        k: u32,
+        ldc: u32,
+        bsa: u32,
+        bsb: u32,
+        bsc: u32,
+        beta: u32,
+        row0: u32,
+        lda: u32,
+        q_off: u32,
+        gqa_group: u32,
+    }
+
+    struct Lcg(u32);
+    impl Lcg {
+        fn f(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((self.0 >> 8) as f32 / 16_777_216.0) * 2.0 - 1.0
+        }
+        fn i8(&mut self) -> i8 {
+            self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((self.0 >> 16) as i32 % 255 - 127) as i8
+        }
+    }
+
+    fn vulkan() -> Option<crate::gpu::Gpu> {
+        match pollster::block_on(crate::gpu::Gpu::new_with(
+            crate::gpu::DeviceSelector::parse("vulkan").unwrap(),
+        )) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                eprintln!("skip numeric GEMM test: {e}");
+                None
+            }
+        }
+    }
+
+    /// One dispatch of a generated GEMM against a CPU reference.
+    ///
+    /// `w8` reads `W` as int8 bytes with `scales`, `transb` as `[k][n]`, and
+    /// `heads` stacks that many independent `A`/`C` slices; `gqa` is the
+    /// shader's `gqa_group` (2 makes every quality head read KV head 0).
+    #[allow(clippy::too_many_arguments)]
+    fn check(
+        gpu: &crate::gpu::Gpu,
+        src: &str,
+        tile64: bool,
+        m: usize,
+        n: usize,
+        k: usize,
+        transb: bool,
+        beta: bool,
+        bias: bool,
+        w8: bool,
+        heads: usize,
+        gqa: usize,
+        label: &str,
+    ) {
+        let mut rng = Lcg(0x5151_2323);
+        let a: Vec<half::f16> = (0..heads * m * k)
+            .map(|_| half::f16::from_f32(rng.f() * 0.5))
+            .collect();
+        let scales: Vec<f32> = (0..n)
+            .map(|_| 0.004 + 0.026 * ((rng.f() + 1.0) * 0.5))
+            .collect();
+        // The `w8` arm's weights are int8 bytes with a per-row scale; the f16
+        // arms are plain f16.  Keeping `q` is what lets the reference read the
+        // exact operand the kernel dequantizes.
+        let q: Vec<i8> = if w8 {
+            (0..n * k).map(|_| rng.i8()).collect()
+        } else {
+            Vec::new()
+        };
+        let wf: Vec<half::f16> = if w8 {
+            q.iter()
+                .enumerate()
+                .map(|(i, &b)| half::f16::from_f32(b as f32 * scales[i / k]))
+                .collect()
+        } else {
+            (0..n * k)
+                .map(|_| half::f16::from_f32(rng.f() * 0.5))
+                .collect()
+        };
+        let bias_v: Vec<half::f16> = (0..n).map(|_| half::f16::from_f32(rng.f() * 0.1)).collect();
+        let c_init: Vec<half::f16> = (0..heads * m * n)
+            .map(|_| half::f16::from_f32(rng.f() * 0.25))
+            .collect();
+
+        // Operand layout: row-major `[n][k]`, or `[k][n]` for `transb`.
+        let mut wbuf: Vec<u8> = Vec::new();
+        if w8 {
+            wbuf = q.iter().map(|&b| b as u8).collect();
+        } else if transb {
+            for c in 0..k {
+                for r in 0..n {
+                    wbuf.extend_from_slice(&wf[r * k + c].to_le_bytes());
+                }
+            }
+        } else {
+            wbuf = crate::weights::words_bytes(&wf);
+        }
+        let a_buf = gpu.storage("n.a", (a.len() * 2) as u64);
+        let w_buf = gpu.storage("n.w", wbuf.len() as u64);
+        let c_buf = gpu.storage("n.c", (c_init.len() * 2) as u64);
+        let s_buf = gpu.storage("n.s", (n * 4) as u64);
+        let b_buf = gpu.storage("n.b", (n * 2) as u64);
+        gpu.upload(&a_buf, &crate::weights::words_bytes(&a));
+        gpu.upload(&w_buf, &wbuf);
+        gpu.upload(&c_buf, &crate::weights::words_bytes(&c_init));
+        gpu.upload(&b_buf, &crate::weights::words_bytes(&bias_v));
+        let mut sb = Vec::with_capacity(n * 4);
+        for s in &scales {
+            sb.extend_from_slice(&s.to_le_bytes());
+        }
+        gpu.upload(&s_buf, &sb);
+
+        let gd = Gd {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            ldc: n as u32,
+            bsa: (m * k / 2) as u32,
+            bsb: (n * k / 2) as u32,
+            bsc: (m * n) as u32,
+            beta: u32::from(beta),
+            row0: 0,
+            lda: k as u32,
+            q_off: 0,
+            gqa_group: gqa as u32,
+        };
+        let u_gd = gpu.uniform("n.gd", 256);
+        gpu.upload(&u_gd, bytemuck::bytes_of(&gd));
+        let pipe = gpu
+            .pipeline(label, src, "gemm", None)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: a_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: w_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: c_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &u_gd,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(64),
+                }),
+            },
+        ];
+        if bias {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 4,
+                resource: b_buf.as_entire_binding(),
+            });
+        } else if w8 {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 4,
+                resource: s_buf.as_entire_binding(),
+            });
+        }
+        let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("n.bg"),
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &entries,
+        });
+        let tile = if tile64 { 64 } else { 128 };
+        let mut enc = gpu.device.create_command_encoder(&Default::default());
+        {
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            cp.set_pipeline(&pipe);
+            cp.set_bind_group(0, &bg, &[]);
+            cp.dispatch_workgroups((n / tile) as u32, (m / tile) as u32, heads as u32);
+        }
+        gpu.queue.submit([enc.finish()]);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let got = gpu
+            .readback(&c_buf, (heads * m * n * 2) as u64)
+            .expect("readback");
+        let got: Vec<f32> = got
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect();
+
+        // Reference: the reading head's slice of A against KV head
+        // `z / gqa` of W (so `gqa = 2` proves the divisor picks head 0 twice).
+        let mut worst = 0.0f32;
+        for z in 0..heads {
+            let kv = z / gqa.max(1);
+            let _ = kv;
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = 0.0f64;
+                    for c in 0..k {
+                        let av = a[(z * m + i) * k + c].to_f32();
+                        // Every `heads` slice shares KV head 0 when `gqa == 2`.
+                        let wv = if w8 {
+                            q[j * k + c] as f32 * scales[j]
+                        } else {
+                            wf[j * k + c].to_f32()
+                        };
+                        acc += (av * wv) as f64;
+                    }
+                    let mut want = acc as f32;
+                    if bias {
+                        want += bias_v[j].to_f32();
+                    }
+                    if beta {
+                        want += c_init[(z * m + i) * n + j].to_f32();
+                    }
+                    let want = half::f16::from_f32(want).to_f32();
+                    let d = (got[(z * m + i) * n + j] - want).abs();
+                    if d > worst {
+                        worst = d;
+                    }
+                }
+            }
+        }
+        assert!(
+            worst <= 0.05,
+            "{label}: max |GPU - CPU| = {worst:.4} (m={m} n={n} k={k} transb={transb} beta={beta} bias={bias} w8={w8} heads={heads})"
+        );
+    }
+
+    #[test]
+    fn prefill_gemm_matches_cpu_on_both_tiles() {
+        let Some(gpu) = vulkan() else { return };
+        let mut f16s = vec![false];
+        if gpu.has_f16() {
+            f16s.push(true);
+        }
+        for &use_f16 in &f16s {
+            for &tile64 in &[false, true] {
+                let tile = if tile64 { 64 } else { 128 };
+                for (transb, beta, bias) in [
+                    (false, false, false),
+                    (true, false, false),
+                    (false, true, false),
+                    (false, false, true),
+                    (false, true, true),
+                ] {
+                    let src =
+                        prefill_gemm_cfg(transb, beta, bias, false, false, false, tile64, use_f16);
+                    let label = format!("num_{tile}_{transb}_{beta}_{bias}_{use_f16}");
+                    check(
+                        &gpu, &src, tile64, tile, tile, 32, transb, beta, bias, false, 1, 1, &label,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_gemm_w8_matches_cpu_on_both_tiles() {
+        let Some(gpu) = vulkan() else { return };
+        let mut f16s = vec![false];
+        if gpu.has_f16() {
+            f16s.push(true);
+        }
+        for &use_f16 in &f16s {
+            for &tile64 in &[false, true] {
+                let tile = if tile64 { 64 } else { 128 };
+                for beta in [false, true] {
+                    let src =
+                        prefill_gemm_cfg(false, beta, false, false, false, true, tile64, use_f16);
+                    let label = format!("numw8_{tile}_{beta}_{use_f16}");
+                    check(
+                        &gpu, &src, tile64, tile, tile, 32, false, beta, false, true, 1, 1, &label,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Two quality heads over one KV head: both batch slices must read the
+    /// *same* operand, which is exactly what `gqa_group` makes `wid.z` do.
+    #[test]
+    fn prefill_gemm_gqa_group_reads_one_kv_head() {
+        let Some(gpu) = vulkan() else { return };
+        for &tile64 in &[false, true] {
+            let tile = if tile64 { 64 } else { 128 };
+            let src = prefill_gemm_cfg(false, false, false, false, false, false, tile64, false);
+            let label = format!("numgqa_{tile}");
+            check(
+                &gpu, &src, tile64, tile, tile, 32, false, false, false, false, 2, 2, &label,
+            );
+        }
+    }
+}

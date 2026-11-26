@@ -71,6 +71,9 @@ struct GDims {
     row0: u32,
     lda: u32,
     q_off: u32,
+    /// The encoder has no GQA: one KV head per query head, so the operand base
+    /// is `wid.z * bsb` for every batch index (the GEMM divides by `max(. , 1)`).
+    gqa_group: u32,
 }
 
 #[repr(C)]
@@ -166,7 +169,11 @@ struct PeCfg {
     d: u32,
     tpc: u32,
     s_pad: u32,
-    _a: u32,
+    rows: u32,
+    dst_row: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
 }
 
 #[repr(C)]
@@ -201,8 +208,16 @@ impl GpuLinear {
     ) -> Result<Self> {
         let n_pad = align(n, GEMM_BM);
         let bias_host = bias_host.unwrap_or_else(|| vec![f16::ZERO; n]);
-        anyhow::ensure!(bias_host.len() == n, "{label}: bias {} != n {n}", bias_host.len());
-        anyhow::ensure!(w.rows == n_pad && w.cols == k, "{label}: weight {:?}", (w.rows, w.cols));
+        anyhow::ensure!(
+            bias_host.len() == n,
+            "{label}: bias {} != n {n}",
+            bias_host.len()
+        );
+        anyhow::ensure!(
+            w.rows == n_pad && w.cols == k,
+            "{label}: weight {:?}",
+            (w.rows, w.cols)
+        );
         Ok(Self {
             w: upload_words(up, &format!("{label}.w"), &w)?,
             bias: upload_bias(up, &format!("{label}.b"), n, n_pad, &bias_host)?,
@@ -235,7 +250,9 @@ impl GpuLinear {
         label: &str,
     ) -> Result<Self> {
         let name = format!("{prefix}.weight");
-        let t = weights.get(&name).ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
+        let t = weights
+            .get(&name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
         anyhow::ensure!(t.shape.len() >= 2, "{name}: shape {:?} not 2D+", t.shape);
         let n = t.shape[0];
         let k: usize = t.shape[1..].iter().product();
@@ -247,7 +264,10 @@ impl GpuLinear {
         let (w, shape) = t.as_f16()?;
         anyhow::ensure!(shape[0] == n && w.len() == n * k);
         let (bias, bshape) = weights::get_f16(weights, &format!("{prefix}.bias"))?;
-        anyhow::ensure!(bshape.len() == 1 && bshape[0] == n, "{prefix}.bias {bshape:?} != [{n}]");
+        anyhow::ensure!(
+            bshape.len() == 1 && bshape[0] == n,
+            "{prefix}.bias {bshape:?} != [{n}]"
+        );
         let packed = pad_k(&PackedWeight::from_f16(&w, n, k))?;
         let packed = pad_rows(&packed, align(n, GEMM_BM))?;
         Self::finish(up, label, packed, Some(bias), n, pad_k_tile(k))
@@ -263,7 +283,10 @@ impl GpuLinear {
         let mut mats = Vec::with_capacity(parts.len());
         let mut bias: Vec<f16> = Vec::new();
         for p in parts {
-            mats.push(weights::get_matrix(weights, &format!("{prefix}.{p}.weight"))?);
+            mats.push(weights::get_matrix(
+                weights,
+                &format!("{prefix}.{p}.weight"),
+            )?);
             let (b, _) = weights::get_f16(weights, &format!("{prefix}.{p}.bias"))?;
             bias.extend_from_slice(&b);
         }
@@ -521,9 +544,10 @@ pub struct GpuAudioEncoder {
     col: [wgpu::Buffer; 3],
     raw: [wgpu::Buffer; 3],
     act: [wgpu::Buffer; 3],
-    /// Clip-sized tensors (`packed`, `mel_in`, the transformer's
-    /// activations) are allocated per `encode`: at `MAX_TOKENS` rows the big
-    /// ones are hundreds of MB each, and a clip rarely needs a third of that.
+    /// Clip-sized tensors (`packed`, `mel_in`, the transformer's activations):
+    /// at `MAX_TOKENS` rows the big ones are hundreds of MB each, so they grow
+    /// with the clip instead of being allocated per `encode`.
+    scratch: EncScratch,
 
     u_gd: wgpu::Buffer,
     u_im: [wgpu::Buffer; 3],
@@ -568,6 +592,149 @@ struct LayerCtx<'a> {
     kt: &'a wgpu::Buffer,
     vp: &'a wgpu::Buffer,
     attn_out: &'a wgpu::Buffer,
+}
+
+/// Grow-only buffers for one encoder pass.  The conv stem and the transformer
+/// share them, and consecutive clips reuse every allocation that still fits, so
+/// an equal-or-shorter clip costs no `wgpu::Buffer` creation at all.
+///
+/// Only ever grows: a batched pass may size the buffers for its whole token
+/// block, and the per-utterance conv stages that run before it must not shrink
+/// (or reallocate) `h_buf` while the batch already holds a handle to it.
+struct EncScratch {
+    cap_mel_bytes: u64,
+    mel_buf: wgpu::Buffer,
+    cap_s_pad: usize,
+    packed: wgpu::Buffer,
+    h_raw: wgpu::Buffer,
+    h_buf: wgpu::Buffer,
+    normed: wgpu::Buffer,
+    norm2: wgpu::Buffer,
+    qkv: wgpu::Buffer,
+    q_buf: wgpu::Buffer,
+    k_buf: wgpu::Buffer,
+    v_buf: wgpu::Buffer,
+    attn_flat: wgpu::Buffer,
+    gu: wgpu::Buffer,
+    gact: wgpu::Buffer,
+    out_emb: wgpu::Buffer,
+    cap_z_blocks: usize,
+    qp: wgpu::Buffer,
+    kt: wgpu::Buffer,
+    vp: wgpu::Buffer,
+    scores: wgpu::Buffer,
+    attn: wgpu::Buffer,
+    attn_out: wgpu::Buffer,
+}
+
+impl EncScratch {
+    fn new(gpu: &Gpu) -> Self {
+        let storage = |label: &str| gpu.storage(label, 16);
+        Self {
+            cap_mel_bytes: 0,
+            mel_buf: storage("enc.mel"),
+            cap_s_pad: 0,
+            packed: storage("enc.packed"),
+            h_raw: storage("enc.h_raw"),
+            h_buf: storage("enc.h"),
+            normed: storage("enc.normed"),
+            norm2: storage("enc.norm2"),
+            qkv: storage("enc.qkv"),
+            q_buf: storage("enc.q"),
+            k_buf: storage("enc.k"),
+            v_buf: storage("enc.v"),
+            attn_flat: storage("enc.attn_flat"),
+            gu: storage("enc.gu"),
+            gact: storage("enc.gact"),
+            out_emb: storage("enc.out"),
+            cap_z_blocks: 0,
+            qp: storage("enc.qp"),
+            kt: storage("enc.kt"),
+            vp: storage("enc.vp"),
+            scores: storage("enc.scores"),
+            attn: storage("enc.attn"),
+            attn_out: storage("enc.attn_out"),
+        }
+    }
+
+    /// Grow whatever the next pass needs; every buffer that still fits is kept.
+    #[allow(clippy::too_many_arguments)]
+    fn ensure(
+        &mut self,
+        gpu: &Gpu,
+        mel_bytes: u64,
+        s_pad: usize,
+        z_blocks: usize,
+        words: &impl Fn(usize) -> u64,
+        (cf, dm, qkv_cols, acols, gu_pad, inter_pad, out_dim, wpad, hd, hd_pad): (
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+        ),
+    ) {
+        if mel_bytes > self.cap_mel_bytes {
+            self.mel_buf = gpu.storage("enc.mel", mel_bytes);
+            self.cap_mel_bytes = mel_bytes;
+        }
+        if s_pad > self.cap_s_pad {
+            let token: [(&str, &mut wgpu::Buffer, u64); 13] = [
+                ("enc.packed", &mut self.packed, words(s_pad * cf)),
+                ("enc.h_raw", &mut self.h_raw, words(s_pad * dm)),
+                ("enc.h", &mut self.h_buf, words(s_pad * dm)),
+                ("enc.normed", &mut self.normed, words(s_pad * dm)),
+                ("enc.norm2", &mut self.norm2, words(s_pad * dm)),
+                ("enc.qkv", &mut self.qkv, words(s_pad * qkv_cols)),
+                ("enc.q", &mut self.q_buf, words(s_pad * acols)),
+                ("enc.k", &mut self.k_buf, words(s_pad * acols)),
+                ("enc.v", &mut self.v_buf, words(s_pad * acols)),
+                ("enc.attn_flat", &mut self.attn_flat, words(s_pad * acols)),
+                ("enc.gu", &mut self.gu, words(s_pad * gu_pad)),
+                ("enc.gact", &mut self.gact, words(s_pad * inter_pad)),
+                ("enc.out", &mut self.out_emb, words(s_pad * out_dim)),
+            ];
+            for (label, buf, need) in token {
+                *buf = gpu.storage(label, need);
+            }
+            self.cap_s_pad = s_pad;
+        }
+        if z_blocks > self.cap_z_blocks {
+            let win: [(&str, &mut wgpu::Buffer, u64); 6] = [
+                ("enc.qp", &mut self.qp, (z_blocks * wpad * hd * 2) as u64),
+                ("enc.kt", &mut self.kt, (z_blocks * hd * wpad * 2) as u64),
+                (
+                    "enc.vp",
+                    &mut self.vp,
+                    (z_blocks * wpad * hd_pad * 2) as u64,
+                ),
+                (
+                    "enc.scores",
+                    &mut self.scores,
+                    (z_blocks * wpad * wpad * 2) as u64,
+                ),
+                (
+                    "enc.attn",
+                    &mut self.attn,
+                    (z_blocks * wpad * wpad * 2) as u64,
+                ),
+                (
+                    "enc.attn_out",
+                    &mut self.attn_out,
+                    (z_blocks * wpad * hd_pad * 2) as u64,
+                ),
+            ];
+            for (label, buf, need) in win {
+                *buf = gpu.storage(label, need);
+            }
+            self.cap_z_blocks = z_blocks;
+        }
+    }
 }
 
 /// Every buffer one transformer pass reads or writes, sized by *its* `s_pad`.
@@ -617,7 +784,12 @@ impl GpuAudioEncoder {
         let mut up = gpu.uploader();
 
         let c1 = GpuLinear::load_conv(&mut up, weights, &format!("{prefix}.conv2d1"), "enc.c1")?;
-        anyhow::ensure!(c1.k == pad_k_tile(TAPS), "conv2d1 k {} != {}", c1.k, pad_k_tile(TAPS));
+        anyhow::ensure!(
+            c1.k == pad_k_tile(TAPS),
+            "conv2d1 k {} != {}",
+            c1.k,
+            pad_k_tile(TAPS)
+        );
         let c2 = GpuLinear::load_conv(&mut up, weights, &format!("{prefix}.conv2d2"), "enc.c2")?;
         let c3 = GpuLinear::load_conv(&mut up, weights, &format!("{prefix}.conv2d3"), "enc.c3")?;
         anyhow::ensure!(c2.k == c1.n * TAPS, "conv2d2 k={} != {}*9", c2.k, c1.n);
@@ -630,8 +802,20 @@ impl GpuAudioEncoder {
             let l = |s: &str| format!("enc.l{i}.{s}");
             let fc1 = GpuLinear::load(&mut up, weights, &format!("{p}.fc1"), &l("fc1"))?;
             layers.push(GpuLayer {
-                sln: GpuLayerNorm::load(&mut up, weights, &format!("{p}.self_attn_layer_norm"), &l("sln"), eps)?,
-                fln: GpuLayerNorm::load(&mut up, weights, &format!("{p}.final_layer_norm"), &l("fln"), eps)?,
+                sln: GpuLayerNorm::load(
+                    &mut up,
+                    weights,
+                    &format!("{p}.self_attn_layer_norm"),
+                    &l("sln"),
+                    eps,
+                )?,
+                fln: GpuLayerNorm::load(
+                    &mut up,
+                    weights,
+                    &format!("{p}.final_layer_norm"),
+                    &l("fln"),
+                    eps,
+                )?,
                 qkv: GpuLinear::load_fused(
                     &mut up,
                     weights,
@@ -639,12 +823,23 @@ impl GpuAudioEncoder {
                     &["q_proj", "k_proj", "v_proj"],
                     &l("qkv"),
                 )?,
-                o: GpuLinear::load(&mut up, weights, &format!("{p}.self_attn.out_proj"), &l("o"))?,
+                o: GpuLinear::load(
+                    &mut up,
+                    weights,
+                    &format!("{p}.self_attn.out_proj"),
+                    &l("o"),
+                )?,
                 fc1,
                 fc2: GpuLinear::load(&mut up, weights, &format!("{p}.fc2"), &l("fc2"))?,
             });
         }
-        let ln_post = GpuLayerNorm::load(&mut up, weights, &format!("{prefix}.ln_post"), "enc.lnp", eps)?;
+        let ln_post = GpuLayerNorm::load(
+            &mut up,
+            weights,
+            &format!("{prefix}.ln_post"),
+            "enc.lnp",
+            eps,
+        )?;
         let proj1 = GpuLinear::load(&mut up, weights, &format!("{prefix}.proj1"), "enc.p1")?;
         let proj2 = GpuLinear::load(&mut up, weights, &format!("{prefix}.proj2"), "enc.p2")?;
 
@@ -664,30 +859,69 @@ impl GpuAudioEncoder {
             h3,
             c3.n * h3
         );
-        anyhow::ensure!(conv_out.n == dm, "conv_out n={} != d_model {dm}", conv_out.n);
+        anyhow::ensure!(
+            conv_out.n == dm,
+            "conv_out n={} != d_model {dm}",
+            conv_out.n
+        );
 
         let planes = [h1 * t1, h2 * t2, h3 * t3];
         let plane_pads = planes.map(|p| align(p, 32));
         let n_alls = plane_pads.map(|p| align(CONV_TILE * p, GEMM_BN));
         for (i, (pl, pp)) in planes.iter().zip(&plane_pads).enumerate() {
             anyhow::ensure!(pl % 2 == 0, "conv{} plane {pl} is odd", i + 1);
-            anyhow::ensure!(pp % 32 == 0, "conv{} plane_pad {pp} not a 32-multiple", i + 1);
+            anyhow::ensure!(
+                pp % 32 == 0,
+                "conv{} plane_pad {pp} not a 32-multiple",
+                i + 1
+            );
         }
-        anyhow::ensure!(t3 == planes[2] / h3, "conv3 plane {} is not h3·t3", planes[2]);
+        anyhow::ensure!(
+            t3 == planes[2] / h3,
+            "conv3 plane {} is not h3·t3",
+            planes[2]
+        );
 
         let mel_chunk = mel_elems(n_mels, w0);
         let conv = [
             ConvLevel::build(
-                &mut up, weights, &format!("{prefix}.conv2d1"), "enc.c1",
-                n_mels, cs, w0, 1, mel_chunk, 0, n_alls[0],
+                &mut up,
+                weights,
+                &format!("{prefix}.conv2d1"),
+                "enc.c1",
+                n_mels,
+                cs,
+                w0,
+                1,
+                mel_chunk,
+                0,
+                n_alls[0],
             )?,
             ConvLevel::build(
-                &mut up, weights, &format!("{prefix}.conv2d2"), "enc.c2",
-                h1, t1, t1, c1.n, plane_pads[0], n_alls[0], n_alls[1],
+                &mut up,
+                weights,
+                &format!("{prefix}.conv2d2"),
+                "enc.c2",
+                h1,
+                t1,
+                t1,
+                c1.n,
+                plane_pads[0],
+                n_alls[0],
+                n_alls[1],
             )?,
             ConvLevel::build(
-                &mut up, weights, &format!("{prefix}.conv2d3"), "enc.c3",
-                h2, t2, t2, c2.n, plane_pads[1], n_alls[1], n_alls[2],
+                &mut up,
+                weights,
+                &format!("{prefix}.conv2d3"),
+                "enc.c3",
+                h2,
+                t2,
+                t2,
+                c2.n,
+                plane_pads[1],
+                n_alls[1],
+                n_alls[2],
             )?,
         ];
         for i in 1..3 {
@@ -707,10 +941,26 @@ impl GpuAudioEncoder {
         }
 
         for (i, l) in layers.iter().enumerate() {
-            anyhow::ensure!(l.qkv.k == dm && l.qkv.n == 3 * dm, "layer {i} qkv {:?}", (l.qkv.n, l.qkv.k));
-            anyhow::ensure!(l.o.k == nh * hd && l.o.n == dm, "layer {i} out_proj {:?}", (l.o.n, l.o.k));
-            anyhow::ensure!(l.fc1.k == dm && l.fc1.n == inter, "layer {i} fc1 {:?}", (l.fc1.n, l.fc1.k));
-            anyhow::ensure!(l.fc2.k == inter && l.fc2.n == dm, "layer {i} fc2 {:?}", (l.fc2.n, l.fc2.k));
+            anyhow::ensure!(
+                l.qkv.k == dm && l.qkv.n == 3 * dm,
+                "layer {i} qkv {:?}",
+                (l.qkv.n, l.qkv.k)
+            );
+            anyhow::ensure!(
+                l.o.k == nh * hd && l.o.n == dm,
+                "layer {i} out_proj {:?}",
+                (l.o.n, l.o.k)
+            );
+            anyhow::ensure!(
+                l.fc1.k == dm && l.fc1.n == inter,
+                "layer {i} fc1 {:?}",
+                (l.fc1.n, l.fc1.k)
+            );
+            anyhow::ensure!(
+                l.fc2.k == inter && l.fc2.n == dm,
+                "layer {i} fc2 {:?}",
+                (l.fc2.n, l.fc2.k)
+            );
         }
         anyhow::ensure!(
             proj1.k == dm && proj2.k == proj1.n && proj2.n == out_dim,
@@ -740,7 +990,11 @@ impl GpuAudioEncoder {
             "gpu audio encoder: conv {h1}x{t1} -> {h2}x{t2} -> {h3}x{t3} \
              [{} pos/chunk, {CONV_TILE}-chunk rounds], d_model {dm} / {nh}h x {hd}, \
              ffn {inter}, out {out_dim}, chunk {cs} -> {tpc} tok, wlen {wlen}",
-            planes.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("/"),
+            planes
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join("/"),
         );
         if enc_trace() {
             // Geometry, because the conv stem's cost is not the transformer's and
@@ -748,7 +1002,14 @@ impl GpuAudioEncoder {
             for (i, c) in conv.iter().enumerate() {
                 eprintln!(
                     "enc geom c{}: plane {}x{} c_in {} c_out {} k {} k_pad {} m_pad {}",
-                    i + 1, c.h_in, c.w_in, c.c_in, c.c_out, c.k, c.k_pad, c.m_pad
+                    i + 1,
+                    c.h_in,
+                    c.w_in,
+                    c.c_in,
+                    c.c_out,
+                    c.k,
+                    c.k_pad,
+                    c.m_pad
                 );
             }
             eprintln!(
@@ -757,6 +1018,12 @@ impl GpuAudioEncoder {
             );
         }
 
+        // The tower stays on the 128x128 tile: every GEMM's `n` is padded to
+        // `GEMM_BN` and the conv/window geometry is built on those strides.
+        let use_f16 = gpu.use_f16_kernel();
+        let gemm = |transb: bool, beta: bool, bias: bool| {
+            shaders::prefill_gemm_cfg(transb, beta, bias, false, false, false, false, use_f16)
+        };
         let gemm_layout = gemm_layout(gpu, "enc_gemm", 3, &[2]);
         let gemm_bias_layout = gemm_bias_layout(gpu, "enc_gemm_bias", &[2]);
         // One batch, built on every core: the backend compiles each PSO on the
@@ -765,18 +1032,63 @@ impl GpuAudioEncoder {
         let jobs = [
             PipeJob::new("enc_im2col", shaders::audio_im2col(), "im2col", None),
             PipeJob::new("enc_gelu", shaders::audio_bias_gelu(), "bias_gelu", None),
-            PipeJob::new("enc_gemm", shaders::prefill_gemm(false, false), "gemm", Some(&gemm_layout)),
-            PipeJob::new("enc_gemm_t", shaders::prefill_gemm(true, false), "gemm", Some(&gemm_layout)),
+            PipeJob::new(
+                "enc_gemm",
+                gemm(false, false, false),
+                "gemm",
+                Some(&gemm_layout),
+            ),
+            PipeJob::new(
+                "enc_gemm_t",
+                gemm(true, false, false),
+                "gemm",
+                Some(&gemm_layout),
+            ),
             PipeJob::new("enc_extract", shaders::audio_extract_qkv(), "extract", None),
             PipeJob::new("enc_win_pack", shaders::audio_win_pack(), "win_pack", None),
-            PipeJob::new("enc_gemm_beta", shaders::prefill_gemm(false, true), "gemm", Some(&gemm_layout)),
-            PipeJob::new("enc_gemm_bias", shaders::prefill_gemm_bias(false, false), "gemm", Some(&gemm_bias_layout)),
-            PipeJob::new("enc_gemm_beta_bias", shaders::prefill_gemm_bias(false, true), "gemm", Some(&gemm_bias_layout)),
-            PipeJob::new("enc_softmax", shaders::audio_window_softmax(), "softmax", None),
-            PipeJob::new("enc_layernorm", shaders::audio_layernorm(), "layernorm", None),
-            PipeJob::new("enc_permute", shaders::audio_permute_pe(), "permute_pe", None),
+            PipeJob::new(
+                "enc_gemm_beta",
+                gemm(false, true, false),
+                "gemm",
+                Some(&gemm_layout),
+            ),
+            PipeJob::new(
+                "enc_gemm_bias",
+                gemm(false, false, true),
+                "gemm",
+                Some(&gemm_bias_layout),
+            ),
+            PipeJob::new(
+                "enc_gemm_beta_bias",
+                gemm(false, true, true),
+                "gemm",
+                Some(&gemm_bias_layout),
+            ),
+            PipeJob::new(
+                "enc_softmax",
+                shaders::audio_window_softmax(),
+                "softmax",
+                None,
+            ),
+            PipeJob::new(
+                "enc_layernorm",
+                shaders::audio_layernorm(),
+                "layernorm",
+                None,
+            ),
+            PipeJob::new(
+                "enc_permute",
+                shaders::audio_permute_pe(),
+                "permute_pe",
+                None,
+            ),
             PipeJob::new("enc_add_pe", shaders::audio_add_pe(), "add_pe", None),
-            PipeJob::new("enc_attn_flat", shaders::audio_attn_flat(), "attn_flat", None),
+            PipeJob::new(
+                "enc_attn_flat",
+                shaders::audio_attn_flat(),
+                "attn_flat",
+                None,
+            ),
         ];
         let mut built = gpu.pipelines(&jobs)?;
         let mut take = |name: &str| -> Result<wgpu::ComputePipeline> {
@@ -865,6 +1177,7 @@ impl GpuAudioEncoder {
             col,
             raw,
             act,
+            scratch: EncScratch::new(gpu),
             u_gd,
             u_im,
             u_sc,
@@ -910,7 +1223,9 @@ impl GpuAudioEncoder {
         n_mels: usize,
         n_frames: usize,
     ) -> Result<Vec<f16>> {
-        Ok(self.encode_capture(gpu, mel, n_mels, n_frames, false)?.embeds)
+        Ok(self
+            .encode_capture(gpu, mel, n_mels, n_frames, false)?
+            .embeds)
     }
 
     /// As [`Self::encode`], optionally snapshotting each conv round's tensors on
@@ -984,6 +1299,7 @@ impl GpuAudioEncoder {
         let (cs, tpc) = (self.cs, self.tpc);
         let dm = self.d_model;
         let out_dim = self.out_dim;
+        let cf = self.conv_out.k;
         let wlen = tpc * (self.window_infer / cs);
         anyhow::ensure!(wlen > 0, "encoder window is empty");
 
@@ -992,7 +1308,11 @@ impl GpuAudioEncoder {
         let lens: Vec<usize> = utts
             .iter()
             .map(|&(_, n_mels, n_frames)| {
-                anyhow::ensure!(n_mels == self.n_mels, "mel bins {n_mels} != {}", self.n_mels);
+                anyhow::ensure!(
+                    n_mels == self.n_mels,
+                    "mel bins {n_mels} != {}",
+                    self.n_mels
+                );
                 let nfull = n_frames / cs;
                 let tail = n_frames % cs;
                 let n_chunks = nfull + usize::from(tail > 0);
@@ -1010,10 +1330,17 @@ impl GpuAudioEncoder {
             acc += n.div_ceil(wlen) * wlen;
         }
         let s_total = acc;
-        anyhow::ensure!(s_total <= MAX_TOKENS, "batch needs {s_total} tokens > {MAX_TOKENS}");
+        anyhow::ensure!(
+            s_total <= MAX_TOKENS,
+            "batch needs {s_total} tokens > {MAX_TOKENS}"
+        );
         let s_pad = align(s_total, GEMM_BM);
         let n_win = s_total / wlen;
-        let geom = Geom { s: s_total, wlen, n_win };
+        let geom = Geom {
+            s: s_total,
+            wlen,
+            n_win,
+        };
 
         let (nh, hd, inter, acols) = (self.nh, self.hd, self.inter, self.attn_cols);
         let qkv_cols = align(3 * dm, GEMM_BM);
@@ -1024,34 +1351,59 @@ impl GpuAudioEncoder {
         let z_blocks = nh * n_win;
         let words = |n: usize| (n / 2 * 4) as u64;
 
-        // Zero-filled by construction, so the rows between a block's last token
-        // and its window boundary are the zeros a lone run's tail would be.
-        let h = gpu.storage("encb.h", words(s_pad * dm));
-        let normed = gpu.storage("encb.normed", words(s_pad * dm));
-        let norm2 = gpu.storage("encb.norm2", words(s_pad * dm));
-        let qkv = gpu.storage("encb.qkv", words(s_pad * qkv_cols));
-        let q_buf = gpu.storage("encb.q", words(s_pad * acols));
-        let k_buf = gpu.storage("encb.k", words(s_pad * acols));
-        let v_buf = gpu.storage("encb.v", words(s_pad * acols));
-        let attn_flat = gpu.storage("encb.attn_flat", words(s_pad * acols));
-        let qp = gpu.storage("encb.qp", (z_blocks * wpad * hd * 2) as u64);
-        let kt = gpu.storage("encb.kt", (z_blocks * hd * wpad * 2) as u64);
-        let vp = gpu.storage("encb.vp", (z_blocks * wpad * hd_pad * 2) as u64);
-        let scores = gpu.storage("encb.scores", (z_blocks * wpad * wpad * 2) as u64);
-        let attn = gpu.storage("encb.attn", (z_blocks * wpad * wpad * 2) as u64);
-        let attn_out = gpu.storage("encb.attn_out", (z_blocks * wpad * hd_pad * 2) as u64);
-        let gu = gpu.storage("encb.gu", words(s_pad * gu_pad));
-        let gact = gpu.storage("encb.gact", words(s_pad * inter_pad));
-        let out_emb = gpu.storage("encb.out", words(s_pad * out_dim));
+        // Size the pool for the whole block first: the per-utterance conv stages
+        // below must find every buffer already large enough, because `h_dst`
+        // points into `h_buf` for the whole loop.
+        self.scratch.ensure(
+            gpu,
+            0,
+            s_pad,
+            z_blocks,
+            &words,
+            (
+                cf, dm, qkv_cols, acols, gu_pad, inter_pad, out_dim, wpad, hd, hd_pad,
+            ),
+        );
+        // The rows between an utterance's last token and its window boundary are
+        // the zeros a lone run's tail would be -- and a pooled `h_buf` still holds
+        // the previous clip's activations there, so clear the block explicitly.
+        {
+            let mut zenc = gpu.device.create_command_encoder(&Default::default());
+            zenc.clear_buffer(&self.scratch.h_buf, 0, Some(words(s_pad * dm)));
+            gpu.queue.submit([zenc.finish()]);
+        }
+        // A cheap handle clone: `encode_conv_into` takes `&mut self`, so the loop
+        // cannot hold a borrow of `self.scratch` across it.
+        let h_dst = self.scratch.h_buf.clone();
+        let normed = self.scratch.normed.clone();
+        let norm2 = self.scratch.norm2.clone();
+        let qkv = self.scratch.qkv.clone();
+        let q_buf = self.scratch.q_buf.clone();
+        let k_buf = self.scratch.k_buf.clone();
+        let v_buf = self.scratch.v_buf.clone();
+        let attn_flat = self.scratch.attn_flat.clone();
+        let qp = self.scratch.qp.clone();
+        let kt = self.scratch.kt.clone();
+        let vp = self.scratch.vp.clone();
+        let scores = self.scratch.scores.clone();
+        let attn = self.scratch.attn.clone();
+        let attn_out = self.scratch.attn_out.clone();
+        let gu = self.scratch.gu.clone();
+        let gact = self.scratch.gact.clone();
+        let out_emb = self.scratch.out_emb.clone();
 
         // The conv stem, one utterance at a time, straight into its block.
         for (i, &(mel, n_mels, n_frames)) in utts.iter().enumerate() {
-            let got = self.encode_conv_into(gpu, &h, row0[i], mel, n_mels, n_frames)?;
-            anyhow::ensure!(got == lens[i], "conv produced {got} tokens, planned {}", lens[i]);
+            let got = self.encode_conv_into(gpu, &h_dst, row0[i], mel, n_mels, n_frames)?;
+            anyhow::ensure!(
+                got == lens[i],
+                "conv produced {got} tokens, planned {}",
+                lens[i]
+            );
         }
 
         let b = XfBufs {
-            h: &h,
+            h: &h_dst,
             normed: &normed,
             norm2: &norm2,
             qkv: &qkv,
@@ -1076,7 +1428,12 @@ impl GpuAudioEncoder {
         for (i, &n) in lens.iter().enumerate() {
             let off = (row0[i] * out_dim * 2) as u64;
             let bytes = gpu.readback_at(&out_emb, off, (n * out_dim * 2) as u64)?;
-            out.push(bytes.chunks_exact(2).map(|c| f16::from_le_bytes([c[0], c[1]])).collect());
+            out.push(
+                bytes
+                    .chunks_exact(2)
+                    .map(|c| f16::from_le_bytes([c[0], c[1]]))
+                    .collect(),
+            );
         }
         Ok(out)
     }
@@ -1091,7 +1448,11 @@ impl GpuAudioEncoder {
         conv_into: Option<(&wgpu::Buffer, usize)>,
     ) -> Result<Capture> {
         let t_all = std::time::Instant::now();
-        anyhow::ensure!(n_mels == self.n_mels, "mel bins {n_mels} != {}", self.n_mels);
+        anyhow::ensure!(
+            n_mels == self.n_mels,
+            "mel bins {n_mels} != {}",
+            self.n_mels
+        );
         let (cs, tpc) = (self.cs, self.tpc);
         let nfull = n_frames / cs;
         let tail = n_frames % cs;
@@ -1100,7 +1461,10 @@ impl GpuAudioEncoder {
         let n_total: usize = (0..n_chunks)
             .map(|i| if i < nfull { tpc } else { feo(tail) })
             .sum();
-        anyhow::ensure!(n_total <= MAX_TOKENS, "mel needs {n_total} tokens > {MAX_TOKENS}");
+        anyhow::ensure!(
+            n_total <= MAX_TOKENS,
+            "mel needs {n_total} tokens > {MAX_TOKENS}"
+        );
 
         let t_pack = std::time::Instant::now();
         let w0 = self.w0;
@@ -1116,7 +1480,8 @@ impl GpuAudioEncoder {
         let mel_f16: Vec<f16> = chunked.iter().map(|v| f16::from_f32(*v)).collect();
         let t_pack = t_pack.elapsed();
 
-        let (dm, nh, hd, inter, acols) = (self.d_model, self.nh, self.hd, self.inter, self.attn_cols);
+        let (dm, nh, hd, inter, acols) =
+            (self.d_model, self.nh, self.hd, self.inter, self.attn_cols);
         let out_dim = self.out_dim;
         let cf = self.conv_out.k;
         let s_pad = align(n_total, GEMM_BM);
@@ -1125,33 +1490,49 @@ impl GpuAudioEncoder {
         let gu_pad = align(2 * inter, GEMM_BM);
         let wlen = tpc * (self.window_infer / cs);
         let n_win = n_total.div_ceil(wlen);
-        let geom = Geom { s: n_total, wlen, n_win };
+        let geom = Geom {
+            s: n_total,
+            wlen,
+            n_win,
+        };
         let words = |n: usize| (n / 2 * 4) as u64;
 
-        let mel_buf = gpu.storage("enc.mel", (mel_f16.len() * 2) as u64);
-        gpu.upload(&mel_buf, &weights::words_bytes(&mel_f16));
-        let packed = gpu.storage("enc.packed", words(s_pad * cf));
-        let h_raw = gpu.storage("enc.h_raw", words(s_pad * dm));
-        let h_buf = gpu.storage("enc.h", words(s_pad * dm));
-        let normed = gpu.storage("enc.normed", words(s_pad * dm));
-        let norm2 = gpu.storage("enc.norm2", words(s_pad * dm));
-        let qkv = gpu.storage("enc.qkv", words(s_pad * qkv_cols));
-        let q_buf = gpu.storage("enc.q", words(s_pad * acols));
-        let k_buf = gpu.storage("enc.k", words(s_pad * acols));
-        let v_buf = gpu.storage("enc.v", words(s_pad * acols));
-        let attn_flat = gpu.storage("enc.attn_flat", words(s_pad * acols));
         let wpad = align(wlen, GEMM_BM);
         let hd_pad = align(hd, GEMM_BN);
         let z_blocks = nh * n_win;
-        let qp = gpu.storage("enc.qp", (z_blocks * wpad * hd * 2) as u64);
-        let kt = gpu.storage("enc.kt", (z_blocks * hd * wpad * 2) as u64);
-        let vp = gpu.storage("enc.vp", (z_blocks * wpad * hd_pad * 2) as u64);
-        let scores = gpu.storage("enc.scores", (z_blocks * wpad * wpad * 2) as u64);
-        let attn = gpu.storage("enc.attn", (z_blocks * wpad * wpad * 2) as u64);
-        let attn_out = gpu.storage("enc.attn_out", (z_blocks * wpad * hd_pad * 2) as u64);
-        let gu = gpu.storage("enc.gu", words(s_pad * gu_pad));
-        let gact = gpu.storage("enc.gact", words(s_pad * inter_pad));
-        let out_emb = gpu.storage("enc.out", words(s_pad * out_dim));
+        // Grow-only: an equal-or-shorter clip reuses every buffer, and a batched
+        // pass that already sized them for its whole block keeps them.
+        self.scratch.ensure(
+            gpu,
+            (mel_f16.len() * 2) as u64,
+            s_pad,
+            z_blocks,
+            &words,
+            (
+                cf, dm, qkv_cols, acols, gu_pad, inter_pad, out_dim, wpad, hd, hd_pad,
+            ),
+        );
+        let mel_buf = self.scratch.mel_buf.clone();
+        let packed = self.scratch.packed.clone();
+        let h_raw = self.scratch.h_raw.clone();
+        let h_buf = self.scratch.h_buf.clone();
+        let normed = self.scratch.normed.clone();
+        let norm2 = self.scratch.norm2.clone();
+        let qkv = self.scratch.qkv.clone();
+        let q_buf = self.scratch.q_buf.clone();
+        let k_buf = self.scratch.k_buf.clone();
+        let v_buf = self.scratch.v_buf.clone();
+        let attn_flat = self.scratch.attn_flat.clone();
+        let qp = self.scratch.qp.clone();
+        let kt = self.scratch.kt.clone();
+        let vp = self.scratch.vp.clone();
+        let scores = self.scratch.scores.clone();
+        let attn = self.scratch.attn.clone();
+        let attn_out = self.scratch.attn_out.clone();
+        let gu = self.scratch.gu.clone();
+        let gact = self.scratch.gact.clone();
+        let out_emb = self.scratch.out_emb.clone();
+        gpu.upload(&mel_buf, &weights::words_bytes(&mel_f16));
 
         for (i, (rows, lin, by_channel)) in [
             (s_pad, &self.layers[0].fc1, false),
@@ -1228,10 +1609,29 @@ impl GpuAudioEncoder {
         self.gd_slot.set(0);
         let mut enc = gpu.device.create_command_encoder(&Default::default());
         self.gemm(
-            gpu, &mut enc, &packed, &self.conv_out.w, &h_raw,
-            n_total, self.conv_out.n_pad, cf, self.conv_out.n_pad, None, "convout",
+            gpu,
+            &mut enc,
+            &packed,
+            &self.conv_out.w,
+            &h_raw,
+            n_total,
+            self.conv_out.n_pad,
+            cf,
+            self.conv_out.n_pad,
+            None,
+            "convout",
         );
-        self.add_pe(gpu, &mut enc, &h_raw, &h_buf, s_pad);
+        self.add_pe(
+            gpu,
+            &mut enc,
+            &h_raw,
+            conv_into.map_or(&h_buf, |(dst, _)| dst),
+            conv_into.map_or(0, |(_, row)| row),
+            s_pad,
+            // Only an utterance's real tokens go into a shared block: the block
+            // is a whole number of windows, not of GEMM tiles.
+            if conv_into.is_some() { n_total } else { s_pad },
+        );
         gpu.queue.submit([enc.finish()]);
         if capture {
             gpu.device
@@ -1239,22 +1639,17 @@ impl GpuAudioEncoder {
                 .map_err(|e| anyhow::anyhow!("audio encoder: device lost after conv_out: {e:?}"))?;
             out.h = read_f16_buf(gpu, &h_buf, s_pad * dm)?;
         }
-        // The conv half on its own: hand the token rows to the shared buffer and
-        // stop.  The copy is ordered after `add_pe` by the queue, so no wait is
-        // needed; the rows past `n_total` stay zero (wgpu zero-fills buffers),
-        // which is what the shared pass expects between two utterances.
-        if let Some((dst, row)) = conv_into {
+        // The conv half on its own: `add_pe` above already wrote this
+        // utterance's token rows straight into its block of the shared buffer
+        // (the pooled `h_buf` *is* the batch's `h`, so a copy would be a
+        // same-buffer copy), and the block's rows past `s_pad` were zeroed by
+        // the caller.  Nothing is left to move.
+        if conv_into.is_some() {
             out.conv_tokens = n_total;
-            let mut enc = gpu.device.create_command_encoder(&Default::default());
-            enc.copy_buffer_to_buffer(
-                &h_buf,
-                0,
-                dst,
-                (row * dm * 2) as u64,
-                (n_total * dm * 2) as u64,
+            ENC_MS.store(
+                (t_all.elapsed().as_secs_f64() * 1000.0) as u64,
+                Ordering::Relaxed,
             );
-            gpu.queue.submit([enc.finish()]);
-            ENC_MS.store((t_all.elapsed().as_secs_f64() * 1000.0) as u64, Ordering::Relaxed);
             PACK_MS.store((t_pack.as_secs_f64() * 1000.0) as u64, Ordering::Relaxed);
             return Ok(out);
         }
@@ -1284,7 +1679,10 @@ impl GpuAudioEncoder {
 
         let read_f16 = |buf: &wgpu::Buffer, n: usize| -> Result<Vec<f16>> {
             let bytes = gpu.readback(buf, (n * 2) as u64)?;
-            Ok(bytes.chunks_exact(2).map(|c| f16::from_le_bytes([c[0], c[1]])).collect())
+            Ok(bytes
+                .chunks_exact(2)
+                .map(|c| f16::from_le_bytes([c[0], c[1]]))
+                .collect())
         };
         if capture {
             out.packed = read_f16(&packed, s_pad * cf)?;
@@ -1294,7 +1692,10 @@ impl GpuAudioEncoder {
         out.embeds = embeds;
         out.conv_tokens = n_total;
 
-        ENC_MS.store((t_all.elapsed().as_secs_f64() * 1000.0) as u64, Ordering::Relaxed);
+        ENC_MS.store(
+            (t_all.elapsed().as_secs_f64() * 1000.0) as u64,
+            Ordering::Relaxed,
+        );
         PACK_MS.store((t_pack.as_secs_f64() * 1000.0) as u64, Ordering::Relaxed);
         Ok(out)
     }
@@ -1315,7 +1716,11 @@ impl GpuAudioEncoder {
         capture: bool,
         out: &mut Capture,
     ) -> Result<()> {
-        let Geom { s: n_total, wlen, n_win } = geom;
+        let Geom {
+            s: n_total,
+            wlen,
+            n_win,
+        } = geom;
         let z_blocks = self.nh * n_win;
         let (dm, nh, hd, inter, acols) =
             (self.d_model, self.nh, self.hd, self.inter, self.attn_cols);
@@ -1328,22 +1733,22 @@ impl GpuAudioEncoder {
             geom,
             s_pad,
             acols,
-            h: &b.h,
-            normed: &b.normed,
-            norm2: &b.norm2,
-            qkv: &b.qkv,
-            q: &b.q,
-            k: &b.k,
-            v: &b.v,
-            scores: &b.scores,
-            attn: &b.attn,
-            attn_flat: &b.attn_flat,
-            gu: &b.gu,
-            act: &b.act,
-            qp: &b.qp,
-            kt: &b.kt,
-            vp: &b.vp,
-            attn_out: &b.attn_out,
+            h: b.h,
+            normed: b.normed,
+            norm2: b.norm2,
+            qkv: b.qkv,
+            q: b.q,
+            k: b.k,
+            v: b.v,
+            scores: b.scores,
+            attn: b.attn,
+            attn_flat: b.attn_flat,
+            gu: b.gu,
+            act: b.act,
+            qp: b.qp,
+            kt: b.kt,
+            vp: b.vp,
+            attn_out: b.attn_out,
         };
         // These four uniforms are geometry-only: every layer writes the *same*
         // bytes, so writing them once instead of 14 times is 56 fewer
@@ -1415,9 +1820,11 @@ impl GpuAudioEncoder {
                 gpu.queue.submit([enc.finish()]);
                 gpu.device
                     .poll(wgpu::PollType::wait_indefinitely())
-                    .map_err(|e| anyhow::anyhow!("audio encoder: device lost after layer {li}: {e:?}"))?;
+                    .map_err(|e| {
+                        anyhow::anyhow!("audio encoder: device lost after layer {li}: {e:?}")
+                    })?;
                 enc = gpu.device.create_command_encoder(&Default::default());
-                out.layers.push(read_f16_buf(gpu, &b.h, s_pad * dm)?);
+                out.layers.push(read_f16_buf(gpu, b.h, s_pad * dm)?);
                 if li == 0 {
                     let mid = self.mid_h.borrow_mut().take().unwrap_or_default();
                     let (wpad, hd_pad) = (align(wlen, GEMM_BM), align(hd, GEMM_BN));
@@ -1455,26 +1862,66 @@ impl GpuAudioEncoder {
                 gpu.queue.submit([enc.finish()]);
                 gpu.device
                     .poll(wgpu::PollType::wait_indefinitely())
-                    .map_err(|e| anyhow::anyhow!("audio encoder: device lost after layer {li}: {e:?}"))?;
-                HOST_WAIT_US.fetch_add(
-                    t_wait.elapsed().as_micros() as u64,
-                    Ordering::Relaxed,
-                );
+                    .map_err(|e| {
+                        anyhow::anyhow!("audio encoder: device lost after layer {li}: {e:?}")
+                    })?;
+                HOST_WAIT_US.fetch_add(t_wait.elapsed().as_micros() as u64, Ordering::Relaxed);
                 enc = gpu.device.create_command_encoder(&Default::default());
             }
         }
-        self.layernorm(gpu, &mut enc, ctx.h, &self.ln_post, ctx.normed, geom.s, "lnpost");
-        self.gemm(gpu, &mut enc, ctx.normed, &self.proj1.w, &b.gu, geom.s, self.proj1.n_pad, self.proj1.k, self.proj1.n_pad, None, "proj1");
-        self.bias_gelu_tensor(
-            gpu, &mut enc, &b.gu, &self.proj1.bias, &b.act, &self.u_sc[4],
-            s_pad * self.proj1.n_pad, self.proj1.n_pad / 2, false, "pgelu",
+        self.layernorm(
+            gpu,
+            &mut enc,
+            ctx.h,
+            &self.ln_post,
+            ctx.normed,
+            geom.s,
+            "lnpost",
         );
         self.gemm(
-            gpu, &mut enc, &b.act, &self.proj2.w, &b.out_emb, geom.s,
-            self.proj2.n_pad, self.proj2.k, self.proj2.n_pad, Some(&self.proj2.bias), "proj2",
+            gpu,
+            &mut enc,
+            ctx.normed,
+            &self.proj1.w,
+            b.gu,
+            geom.s,
+            self.proj1.n_pad,
+            self.proj1.k,
+            self.proj1.n_pad,
+            None,
+            "proj1",
+        );
+        self.bias_gelu_tensor(
+            gpu,
+            &mut enc,
+            b.gu,
+            &self.proj1.bias,
+            b.act,
+            &self.u_sc[4],
+            s_pad * self.proj1.n_pad,
+            self.proj1.n_pad / 2,
+            false,
+            "pgelu",
+        );
+        self.gemm(
+            gpu,
+            &mut enc,
+            b.act,
+            &self.proj2.w,
+            b.out_emb,
+            geom.s,
+            self.proj2.n_pad,
+            self.proj2.k,
+            self.proj2.n_pad,
+            Some(&self.proj2.bias),
+            "proj2",
         );
 
-        anyhow::ensure!(self.gd_slot.get() <= MAX_GEMMS, "{} GEMM slots > {MAX_GEMMS}", self.gd_slot.get());
+        anyhow::ensure!(
+            self.gd_slot.get() <= MAX_GEMMS,
+            "{} GEMM slots > {MAX_GEMMS}",
+            self.gd_slot.get()
+        );
         gpu.queue.submit([enc.finish()]);
         gpu.device
             .poll(wgpu::PollType::wait_indefinitely())
@@ -1496,19 +1943,31 @@ impl GpuAudioEncoder {
         gpu.device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| anyhow::anyhow!("audio encoder: device lost during capture: {e:?}"))?;
-        let mut r = ConvRound { chunk0: ch0, n_chunks: n, col: Vec::new(), raw: Vec::new(), act: Vec::new() };
+        let mut r = ConvRound {
+            chunk0: ch0,
+            n_chunks: n,
+            col: Vec::new(),
+            raw: Vec::new(),
+            act: Vec::new(),
+        };
         for level in 0..3 {
             let l = &self.conv[level];
-            r.col.push(read_f16_buf(gpu, &self.col[level], l.k_pad * l.n_all)?);
-            r.raw.push(read_f16_buf(gpu, &self.raw[level], l.m_pad * l.n_all)?);
-            r.act.push(read_f16_buf(gpu, &self.act[level], l.m_pad * l.n_all)?);
+            r.col
+                .push(read_f16_buf(gpu, &self.col[level], l.k_pad * l.n_all)?);
+            r.raw
+                .push(read_f16_buf(gpu, &self.raw[level], l.m_pad * l.n_all)?);
+            r.act
+                .push(read_f16_buf(gpu, &self.act[level], l.m_pad * l.n_all)?);
         }
         if out.rounds.is_empty() {
             out.mel_head = read_f16_buf(gpu, mel_buf, 64)?;
             for level in 0..3 {
                 let bytes = gpu.readback(&self.conv[level].taps, (TAPS * 8 * 4) as u64)?;
                 out.taps.push(
-                    bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+                    bytes
+                        .chunks_exact(4)
+                        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
                 );
             }
         }
@@ -1533,22 +1992,49 @@ impl GpuAudioEncoder {
         self.layernorm(gpu, enc, ctx.h, &l.sln, ctx.normed, s, "ln");
         if !enc_skip("qkv") {
             self.gemm(
-                gpu, enc, ctx.normed, &l.qkv.w, ctx.qkv, s, l.qkv.n_pad, l.qkv.k, l.qkv.n_pad,
-                Some(&l.qkv.bias), "qkv",
+                gpu,
+                enc,
+                ctx.normed,
+                &l.qkv.w,
+                ctx.qkv,
+                s,
+                l.qkv.n_pad,
+                l.qkv.k,
+                l.qkv.n_pad,
+                Some(&l.qkv.bias),
+                "qkv",
             );
         }
         {
-            let bg = mkbg(gpu, wgpu::BindGroupDescriptor {
-                label: Some("enc.extract"),
-                layout: &self.p.extract.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: ctx.qkv.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: ctx.q.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: ctx.k.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: ctx.v.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: self.u_ex.as_entire_binding() },
-                ],
-            });
+            let bg = mkbg(
+                gpu,
+                wgpu::BindGroupDescriptor {
+                    label: Some("enc.extract"),
+                    layout: &self.p.extract.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: ctx.qkv.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: ctx.q.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: ctx.k.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: ctx.v.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: self.u_ex.as_entire_binding(),
+                        },
+                    ],
+                },
+            );
             let _pg = PassGuard::new();
             let mut cp = enc.begin_compute_pass(&Default::default());
             cp.set_pipeline(&self.p.extract);
@@ -1571,44 +2057,102 @@ impl GpuAudioEncoder {
         let (wpad, hd_pad) = (align(wlen, GEMM_BM), align(hd, GEMM_BN));
         let n_blocks = nh * geom.n_win;
         {
-            let bg = mkbg(gpu, wgpu::BindGroupDescriptor {
-                label: Some("enc.win_pack"),
-                layout: &self.p.win_pack.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: ctx.q.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: ctx.k.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: ctx.v.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: ctx.qp.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: ctx.kt.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: ctx.vp.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 6, resource: self.u_wp.as_entire_binding() },
-                ],
-            });
+            let bg = mkbg(
+                gpu,
+                wgpu::BindGroupDescriptor {
+                    label: Some("enc.win_pack"),
+                    layout: &self.p.win_pack.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: ctx.q.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: ctx.k.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: ctx.v.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: ctx.qp.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: ctx.kt.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: ctx.vp.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: self.u_wp.as_entire_binding(),
+                        },
+                    ],
+                },
+            );
             let _pg = PassGuard::new();
             let mut cp = enc.begin_compute_pass(&Default::default());
             cp.set_pipeline(&self.p.win_pack);
             cp.set_bind_group(0, &bg, &[]);
-            dup_dispatch(&mut cp, "winpack", (wpad / 32) as u32, (hd_pad / 2 / 16) as u32, n_blocks as u32);
+            dup_dispatch(
+                &mut cp,
+                "winpack",
+                (wpad / 32) as u32,
+                (hd_pad / 2 / 16) as u32,
+                n_blocks as u32,
+            );
         }
         {
             let bsa = wpad * hd / 2;
             let bsb = hd * wpad / 2;
             let bsc = wpad * wpad;
             self.gemm_batched(
-                gpu, enc, &self.p.gemm_t, ctx.qp, ctx.kt, ctx.scores,
-                wpad, wpad, hd, wpad, bsa, bsb, bsc, n_blocks, 1, 1, 0, "scores",
+                gpu,
+                enc,
+                &self.p.gemm_t,
+                ctx.qp,
+                ctx.kt,
+                ctx.scores,
+                wpad,
+                wpad,
+                hd,
+                wpad,
+                bsa,
+                bsb,
+                bsc,
+                n_blocks,
+                1,
+                1,
+                0,
+                "scores",
             );
         }
         {
-            let bg = mkbg(gpu, wgpu::BindGroupDescriptor {
-                label: Some("enc.sm"),
-                layout: &self.p.softmax.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: ctx.scores.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: ctx.attn.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: self.u_sm.as_entire_binding() },
-                ],
-            });
+            let bg = mkbg(
+                gpu,
+                wgpu::BindGroupDescriptor {
+                    label: Some("enc.sm"),
+                    layout: &self.p.softmax.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: ctx.scores.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: ctx.attn.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.u_sm.as_entire_binding(),
+                        },
+                    ],
+                },
+            );
             let _pg = PassGuard::new();
             let mut cp = enc.begin_compute_pass(&Default::default());
             cp.set_pipeline(&self.p.softmax);
@@ -1620,28 +2164,74 @@ impl GpuAudioEncoder {
             let bsb = wpad * hd_pad / 2;
             let bsc = wpad * hd_pad;
             self.gemm_batched(
-                gpu, enc, &self.p.gemm_t, ctx.attn, ctx.vp, ctx.attn_out,
-                wpad, hd_pad, wpad, hd_pad, bsa, bsb, bsc, n_blocks, 1, 1, 0, "attnout",
+                gpu,
+                enc,
+                &self.p.gemm_t,
+                ctx.attn,
+                ctx.vp,
+                ctx.attn_out,
+                wpad,
+                hd_pad,
+                wpad,
+                hd_pad,
+                bsa,
+                bsb,
+                bsc,
+                n_blocks,
+                1,
+                1,
+                0,
+                "attnout",
             );
         }
         {
-            let bg = mkbg(gpu, wgpu::BindGroupDescriptor {
-                label: Some("enc.attn_flat"),
-                layout: &self.p.attn_flat.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: ctx.attn_out.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: ctx.attn_flat.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: self.u_cp.as_entire_binding() },
-                ],
-            });
+            let bg = mkbg(
+                gpu,
+                wgpu::BindGroupDescriptor {
+                    label: Some("enc.attn_flat"),
+                    layout: &self.p.attn_flat.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: ctx.attn_out.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: ctx.attn_flat.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.u_cp.as_entire_binding(),
+                        },
+                    ],
+                },
+            );
             let _pg = PassGuard::new();
             let mut cp = enc.begin_compute_pass(&Default::default());
             cp.set_pipeline(&self.p.attn_flat);
             cp.set_bind_group(0, &bg, &[]);
-            dup_dispatch(&mut cp, "attnflat", (ctx.s_pad * ctx.acols / 2).div_ceil(256) as u32, 1, 1);
+            dup_dispatch(
+                &mut cp,
+                "attnflat",
+                (ctx.s_pad * ctx.acols / 2).div_ceil(256) as u32,
+                1,
+                1,
+            );
         }
         if !enc_skip("o") {
-            self.gemm_beta(gpu, enc, ctx.attn_flat, &l.o.w, ctx.h, s, l.o.n_pad, l.o.k, dm, Some(&l.o.bias), "o");
+            self.gemm_beta(
+                gpu,
+                enc,
+                ctx.attn_flat,
+                &l.o.w,
+                ctx.h,
+                s,
+                l.o.n_pad,
+                l.o.k,
+                dm,
+                Some(&l.o.bias),
+                "o",
+            );
         }
         if self.mid_capture.get() && li == 0 {
             let cb = std::mem::replace(enc, gpu.device.create_command_encoder(&Default::default()));
@@ -1653,14 +2243,46 @@ impl GpuAudioEncoder {
         }
         self.layernorm(gpu, enc, ctx.h, &l.fln, ctx.norm2, s, "ln");
         if !enc_skip("fc1") {
-            self.gemm(gpu, enc, ctx.norm2, &l.fc1.w, ctx.gu, s, l.fc1.n_pad, l.fc1.k, l.fc1.n_pad, None, "fc1");
+            self.gemm(
+                gpu,
+                enc,
+                ctx.norm2,
+                &l.fc1.w,
+                ctx.gu,
+                s,
+                l.fc1.n_pad,
+                l.fc1.k,
+                l.fc1.n_pad,
+                None,
+                "fc1",
+            );
         }
         self.bias_gelu_tensor(
-            gpu, enc, ctx.gu, &l.fc1.bias, ctx.act, &self.u_sc[3],
-            ctx.s_pad * l.fc1.n_pad, l.fc1.n_pad / 2, false, "gelu",
+            gpu,
+            enc,
+            ctx.gu,
+            &l.fc1.bias,
+            ctx.act,
+            &self.u_sc[3],
+            ctx.s_pad * l.fc1.n_pad,
+            l.fc1.n_pad / 2,
+            false,
+            "gelu",
         );
         if !enc_skip("fc2") {
-            self.gemm_beta(gpu, enc, ctx.act, &l.fc2.w, ctx.h, s, l.fc2.n_pad, l.fc2.k, dm, Some(&l.fc2.bias), "fc2");
+            self.gemm_beta(
+                gpu,
+                enc,
+                ctx.act,
+                &l.fc2.w,
+                ctx.h,
+                s,
+                l.fc2.n_pad,
+                l.fc2.k,
+                dm,
+                Some(&l.fc2.bias),
+                "fc2",
+            );
         }
         Ok(())
     }
@@ -1680,10 +2302,30 @@ impl GpuAudioEncoder {
         bias: Option<&wgpu::Buffer>,
         name: &str,
     ) {
-        let pipe = if bias.is_some() { &self.p.gemm_beta_bias } else { &self.p.gemm_beta };
+        let pipe = if bias.is_some() {
+            &self.p.gemm_beta_bias
+        } else {
+            &self.p.gemm_beta
+        };
         self.dispatch_gemm(
-            gpu, enc, pipe, a, w, c, m, n, k, ldc, 0, 0, 0, 1,
-            (n / GEMM_BN) as u32, (align(m, GEMM_BM) / GEMM_BM) as u32, bias, name,
+            gpu,
+            enc,
+            pipe,
+            a,
+            w,
+            c,
+            m,
+            n,
+            k,
+            ldc,
+            0,
+            0,
+            0,
+            1,
+            (n / GEMM_BN) as u32,
+            (align(m, GEMM_BM) / GEMM_BM) as u32,
+            bias,
+            name,
         );
     }
 
@@ -1696,44 +2338,78 @@ impl GpuAudioEncoder {
         c: &wgpu::Buffer,
         bias: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
-        mkbg(gpu, wgpu::BindGroupDescriptor {
-            label: Some("enc.gemm_bias"),
-            layout: &pipe.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: a.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: w.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: c.as_entire_binding() },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &self.u_gd,
-                        offset: 0,
-                        size: std::num::NonZeroU64::new(64),
-                    }),
-                },
-                wgpu::BindGroupEntry { binding: 4, resource: bias.as_entire_binding() },
-            ],
-        })
+        mkbg(
+            gpu,
+            wgpu::BindGroupDescriptor {
+                label: Some("enc.gemm_bias"),
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: a.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: w.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: c.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &self.u_gd,
+                            offset: 0,
+                            size: std::num::NonZeroU64::new(64),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: bias.as_entire_binding(),
+                    },
+                ],
+            },
+        )
     }
 
-    fn gemm_bind(&self, gpu: &Gpu, pipe: &wgpu::ComputePipeline, a: &wgpu::Buffer, w: &wgpu::Buffer, c: &wgpu::Buffer) -> wgpu::BindGroup {
-        mkbg(gpu, wgpu::BindGroupDescriptor {
-            label: Some("enc.gemm"),
-            layout: &pipe.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: a.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: w.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: c.as_entire_binding() },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &self.u_gd,
-                        offset: 0,
-                        size: std::num::NonZeroU64::new(64),
-                    }),
-                },
-            ],
-        })
+    fn gemm_bind(
+        &self,
+        gpu: &Gpu,
+        pipe: &wgpu::ComputePipeline,
+        a: &wgpu::Buffer,
+        w: &wgpu::Buffer,
+        c: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        mkbg(
+            gpu,
+            wgpu::BindGroupDescriptor {
+                label: Some("enc.gemm"),
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: a.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: w.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: c.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &self.u_gd,
+                            offset: 0,
+                            size: std::num::NonZeroU64::new(64),
+                        }),
+                    },
+                ],
+            },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1751,19 +2427,54 @@ impl GpuAudioEncoder {
         bias: Option<&wgpu::Buffer>,
         name: &str,
     ) {
-        let pipe = if bias.is_some() { &self.p.gemm_bias } else { &self.p.gemm };
+        let pipe = if bias.is_some() {
+            &self.p.gemm_bias
+        } else {
+            &self.p.gemm
+        };
         self.dispatch_gemm(
-            gpu, enc, pipe, a, w, c, m, n, k, ldc, 0, 0, 0, 1,
-            (n / GEMM_BN) as u32, (align(m, GEMM_BM) / GEMM_BM) as u32, bias, name,
+            gpu,
+            enc,
+            pipe,
+            a,
+            w,
+            c,
+            m,
+            n,
+            k,
+            ldc,
+            0,
+            0,
+            0,
+            1,
+            (n / GEMM_BN) as u32,
+            (align(m, GEMM_BM) / GEMM_BM) as u32,
+            bias,
+            name,
         );
     }
 
     fn gemm_conv(&self, gpu: &Gpu, enc: &mut wgpu::CommandEncoder, level: usize) {
         let l = &self.conv[level];
         self.dispatch_gemm(
-            gpu, enc, &self.p.gemm_t, &l.w.w, &self.col[level], &self.raw[level],
-            l.m_pad, l.n_all, l.k_pad, l.n_all, 0, 0, 0, 1,
-            (l.n_all / GEMM_BN) as u32, (l.m_pad / GEMM_BM) as u32, None, "cgemm",
+            gpu,
+            enc,
+            &self.p.gemm_t,
+            &l.w.w,
+            &self.col[level],
+            &self.raw[level],
+            l.m_pad,
+            l.n_all,
+            l.k_pad,
+            l.n_all,
+            0,
+            0,
+            0,
+            1,
+            (l.n_all / GEMM_BN) as u32,
+            (l.m_pad / GEMM_BM) as u32,
+            None,
+            "cgemm",
         );
     }
 
@@ -1795,16 +2506,31 @@ impl GpuAudioEncoder {
                 _a: 0,
             }),
         );
-        let bg = mkbg(gpu, wgpu::BindGroupDescriptor {
-            label: Some("enc.im2col"),
-            layout: &self.p.im2col.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: l.taps.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.col[level].as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.u_im[level].as_entire_binding() },
-            ],
-        });
+        let bg = mkbg(
+            gpu,
+            wgpu::BindGroupDescriptor {
+                label: Some("enc.im2col"),
+                layout: &self.p.im2col.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: input.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: l.taps.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.col[level].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.u_im[level].as_entire_binding(),
+                    },
+                ],
+            },
+        );
         let _pg = PassGuard::new();
         let mut cp = enc.begin_compute_pass(&Default::default());
         cp.set_pipeline(&self.p.im2col);
@@ -1859,51 +2585,108 @@ impl GpuAudioEncoder {
                 n_tokens: n_total as u32,
             }),
         );
-        let bg = mkbg(gpu, wgpu::BindGroupDescriptor {
-            label: Some("enc.permute"),
-            layout: &self.p.permute.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.act[2].as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: packed.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.u_pm.as_entire_binding() },
-            ],
-        });
+        let bg = mkbg(
+            gpu,
+            wgpu::BindGroupDescriptor {
+                label: Some("enc.permute"),
+                layout: &self.p.permute.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.act[2].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: packed.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.u_pm.as_entire_binding(),
+                    },
+                ],
+            },
+        );
         let _pg = PassGuard::new();
         let mut cp = enc.begin_compute_pass(&Default::default());
         cp.set_pipeline(&self.p.permute);
         cp.set_bind_group(0, &bg, &[]);
-        dup_dispatch(&mut cp, "permute", align(n_total, GEMM_BM) as u32, (cf / 2 / 256) as u32, 1);
+        dup_dispatch(
+            &mut cp,
+            "permute",
+            align(n_total, GEMM_BM) as u32,
+            (cf / 2 / 256) as u32,
+            1,
+        );
     }
 
+    /// `dst` row `dst_row` onward receives `src` + positional encoding, up to
+    /// `write_rows` rows: a batched pass' block can be shorter than the padded
+    /// `rows` the dispatch covers, and those tail rows belong to the next
+    /// utterance.
+    #[allow(clippy::too_many_arguments)]
     fn add_pe(
         &self,
         gpu: &Gpu,
         enc: &mut wgpu::CommandEncoder,
         src: &wgpu::Buffer,
         dst: &wgpu::Buffer,
+        dst_row: usize,
         rows: usize,
+        write_rows: usize,
     ) {
         let dm = self.d_model;
         gpu.queue.write_buffer(
             &self.u_pe,
             0,
-            bytemuck::bytes_of(&PeCfg { d: dm as u32, tpc: self.tpc as u32, s_pad: dm as u32, _a: 0 }),
+            bytemuck::bytes_of(&PeCfg {
+                d: dm as u32,
+                tpc: self.tpc as u32,
+                s_pad: dm as u32,
+                rows: write_rows as u32,
+                dst_row: dst_row as u32,
+                _p0: 0,
+                _p1: 0,
+                _p2: 0,
+            }),
         );
-        let bg = mkbg(gpu, wgpu::BindGroupDescriptor {
-            label: Some("enc.add_pe"),
-            layout: &self.p.add_pe.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: src.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.pe.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: dst.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.u_pe.as_entire_binding() },
-            ],
-        });
+        let bg = mkbg(
+            gpu,
+            wgpu::BindGroupDescriptor {
+                label: Some("enc.add_pe"),
+                layout: &self.p.add_pe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: src.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.pe.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        // Bound from offset 0 so `dst_row` never depends on
+                        // `min_storage_buffer_offset_alignment`.
+                        resource: dst.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.u_pe.as_entire_binding(),
+                    },
+                ],
+            },
+        );
         let _pg = PassGuard::new();
         let mut cp = enc.begin_compute_pass(&Default::default());
         cp.set_pipeline(&self.p.add_pe);
         cp.set_bind_group(0, &bg, &[]);
-        dup_dispatch(&mut cp, "addpe", align(rows, GEMM_BM) as u32, (dm / 2).div_ceil(256) as u32, 1);
+        dup_dispatch(
+            &mut cp,
+            "addpe",
+            align(rows, GEMM_BM) as u32,
+            (dm / 2).div_ceil(256) as u32,
+            1,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1928,7 +2711,9 @@ impl GpuAudioEncoder {
         _reserved: usize,
         name: &str,
     ) {
-        self.dispatch_gemm(gpu, enc, pipe, a, w, c, m, n, k, ldc, bsa, bsb, bsc, batch, gx, gy, None, name);
+        self.dispatch_gemm(
+            gpu, enc, pipe, a, w, c, m, n, k, ldc, bsa, bsb, bsc, batch, gx, gy, None, name,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1970,6 +2755,7 @@ impl GpuAudioEncoder {
                 row0: 0,
                 lda: k as u32,
                 q_off: 0,
+                gqa_group: 1,
             }),
         );
         let bg = match bias {
@@ -2008,16 +2794,31 @@ impl GpuAudioEncoder {
                 gx,
             }),
         );
-        let bg = mkbg(gpu, wgpu::BindGroupDescriptor {
-            label: Some("enc.gelu"),
-            layout: &self.p.gelu.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: src.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: bias.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: dst.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: sc.as_entire_binding() },
-            ],
-        });
+        let bg = mkbg(
+            gpu,
+            wgpu::BindGroupDescriptor {
+                label: Some("enc.gelu"),
+                layout: &self.p.gelu.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: src.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: bias.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: dst.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: sc.as_entire_binding(),
+                    },
+                ],
+            },
+        );
         let _pg = PassGuard::new();
         let mut cp = enc.begin_compute_pass(&Default::default());
         cp.set_pipeline(&self.p.gelu);
@@ -2046,17 +2847,35 @@ impl GpuAudioEncoder {
         u[0..4].copy_from_slice(&(self.d_model as u32).to_le_bytes());
         u[4..8].copy_from_slice(&ln.eps.to_le_bytes());
         gpu.upload(&self.u_ln, &u);
-        let bg = mkbg(gpu, wgpu::BindGroupDescriptor {
-            label: Some("enc.ln"),
-            layout: &self.p.layernorm.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: src.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: ln.w.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: ln.b.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.u_ln.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: dst.as_entire_binding() },
-            ],
-        });
+        let bg = mkbg(
+            gpu,
+            wgpu::BindGroupDescriptor {
+                label: Some("enc.ln"),
+                layout: &self.p.layernorm.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: src.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: ln.w.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: ln.b.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.u_ln.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: dst.as_entire_binding(),
+                    },
+                ],
+            },
+        );
         let _pg = PassGuard::new();
         let mut cp = enc.begin_compute_pass(&Default::default());
         cp.set_pipeline(&self.p.layernorm);
@@ -2190,15 +3009,18 @@ fn gemm_layout(gpu: &Gpu, label: &str, n_storage: u32, read_write: &[u32]) -> wg
         },
         count: None,
     });
-    let bgl = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some(&format!("{label}_bgl")),
-        entries: &entries,
-    });
-    gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(&format!("{label}_pl")),
-        bind_group_layouts: &[Some(&bgl)],
-        immediate_size: 0,
-    })
+    let bgl = gpu
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(&format!("{label}_bgl")),
+            entries: &entries,
+        });
+    gpu.device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("{label}_pl")),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        })
 }
 
 fn gemm_bias_layout(gpu: &Gpu, label: &str, read_write: &[u32]) -> wgpu::PipelineLayout {
@@ -2207,7 +3029,9 @@ fn gemm_bias_layout(gpu: &Gpu, label: &str, read_write: &[u32]) -> wgpu::Pipelin
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: !read_write.contains(&binding) },
+                ty: wgpu::BufferBindingType::Storage {
+                    read_only: !read_write.contains(&binding),
+                },
                 has_dynamic_offset: false,
                 min_binding_size: None,
             },
@@ -2224,15 +3048,18 @@ fn gemm_bias_layout(gpu: &Gpu, label: &str, read_write: &[u32]) -> wgpu::Pipelin
         },
         count: None,
     };
-    let bgl = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some(&format!("{label}_bgl")),
-        entries: &entries,
-    });
-    gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(&format!("{label}_pl")),
-        bind_group_layouts: &[Some(&bgl)],
-        immediate_size: 0,
-    })
+    let bgl = gpu
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(&format!("{label}_bgl")),
+            entries: &entries,
+        });
+    gpu.device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("{label}_pl")),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        })
 }
 
 fn read_f16_buf(gpu: &Gpu, buf: &wgpu::Buffer, n: usize) -> Result<Vec<f16>> {
@@ -2320,7 +3147,13 @@ fn conv_taps(h: usize, w_in: usize, w_stride: usize) -> (Vec<u32>, usize, usize,
     (off, h_out * w_out, h_out, w_out)
 }
 
-fn upload_bias(up: &mut BulkUpload, label: &str, n: usize, n_pad: usize, host: &[f16]) -> Result<wgpu::Buffer> {
+fn upload_bias(
+    up: &mut BulkUpload,
+    label: &str,
+    n: usize,
+    n_pad: usize,
+    host: &[f16],
+) -> Result<wgpu::Buffer> {
     let mut v = vec![f16::ZERO; n_pad.max(n)];
     v[..n].copy_from_slice(host);
     upload_f16(up, label, &v)

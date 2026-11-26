@@ -633,6 +633,14 @@ impl Gpu {
         f16_kernel_enabled(self.has_f16(), std::env::var("QASR_F16_KERNEL").ok())
     }
 
+    /// Whether short prefills should use the 64×64 GEMM tile on this device.
+    ///
+    /// A non-f16 GPU is kept on the 128×128 tile unless the override explicitly
+    /// asks for 64×64; f16-capable devices switch automatically up to 512 rows.
+    pub fn use_tile64(&self, m: usize) -> bool {
+        tile64_enabled(self.has_f16(), m, std::env::var("QASR_TILE64").ok())
+    }
+
     /// Whether the device can run the binding-array batch decode kernels.
     /// `QASR_BINDING_ARRAY=0` disables them for A/B testing.
     pub fn supports_binding_array(&self) -> bool {
@@ -858,8 +866,7 @@ impl Gpu {
         for (slot, job) in slots.into_iter().zip(jobs) {
             let pipe = slot
                 .into_inner()
-                .expect("every job is picked up by a worker")
-                .map_err(|e| e)?;
+                .expect("every job is picked up by a worker")?;
             anyhow::ensure!(
                 out.insert(job.label.to_string(), pipe).is_none(),
                 "duplicate pipeline label {:?}",
@@ -927,6 +934,20 @@ fn f16_kernel_enabled(has_f16: bool, override_value: Option<String>) -> bool {
     {
         Some("0" | "off" | "no" | "false") => false,
         _ => has_f16,
+    }
+}
+
+/// Whether short prefills use the 64×64 tile, from capability and env override.
+fn tile64_enabled(has_f16: bool, m: usize, override_value: Option<String>) -> bool {
+    match override_value
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("1" | "on" | "yes" | "true") => true,
+        Some("0" | "off" | "no" | "false") => false,
+        _ => has_f16 && m <= 512,
     }
 }
 
@@ -1205,6 +1226,24 @@ mod tests {
         assert!(!f16_kernel_enabled(true, Some(" OFF ".to_string())));
         assert!(f16_kernel_enabled(true, Some("1".to_string())));
         assert!(!f16_kernel_enabled(false, Some("1".to_string())));
+    }
+
+    #[test]
+    fn tile64_enabled_respects_override_capability_and_length() {
+        for v in ["1", "on", "YES", " true "] {
+            assert!(tile64_enabled(false, 4096, Some(v.to_string())));
+            assert!(tile64_enabled(true, 64, Some(v.to_string())));
+        }
+        for v in ["0", "off", "no", "FALSE"] {
+            assert!(!tile64_enabled(true, 64, Some(v.to_string())));
+            assert!(!tile64_enabled(false, 4096, Some(v.to_string())));
+        }
+        for v in [None, Some("auto".to_string()), Some("other".to_string())] {
+            assert!(!tile64_enabled(false, 64, v.clone()));
+            assert!(!tile64_enabled(false, 513, v.clone()));
+            assert!(tile64_enabled(true, 512, v.clone()));
+            assert!(!tile64_enabled(true, 513, v));
+        }
     }
 
     #[test]

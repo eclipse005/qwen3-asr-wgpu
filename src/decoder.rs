@@ -327,6 +327,7 @@ struct GDims {
     row0: u32,
     lda: u32,
     q_off: u32,
+    gqa_group: u32,
 }
 
 #[repr(C)]
@@ -438,6 +439,197 @@ struct EmbedCfg {
     d2: u32,
     _a: u32,
     _b: u32,
+}
+
+/// Grow-only buffers for prefill.  Uniforms and small buffers are fixed-size;
+/// every token-sized allocation grows only when a longer clip needs it.
+struct PrefillScratch {
+    u_gd: wgpu::Buffer,
+    u_sl: wgpu::Buffer,
+    cap_mp: usize,
+    h_buf: wgpu::Buffer,
+    normed: wgpu::Buffer,
+    norm2: wgpu::Buffer,
+    qkv: wgpu::Buffer,
+    q_out: wgpu::Buffer,
+    attn_flat: wgpu::Buffer,
+    gu: wgpu::Buffer,
+    activated: wgpu::Buffer,
+    cap_scores_bytes: u64,
+    scores: wgpu::Buffer,
+    cap_attn_bytes: u64,
+    attn: wgpu::Buffer,
+    slab: Option<SlabScratch>,
+}
+
+struct SlabScratch {
+    slab_part: wgpu::Buffer,
+    slab_stats: wgpu::Buffer,
+    slab_w: wgpu::Buffer,
+    cap_part_bytes: u64,
+    cap_stats_bytes: u64,
+    cap_w_bytes: u64,
+}
+
+/// Grow-only buffers for the batched prefill body.
+struct MultiPrefillScratch {
+    u_gd: wgpu::Buffer,
+    u_seg: wgpu::Buffer,
+    u_sl: wgpu::Buffer,
+    cap_mp: usize,
+    h_buf: wgpu::Buffer,
+    normed: wgpu::Buffer,
+    norm2: wgpu::Buffer,
+    qkv: wgpu::Buffer,
+    attn_flat: wgpu::Buffer,
+    gu: wgpu::Buffer,
+    activated: wgpu::Buffer,
+    cap_mp_attn: usize,
+    q_out: wgpu::Buffer,
+    cap_scores_bytes: u64,
+    scores: wgpu::Buffer,
+    cap_attn_bytes: u64,
+    attn: wgpu::Buffer,
+}
+
+impl PrefillScratch {
+    fn new(gpu: &Gpu) -> Self {
+        Self {
+            u_gd: gpu.uniform("p.gd", (256 * 256) as u64),
+            u_sl: gpu.uniform("p.sl", (2 * MAX_SLAB as u64 + 2) * 256),
+            cap_mp: 0,
+            h_buf: gpu.storage("p.h", 16),
+            normed: gpu.storage("p.normed", 16),
+            norm2: gpu.storage("p.norm2", 16),
+            qkv: gpu.storage("p.qkv", 16),
+            q_out: gpu.storage("p.q_out", 16),
+            attn_flat: gpu.storage("p.attn_flat", 16),
+            gu: gpu.storage("p.gu", 16),
+            activated: gpu.storage("p.activated", 16),
+            cap_scores_bytes: 0,
+            scores: gpu.storage("p.scores", 16),
+            cap_attn_bytes: 0,
+            attn: gpu.storage("p.attn", 16),
+            slab: None,
+        }
+    }
+
+    fn storage(gpu: &Gpu, label: &str, buf: &mut wgpu::Buffer, cap: &mut u64, need: u64) {
+        if need > *cap {
+            *buf = gpu.storage(label, need);
+            *cap = need;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure(
+        &mut self,
+        gpu: &Gpu,
+        words: &impl Fn(usize, usize) -> u64,
+        hs: usize,
+        fused: usize,
+        qh: usize,
+        hd: usize,
+        inter: usize,
+        mp: usize,
+        score_words: u64,
+        attn_words: u64,
+        slab: Option<(u64, u64, u64)>,
+    ) {
+        if mp > self.cap_mp {
+            let storages: [(&str, &mut wgpu::Buffer, u64); 8] = [
+                ("p.h", &mut self.h_buf, words(mp, hs)),
+                ("p.normed", &mut self.normed, words(mp, hs)),
+                ("p.norm2", &mut self.norm2, words(mp, hs)),
+                ("p.qkv", &mut self.qkv, words(mp, fused)),
+                ("p.q_out", &mut self.q_out, words(qh * mp, hd)),
+                ("p.attn_flat", &mut self.attn_flat, words(mp, qh * hd)),
+                ("p.gu", &mut self.gu, words(mp, 2 * inter)),
+                ("p.activated", &mut self.activated, words(mp, inter)),
+            ];
+            for (label, buf, need) in storages {
+                *buf = gpu.storage(label, need);
+            }
+            self.cap_mp = mp;
+        }
+        Self::storage(gpu, "p.scores", &mut self.scores, &mut self.cap_scores_bytes, score_words);
+        Self::storage(gpu, "p.attn", &mut self.attn, &mut self.cap_attn_bytes, attn_words);
+        if let Some((part, stats, w)) = slab {
+            let s = self.slab.get_or_insert_with(|| SlabScratch {
+                slab_part: gpu.storage("p.slab_part", 16),
+                slab_stats: gpu.storage("p.slab_stats", 16),
+                slab_w: gpu.storage("p.slab_w", 16),
+                cap_part_bytes: 0,
+                cap_stats_bytes: 0,
+                cap_w_bytes: 0,
+            });
+            Self::storage(gpu, "p.slab_part", &mut s.slab_part, &mut s.cap_part_bytes, part);
+            Self::storage(gpu, "p.slab_stats", &mut s.slab_stats, &mut s.cap_stats_bytes, stats);
+            Self::storage(gpu, "p.slab_w", &mut s.slab_w, &mut s.cap_w_bytes, w);
+        }
+    }
+}
+
+impl MultiPrefillScratch {
+    fn new(gpu: &Gpu) -> Self {
+        Self {
+            u_gd: gpu.uniform("pb.gd", (512 * 256) as u64),
+            u_seg: gpu.uniform("pb.seg", 32 * 256),
+            u_sl: gpu.uniform("pb.sl", 32 * 256),
+            cap_mp: 0,
+            h_buf: gpu.storage("pb.h", 16),
+            normed: gpu.storage("pb.normed", 16),
+            norm2: gpu.storage("pb.norm2", 16),
+            qkv: gpu.storage("pb.qkv", 16),
+            attn_flat: gpu.storage("pb.attn_flat", 16),
+            gu: gpu.storage("pb.gu", 16),
+            activated: gpu.storage("pb.activated", 16),
+            cap_mp_attn: 0,
+            q_out: gpu.storage("pb.q_out", 16),
+            cap_scores_bytes: 0,
+            scores: gpu.storage("pb.scores", 16),
+            cap_attn_bytes: 0,
+            attn: gpu.storage("pb.attn", 16),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure(
+        &mut self,
+        gpu: &Gpu,
+        words: &impl Fn(usize, usize) -> u64,
+        hs: usize,
+        fused: usize,
+        nqh: usize,
+        hd: usize,
+        inter: usize,
+        mp: usize,
+        mp_attn: usize,
+        score_words: u64,
+        attn_words: u64,
+    ) {
+        if mp > self.cap_mp {
+            let storages: [(&str, &mut wgpu::Buffer, u64); 7] = [
+                ("pb.h", &mut self.h_buf, words(mp, hs)),
+                ("pb.normed", &mut self.normed, words(mp, hs)),
+                ("pb.norm2", &mut self.norm2, words(mp, hs)),
+                ("pb.qkv", &mut self.qkv, words(mp, fused)),
+                ("pb.attn_flat", &mut self.attn_flat, words(mp, nqh * hd)),
+                ("pb.gu", &mut self.gu, words(mp, 2 * inter)),
+                ("pb.activated", &mut self.activated, words(mp, inter)),
+            ];
+            for (label, buf, need) in storages {
+                *buf = gpu.storage(label, need);
+            }
+            self.cap_mp = mp;
+        }
+        if mp_attn > self.cap_mp_attn {
+            self.q_out = gpu.storage("pb.q_out", words(nqh * mp_attn, hd));
+            self.cap_mp_attn = mp_attn;
+        }
+        PrefillScratch::storage(gpu, "pb.scores", &mut self.scores, &mut self.cap_scores_bytes, score_words);
+        PrefillScratch::storage(gpu, "pb.attn", &mut self.attn, &mut self.cap_attn_bytes, attn_words);
+    }
 }
 
 /// Buffers reused by every layer.
@@ -570,11 +762,17 @@ struct Pipes {
     gemm_av: wgpu::ComputePipeline,
     gemm_causal: wgpu::ComputePipeline,
     gemm_av_causal: wgpu::ComputePipeline,
+    gemm_64: wgpu::ComputePipeline,
+    gemm_acc_64: wgpu::ComputePipeline,
+    gemm_av_64: wgpu::ComputePipeline,
+    gemm_causal_64: wgpu::ComputePipeline,
+    gemm_av_causal_64: wgpu::ComputePipeline,
+    gemm_w8_64: wgpu::ComputePipeline,
+    gemm_w8_acc_64: wgpu::ComputePipeline,
     softmax: std::collections::HashMap<usize, wgpu::ComputePipeline>,
     /// Narrower physical workgroups computing a wider tree, keyed by
     /// `(phys, tree)`; see [`softmax_blocks`] and `softmax_causal_tree`.
     softmax_wide: std::collections::HashMap<(usize, usize), wgpu::ComputePipeline>,
-    repeat_kv: wgpu::ComputePipeline,
     slab_stats: wgpu::ComputePipeline,
     slab_weights: wgpu::ComputePipeline,
     slab_merge: wgpu::ComputePipeline,
@@ -955,6 +1153,9 @@ pub struct WgpuTextDecoder {
     /// cap: growing them would move the rows out from under the shared buffer,
     /// so [`Self::ensure_capacity`] is a no-op for a pooled slot.
     pooled: bool,
+    /// Grow-only allocations for the two prefill paths; reused by every call.
+    prefill_scratch: Option<PrefillScratch>,
+    multi_scratch: Option<MultiPrefillScratch>,
 
     embed_table: wgpu::Buffer,
     layers: Vec<Layer>,
@@ -1008,6 +1209,7 @@ impl WgpuTextDecoder {
         let w = weights::load_tensors(model_dir)?;
         crate::load_trace::note("decoder: tensors", t);
         let int8 = checkpoint_is_int8(&w, prefix)?;
+        let use_f16 = gpu.use_f16_kernel();
         let hs = cfg.hidden_size;
         let q_dim = cfg.q_dim();
         let nqh = cfg.num_attention_heads;
@@ -1045,7 +1247,6 @@ impl WgpuTextDecoder {
             true,
         );
         let sm_pl = family_layout_dyn(&gpu, "softmax", &[(0, true), (1, false)], 2, true);
-        let rk_pl = family_layout(&gpu, "repeat_kv", &[(0, true), (1, false)], 2);
 
         let rms_bs = block_for_reduction(hs) as usize;
         let subgroup = gpu.subgroup32();
@@ -1117,8 +1318,8 @@ impl WgpuTextDecoder {
                 "gemv",
                 None,
             ),
-            PipeJob::new("gemm_w8", shaders::prefill_gemm_w8(false), "gemm", Some(&gemm_w8_pl)),
-            PipeJob::new("gemm_w8_acc", shaders::prefill_gemm_w8(true), "gemm", Some(&gemm_w8_pl)),
+            PipeJob::new("gemm_w8", shaders::prefill_gemm_cfg(false, false, false, false, false, true, false, use_f16), "gemm", Some(&gemm_w8_pl)),
+            PipeJob::new("gemm_w8_acc", shaders::prefill_gemm_cfg(false, true, false, false, false, true, false, use_f16), "gemm", Some(&gemm_w8_pl)),
             PipeJob::new("rms_norm", shaders::rms_norm(hs, rms_bs), "rms_norm", None),
             PipeJob::new("qkv_extract", shaders::qkv_extract(nqh, nkvh, hd), "qkv_extract", None),
             PipeJob::new("gqa256", shaders::gqa_decode_single(nqh, nkvh, hd, 256, GQA_SINGLE_CAP), "gqa", Some(&gqa_pl)),
@@ -1139,6 +1340,13 @@ impl WgpuTextDecoder {
             PipeJob::new("gemm_av", shaders::prefill_gemm(true, false), "gemm", Some(&gemm_pl)),
             PipeJob::new("gemm_causal", shaders::prefill_gemm_causal(), "gemm", Some(&gemm_pl)),
             PipeJob::new("gemm_av_causal", shaders::prefill_gemm_causal_av(), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm_64", shaders::prefill_gemm_64(false, false, use_f16), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm_acc_64", shaders::prefill_gemm_64(false, true, use_f16), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm_av_64", shaders::prefill_gemm_64(true, false, use_f16), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm_causal_64", shaders::prefill_gemm_causal_64(use_f16), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm_av_causal_64", shaders::prefill_gemm_causal_av_64(use_f16), "gemm", Some(&gemm_pl)),
+            PipeJob::new("gemm_w8_64", shaders::prefill_gemm_w8_64(false, use_f16), "gemm", Some(&gemm_w8_pl)),
+            PipeJob::new("gemm_w8_acc_64", shaders::prefill_gemm_w8_64(true, use_f16), "gemm", Some(&gemm_w8_pl)),
             PipeJob::new("softmax32", shaders::softmax_causal_mode(32, sm_mode), "softmax", Some(&sm_pl)),
             PipeJob::new("softmax64", shaders::softmax_causal_mode(64, sm_mode), "softmax", Some(&sm_pl)),
             PipeJob::new("softmax128", shaders::softmax_causal_mode(128, sm_mode), "softmax", Some(&sm_pl)),
@@ -1153,7 +1361,6 @@ impl WgpuTextDecoder {
             PipeJob::new("softmax128x1024", shaders::softmax_causal_tree_mode(128, 1024, sm_mode), "softmax", Some(&sm_pl)),
             PipeJob::new("softmax256x512", shaders::softmax_causal_tree_mode(256, 512, sm_mode), "softmax", Some(&sm_pl)),
             PipeJob::new("softmax256x1024", shaders::softmax_causal_tree_mode(256, 1024, sm_mode), "softmax", Some(&sm_pl)),
-            PipeJob::new("repeat_kv", shaders::repeat_kv(nqh / nkvh), "repeat_kv", Some(&rk_pl)),
             PipeJob::new("slab_stats", shaders::slab_stats(SLAB_BS, SLAB_T), "slab_stats", Some(&slab_stats_pl)),
             PipeJob::new("slab_weights", shaders::slab_weights(256), "slab_weights", Some(&slab_weights_pl)),
             PipeJob::new("slab_merge", shaders::slab_merge(nqh, hd), "slab_merge", Some(&slab_merge_pl)),
@@ -1205,6 +1412,13 @@ impl WgpuTextDecoder {
             gemm_av: take("gemm_av")?,
             gemm_causal: take("gemm_causal")?,
             gemm_av_causal: take("gemm_av_causal")?,
+            gemm_64: take("gemm_64")?,
+            gemm_acc_64: take("gemm_acc_64")?,
+            gemm_av_64: take("gemm_av_64")?,
+            gemm_causal_64: take("gemm_causal_64")?,
+            gemm_av_causal_64: take("gemm_av_causal_64")?,
+            gemm_w8_64: take("gemm_w8_64")?,
+            gemm_w8_acc_64: take("gemm_w8_acc_64")?,
             softmax: std::collections::HashMap::from([
                 (32, take("softmax32")?),
                 (64, take("softmax64")?),
@@ -1226,8 +1440,7 @@ impl WgpuTextDecoder {
                 ((256, 512), take("softmax256x512")?),
                 ((256, 1024), take("softmax256x1024")?),
             ]),
-            repeat_kv: take("repeat_kv")?,
-            slab_stats: take("slab_stats")?,
+                    slab_stats: take("slab_stats")?,
             slab_weights: take("slab_weights")?,
             slab_merge: take("slab_merge")?,
         };
@@ -1577,6 +1790,8 @@ impl WgpuTextDecoder {
             pending: None,
             pending_map: None,
             pooled: false,
+            prefill_scratch: None,
+            multi_scratch: None,
             embed_table,
             layers,
             pipes: std::sync::Arc::new(pipes),
@@ -1867,11 +2082,10 @@ impl WgpuTextDecoder {
             if want(LayerBlock::Gqa) && !k("gqa") {
                 self.encode_gqa(cp, l, cur_len);
             }
-            if want(LayerBlock::Gqa) && d("gqa") {
-                if want(LayerBlock::Gqa) && !k("gqa") {
+            if want(LayerBlock::Gqa) && d("gqa")
+                && want(LayerBlock::Gqa) && !k("gqa") {
                     self.encode_gqa(cp, l, cur_len);
                 }
-            }
 
             let rpwr = gemv_rpwr_o_dp(cfg.hidden_size);
             if want(LayerBlock::O) && !k("o") {
@@ -2842,6 +3056,8 @@ impl WgpuTextDecoder {
             pending: None,
             pending_map: None,
             pooled: false,
+            prefill_scratch: None,
+            multi_scratch: None,
             embed_table,
             layers,
             pipes: self.pipes.clone(),
@@ -3709,7 +3925,7 @@ pub fn prefill_batch(
     anyhow::ensure!(!slots.is_empty(), "prefill_batch: no slots");
     anyhow::ensure!(slots.len() == plans.len(), "prefill_batch: slot/plan mismatch");
     let nl = slots[0].layers.len();
-    anyhow::ensure!(nl == slots[0].cfg.num_hidden_layers as usize, "layer count");
+    anyhow::ensure!(nl == slots[0].cfg.num_hidden_layers, "layer count");
 
     // The clones are handles: `wgpu::Buffer` is refcounted, so a slot's KV is
     // reachable from here without borrowing the slot itself.
@@ -3772,41 +3988,45 @@ impl WgpuTextDecoder {
         let np_max = cur_max.div_ceil(128) * 128;
         let cur16_max = cur_max.div_ceil(16) * 16;
 
-        let words = |rows: usize, cols: usize| (rows * cols / 2 * 4) as u64;
-        let mut up = self.gpu.uploader();
-        // Shared, batched rows.
-        let h_buf = up.storage("pb.h", words(mp, hs));
-        let normed = up.storage("pb.normed", words(mp, hs));
-        let norm2 = up.storage("pb.norm2", words(mp, hs));
-        let qkv = up.storage("pb.qkv", words(mp, cfg.fused_qkv_cols()));
-        let attn_flat = up.storage("pb.attn_flat", words(mp, nqh * hd));
-        let gu = up.storage("pb.gu", words(mp, 2 * inter));
-        let activated = up.storage("pb.activated", words(mp, inter));
-        // Attention scratch, reused across segments (they run sequentially).
-        let q_out = up.storage("pb.q_out", words(nqh * mp_max, hd));
-        let scores = up.storage("pb.scores", words(nqh * mp_max, np_max));
-        let k_rep = up.storage("pb.k_rep", words(nqh * np_max, hd));
-        let v_rep = up.storage("pb.v_rep", words(nqh * np_max, hd));
-        let attn = up.storage("pb.attn", words(nqh * mp_max, cur16_max));
-
+        let bm = if self.gpu.use_tile64(s) { 64 } else { 128 };
+        let bn = bm;
         const MAX_GEMMS: u64 = 512;
-        let u_gd = up.uniform("pb.gd", MAX_GEMMS * 256);
-        // One 64-byte config per segment per kernel family: the dispatch that
-        // reads it is per segment, and a single uniform written N times before
-        // submit would reach all of them with the last value.
-        let u_seg = up.uniform("pb.seg", 32 * 256);
-        let u_sl = up.uniform("pb.sl", 32 * 256);
-        let u_rk = up.uniform("pb.rk", 32 * 256);
+        // Every forked slot shares `self.cap`, so the KV stride of all segments
+        // is the same; the attention buffers only need the longest segment.
+        anyhow::ensure!(self.cap >= np_max, "prefill_multi: KV capacity below segment length");
+        let words = |rows: usize, cols: usize| (rows * cols / 2 * 4) as u64;
+        // Clone handles before mutably borrowing the pool.
+        let sc = self.multi_scratch.get_or_insert_with(|| MultiPrefillScratch::new(&self.gpu));
+        sc.ensure(
+            &self.gpu, &words, hs, cfg.fused_qkv_cols(), nqh, hd, inter,
+            mp, mp_max, words(nqh * mp_max, np_max), words(nqh * mp_max, cur16_max),
+        );
+        let u_gd = sc.u_gd.clone();
+        let u_seg = sc.u_seg.clone();
+        let u_sl = sc.u_sl.clone();
+        let h_buf = sc.h_buf.clone();
+        let normed = sc.normed.clone();
+        let norm2 = sc.norm2.clone();
+        let qkv = sc.qkv.clone();
+        let attn_flat = sc.attn_flat.clone();
+        let gu = sc.gu.clone();
+        let activated = sc.activated.clone();
+        let q_out = sc.q_out.clone();
+        let scores = sc.scores.clone();
+        let attn = sc.attn.clone();
 
-        // Hidden rows of every segment, concatenated.
         let mut hidden = Vec::with_capacity(s * hs * 2);
         for g in segs {
             hidden.extend_from_slice(&g.hidden[..g.len * hs * 2]);
         }
-        up.upload(&h_buf, &hidden)?;
-        up.finish()?;
+        self.gpu.upload(&h_buf, &hidden);
 
         let gpu = &self.gpu;
+        let (gemm_pipe, gemm_acc_pipe, gemm_causal_pipe, gemm_av_causal_pipe) = if bm == 64 {
+            (&self.pipes.gemm_64, &self.pipes.gemm_acc_64, &self.pipes.gemm_causal_64, &self.pipes.gemm_av_causal_64)
+        } else {
+            (&self.pipes.gemm, &self.pipes.gemm_acc, &self.pipes.gemm_causal, &self.pipes.gemm_av_causal)
+        };
         let scale = cfg.scale();
         let eps = cfg.rms_norm_eps;
         let max_seq = self.cap as u32;
@@ -3850,19 +4070,6 @@ impl WgpuTextDecoder {
                     gx: sm_grid.0,
                     row0: 0,
                     q_off: 0,
-                }),
-            );
-            let rk_grid = grid_xy((nqh * lens[i] * hd / 2).div_ceil(256));
-            self.gpu.write_at(
-                &u_rk,
-                (i * 256) as u64,
-                bytemuck::bytes_of(&RepeatKvCfg {
-                    nkvh: nkvh as u32,
-                    max_seq,
-                    cur: lens[i] as u32,
-                    hd: hd as u32,
-                    npw: (nps[i] * hd / 2) as u32,
-                    gx: rk_grid.0,
                 }),
             );
         }
@@ -3936,6 +4143,29 @@ impl WgpuTextDecoder {
             })
         };
 
+        // Every segment's AV sweeps `cur16i` rows while `len` were written; zero
+        // each segment's V tail per KV head so a reused slot cache cannot leak
+        // stale (or NaN) values into the padded columns.
+        {
+            let mut any = false;
+            let mut zenc = gpu.device.create_command_encoder(&Default::default());
+            for (i, seg) in segs.iter().enumerate() {
+                if cur16s[i] > lens[i] {
+                    let bytes = ((cur16s[i] - lens[i]) * hd * 2) as u64;
+                    for cache in &seg.v {
+                        for h in 0..nkvh {
+                            let off = ((h * self.cap + lens[i]) * hd * 2) as u64;
+                            zenc.clear_buffer(cache, off, Some(bytes));
+                            any = true;
+                        }
+                    }
+                }
+            }
+            if any {
+                gpu.queue.submit([zenc.finish()]);
+            }
+        }
+
         let mut enc = gpu.device.create_command_encoder(&Default::default());
         let mut cp = enc.begin_compute_pass(&Default::default());
 
@@ -3946,7 +4176,7 @@ impl WgpuTextDecoder {
             cp.set_bind_group(0, &bg, &[]);
             cp.dispatch_workgroups(s as u32, 1, 1);
             gemm!(
-                &mut cp, &self.pipes.gemm, &normed, &layer.qkv_w, &qkv, 0u64,
+                &mut cp, gemm_pipe, &normed, &layer.qkv_w, &qkv, 0u64,
                 GDims {
                     m: s as u32,
                     n: cfg.fused_qkv_cols() as u32,
@@ -3959,8 +4189,9 @@ impl WgpuTextDecoder {
                     row0: 0,
                     lda: hs as u32,
                     q_off: 0,
+                    gqa_group: 1,
                 },
-                (cfg.fused_qkv_cols() / 128) as u32, (mp / 128) as u32, 1
+                (cfg.fused_qkv_cols() / bn) as u32, (mp / bm) as u32, 1
             );
 
             // attention: per segment, each into its own KV
@@ -4012,52 +4243,26 @@ impl WgpuTextDecoder {
                 cp.set_bind_group(0, &bg_ex, &[]);
                 cp.dispatch_workgroups(len as u32, (nqh + nkvh) as u32, 1);
 
-                // K/V repeated over the query heads, into this segment's scratch.
-                let repeat_grid = grid_xy((nqh * len * hd / 2).div_ceil(256));
-                for (cache, out) in [(&seg.k[li], &k_rep), (&seg.v[li], &v_rep)] {
-                    let bg_rk = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("pb.rk"),
-                        layout: &self.pipes.repeat_kv.get_bind_group_layout(0),
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: cache.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry { binding: 1, resource: out.as_entire_binding() },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                    buffer: &u_rk,
-                                    offset: (i * 256) as u64,
-                                    size: std::num::NonZeroU64::new(64),
-                                }),
-                            },
-                        ],
-                    });
-                    cp.set_pipeline(&self.pipes.repeat_kv);
-                    cp.set_bind_group(0, &bg_rk, &[]);
-                    cp.dispatch_workgroups(repeat_grid.0, repeat_grid.1, 1);
-                }
-
                 let softmax_grid = grid_xy(nqh * len);
 
                 // scores = Q . K^T, causal inside the segment.
                 gemm!(
-                    &mut cp, &self.pipes.gemm_causal, &q_out, &k_rep, &scores, 0u64,
+                    &mut cp, gemm_causal_pipe, &q_out, &seg.k[li], &scores, 0u64,
                     GDims {
                         m: len as u32,
                         n: len as u32,
                         k: hd as u32,
                         ldc: npi as u32,
                         bsa: (mpi * hd / 2) as u32,
-                        bsb: (npi * hd / 2) as u32,
+                        bsb: (self.cap * hd / 2) as u32,
                         bsc: (mpi * npi) as u32,
                         beta: 0,
                         row0: 0,
                         lda: hd as u32,
                         q_off: 0,
+                        gqa_group: (nqh / nkvh) as u32,
                     },
-                    (npi / 128) as u32, (mpi / 128) as u32, nqh as u32
+                    (npi / bn) as u32, (mpi / bm) as u32, nqh as u32
                 );
                 let (phys, tree) = softmax_blocks(len);
                 let sm_pipe = if phys == tree {
@@ -4092,27 +4297,28 @@ impl WgpuTextDecoder {
                 // which is what lets the `o` GEMM see every segment at once.
                 let out_off = (row0 * nqh * hd * 2) as u64;
                 gemm!(
-                    &mut cp, &self.pipes.gemm_av_causal, &attn, &v_rep, &attn_flat, out_off,
+                    &mut cp, gemm_av_causal_pipe, &attn, &seg.v[li], &attn_flat, out_off,
                     GDims {
                         m: len as u32,
                         n: hd as u32,
                         k: cur16i as u32,
                         ldc: (nqh * hd) as u32,
                         bsa: (mpi * cur16i / 2) as u32,
-                        bsb: (npi * hd / 2) as u32,
+                        bsb: (self.cap * hd / 2) as u32,
                         bsc: hd as u32,
                         beta: 0,
                         row0: 0,
                         lda: cur16i as u32,
                         q_off: 0,
+                        gqa_group: (nqh / nkvh) as u32,
                     },
-                    1, (mpi / 128) as u32, nqh as u32
+                    (hd / bn) as u32, (mpi / bm) as u32, nqh as u32
                 );
             }
 
             // o over every row, then the FFN
             gemm!(
-                &mut cp, &self.pipes.gemm_acc, &attn_flat, &layer.o_w, &h_buf, 0u64,
+                &mut cp, gemm_acc_pipe, &attn_flat, &layer.o_w, &h_buf, 0u64,
                 GDims {
                     m: s as u32,
                     n: hs as u32,
@@ -4125,15 +4331,16 @@ impl WgpuTextDecoder {
                     row0: 0,
                     lda: (nqh * hd) as u32,
                     q_off: 0,
+                    gqa_group: 1,
                 },
-                (hs / 128) as u32, (mp / 128) as u32, 1
+                (hs / bn) as u32, (mp / bm) as u32, 1
             );
             let bg2 = rms_bg(&h_buf, &layer.pln_w, &norm2);
             cp.set_pipeline(&self.pipes.rms_norm);
             cp.set_bind_group(0, &bg2, &[]);
             cp.dispatch_workgroups(s as u32, 1, 1);
             gemm!(
-                &mut cp, &self.pipes.gemm, &norm2, &layer.gu_w, &gu, 0u64,
+                &mut cp, gemm_pipe, &norm2, &layer.gu_w, &gu, 0u64,
                 GDims {
                     m: s as u32,
                     n: (2 * inter) as u32,
@@ -4146,8 +4353,9 @@ impl WgpuTextDecoder {
                     row0: 0,
                     lda: hs as u32,
                     q_off: 0,
+                    gqa_group: 1,
                 },
-                ((2 * inter) / 128) as u32, (mp / 128) as u32, 1
+                ((2 * inter) / bn) as u32, (mp / bm) as u32, 1
             );
             let bg_silu = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("pb.silu"),
@@ -4165,7 +4373,7 @@ impl WgpuTextDecoder {
             cp.set_bind_group(0, &bg_silu, &[]);
             cp.dispatch_workgroups(silu_gx, silu_gy, 1);
             gemm!(
-                &mut cp, &self.pipes.gemm_acc, &activated, &layer.dp_w, &h_buf, 0u64,
+                &mut cp, gemm_acc_pipe, &activated, &layer.dp_w, &h_buf, 0u64,
                 GDims {
                     m: s as u32,
                     n: hs as u32,
@@ -4178,8 +4386,9 @@ impl WgpuTextDecoder {
                     row0: 0,
                     lda: inter as u32,
                     q_off: 0,
+                    gqa_group: 1,
                 },
-                (hs / 128) as u32, (mp / 128) as u32, 1
+                (hs / bn) as u32, (mp / bm) as u32, 1
             );
 
             // The GEMM uniform is a slot array; a layer spends `4 + 2*segs.len()`
@@ -4407,7 +4616,7 @@ fn fused_i8_pieces(
         let name = format!("{prefix}.{p}.weight");
         let m = weights::get_int8(w, &name)?;
         anyhow::ensure!(
-            cols.map_or(true, |c| c == m.cols),
+            cols.map(|c| c == m.cols).unwrap_or(true),
             "{prefix}: fused int8 parts disagree on cols ({cols:?} vs {})",
             m.cols
         );
@@ -4604,12 +4813,16 @@ impl WgpuTextDecoder {
         let np = cur.div_ceil(128) * 128;
         let cur16 = cur.div_ceil(16) * 16;
         anyhow::ensure!(hidden_words.len() >= s * hs * 2, "prefill hidden size mismatch");
-
         let slab_t = SLAB_T;
         let n_slab = if slab_path(s) { cur.div_ceil(slab_t) } else { 0 };
         let slabbed = n_slab > 0;
         let nkv_rows = if slabbed { n_slab * slab_t } else { np };
-        let bind_limit = self.gpu.limits.max_storage_buffer_binding_size as u64;
+        // Slabbed attention reads whole slabs past `cur`, so the cache must hold
+        // `nkv_rows` per KV head *before* any buffer handle is taken below --
+        // with `QASR_SLAB=on` that is more than `cur`, and more than a previous
+        // `cap`, which only grows through here.
+        self.ensure_capacity(nkv_rows);
+        let bind_limit = self.gpu.limits.max_storage_buffer_binding_size;
         if slabbed {
             anyhow::ensure!(
                 n_slab <= MAX_SLAB,
@@ -4635,32 +4848,55 @@ impl WgpuTextDecoder {
             );
         }
 
+        let bm = if self.gpu.use_tile64(s) { 64 } else { 128 };
+        let bn = bm;
         let words = |rows: usize, cols: usize| (rows * cols / 2 * 4) as u64;
-        let mut up = self.gpu.uploader();
-        let h_buf = up.storage("p.h", words(mp, hs));
-        let normed = up.storage("p.normed", words(mp, hs));
-        let norm2 = up.storage("p.norm2", words(mp, hs));
-        let qkv = up.storage("p.qkv", words(mp, cfg.fused_qkv_cols()));
-        let q_out = up.storage("p.q_out", words(nqh * mp, hd));
         let slab_cols = if slabbed { slab_t } else { np };
-        let scores = up.storage("p.scores", words(nqh * mp, slab_cols));
-        let k_rep = up.storage("p.k_rep", words(nqh * nkv_rows, hd));
-        let v_rep = up.storage("p.v_rep", words(nqh * nkv_rows, hd));
-        let attn = up.storage("p.attn", words(nqh * mp, if slabbed { slab_t } else { cur16 }));
-        let slab_part = slabbed.then(|| up.storage("p.slab_part", words(n_slab * mp, nqh * hd)));
-        let slab_stats = slabbed.then(|| up.storage("p.slab_stats", (n_slab * nqh * mp * 2 * 4) as u64));
-        let slab_w = slabbed.then(|| up.storage("p.slab_w", (n_slab * nqh * mp * 4) as u64));
-        let attn_flat = up.storage("p.attn_flat", words(mp, nqh * hd));
-        let gu = up.storage("p.gu", words(mp, 2 * inter));
-        let activated = up.storage("p.activated", words(mp, inter));
+        let sc = self.prefill_scratch.get_or_insert_with(|| PrefillScratch::new(&self.gpu));
+        sc.ensure(
+            &self.gpu, &words, hs, cfg.fused_qkv_cols(), nqh, hd, inter, mp,
+            words(nqh * mp, slab_cols), words(nqh * mp, if slabbed { slab_t } else { cur16 }),
+            if slabbed {
+                Some((
+                    words(n_slab * mp, nqh * hd),
+                    (n_slab * nqh * mp * 2 * 4) as u64,
+                    (n_slab * nqh * mp * 4) as u64,
+                ))
+            } else {
+                None
+            },
+        );
+        let u_gd = sc.u_gd.clone();
+        let u_sl = sc.u_sl.clone();
+        let h_buf = sc.h_buf.clone();
+        let normed = sc.normed.clone();
+        let norm2 = sc.norm2.clone();
+        let qkv = sc.qkv.clone();
+        let q_out = sc.q_out.clone();
+        let scores = sc.scores.clone();
+        let attn = sc.attn.clone();
+        let attn_flat = sc.attn_flat.clone();
+        let gu = sc.gu.clone();
+        let activated = sc.activated.clone();
+        let (slab_part, slab_stats, slab_w) = match &sc.slab {
+            Some(s) => (
+                Some(s.slab_part.clone()),
+                Some(s.slab_stats.clone()),
+                Some(s.slab_w.clone()),
+            ),
+            None => (None, None, None),
+        };
         const MAX_GEMMS: u64 = 256;
-        let u_gd = up.uniform("p.gd", MAX_GEMMS * 256);
-        let u_sl = up.uniform("p.sl", (2 * MAX_SLAB as u64 + 2) * 256);
-        let u_rk = up.uniform("p.rk", 32);
-        up.upload(&h_buf, hidden_words)?;
+        let mut up = self.gpu.uploader();
+        up.upload(&h_buf, &hidden_words[..s * hs * 2])?;
         up.finish()?;
 
         let gpu = &self.gpu;
+        let (gemm_pipe, gemm_acc_pipe, gemm_causal_pipe, gemm_av_causal_pipe, gemm_av_pipe, gemm_w8_pipe, gemm_w8_acc_pipe) = if bm == 64 {
+            (&self.pipes.gemm_64, &self.pipes.gemm_acc_64, &self.pipes.gemm_causal_64, &self.pipes.gemm_av_causal_64, &self.pipes.gemm_av_64, &self.pipes.gemm_w8_64, &self.pipes.gemm_w8_acc_64)
+        } else {
+            (&self.pipes.gemm, &self.pipes.gemm_acc, &self.pipes.gemm_causal, &self.pipes.gemm_av_causal, &self.pipes.gemm_av, &self.pipes.gemm_w8, &self.pipes.gemm_w8_acc)
+        };
         let gemm_bg = |pipe: &wgpu::ComputePipeline,
                        a: &wgpu::Buffer,
                        w: &wgpu::Buffer,
@@ -4769,6 +5005,7 @@ impl WgpuTextDecoder {
                         row0: 0,
                         lda: $k as u32,
                         q_off: kv_start as u32,
+                        gqa_group: 1,
                     },
                     $gx, $gy, $gz
                 );
@@ -4796,6 +5033,7 @@ impl WgpuTextDecoder {
                     row0: 0,
                     lda: $k as u32,
                     q_off: kv_start as u32,
+                    gqa_group: 1,
                 }));
                 let bg = gemm_w8_bg($pipe, $a, $w, $s, $c, 0u64, &u_gd);
                 $cp.set_pipeline($pipe);
@@ -4893,27 +5131,22 @@ impl WgpuTextDecoder {
                 }),
             );
         }
-        let tail_rows = nkv_rows - cur;
-        if tail_rows > 0 {
-            let zero = vec![0u8; tail_rows * hd * 2];
-            for h in 0..nqh {
-                let off = ((h * nkv_rows + cur) * hd * 2) as u64;
-                gpu.write_at(&k_rep, off, &zero);
-                gpu.write_at(&v_rep, off, &zero);
+        // The AV pass sweeps `k = cur16` while only `cur` KV rows were written,
+        // and the softmax's zero columns only make those tail reads harmless if
+        // the rows themselves are numbers: a reused cache holds whatever the
+        // previous clip left there, including NaN.  Zero `cur..cur16` per KV
+        // head before the compute pass, exactly what a fresh buffer would be.
+        if cur16 > cur {
+            let mut zenc = gpu.device.create_command_encoder(&Default::default());
+            let bytes = ((cur16 - cur) * hd * 2) as u64;
+            for layer in &self.layers {
+                for h in 0..nkvh {
+                    let off = ((h * self.cap + cur) * hd * 2) as u64;
+                    zenc.clear_buffer(&layer.v_cache, off, Some(bytes));
+                }
             }
+            gpu.queue.submit([zenc.finish()]);
         }
-        let repeat_grid = grid_xy((nqh * cur * hd / 2).div_ceil(256));
-        gpu.upload(
-            &u_rk,
-            bytemuck::bytes_of(&RepeatKvCfg {
-                nkvh: nkvh as u32,
-                max_seq: self.cap as u32,
-                cur: cur as u32,
-                hd: hd as u32,
-                npw: (nkv_rows * hd / 2) as u32,
-                gx: repeat_grid.0,
-            }),
-        );
 
         let mut enc = gpu.device.create_command_encoder(&Default::default());
         let mut cp = enc.begin_compute_pass(&Default::default());
@@ -4945,16 +5178,16 @@ impl WgpuTextDecoder {
             if !sk("p_qkv") {
                 if self.int8 {
                     gemm_w8!(
-                        &mut cp, &self.pipes.gemm_w8, &normed, &layer.qkv_w,
+                        &mut cp, gemm_w8_pipe, &normed, &layer.qkv_w,
                         layer.qkv_s.as_ref().expect("int8 scale buffers"), &qkv,
                         s, cfg.fused_qkv_cols(), hs, cfg.fused_qkv_cols(), 0, 0, 0,
-                        (cfg.fused_qkv_cols() / 128) as u32, (mp / 128) as u32, 1
+                        (cfg.fused_qkv_cols() / bn) as u32, (mp / bm) as u32, 1
                     );
                 } else {
                     gemm!(
-                        &mut cp, &self.pipes.gemm, &normed, &layer.qkv_w, &qkv,
+                        &mut cp, gemm_pipe, &normed, &layer.qkv_w, &qkv,
                         s, cfg.fused_qkv_cols(), hs, cfg.fused_qkv_cols(), 0, 0, 0,
-                        (cfg.fused_qkv_cols() / 128) as u32, (mp / 128) as u32, 1
+                        (cfg.fused_qkv_cols() / bn) as u32, (mp / bm) as u32, 1
                     );
                 }
             }
@@ -4981,24 +5214,6 @@ impl WgpuTextDecoder {
                 cp.dispatch_workgroups(s as u32, (nqh + nkvh) as u32, 1);
             }
 
-            for (cache, out) in [(&layer.k_cache, &k_rep), (&layer.v_cache, &v_rep)] {
-                let bg_rk = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("p.rk"),
-                    layout: &self.pipes.repeat_kv.get_bind_group_layout(0),
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: cache.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: out.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: u_rk.as_entire_binding() },
-                    ],
-                });
-                cp.set_pipeline(&self.pipes.repeat_kv);
-                cp.set_bind_group(0, &bg_rk, &[]);
-                cp.dispatch_workgroups(repeat_grid.0, repeat_grid.1, 1);
-                if dup == "p_repeat" {
-                    cp.dispatch_workgroups(repeat_grid.0, repeat_grid.1, 1);
-                }
-            }
-
             if slabbed {
                 let spart = slab_part.as_ref().unwrap();
                 let sstats = slab_stats.as_ref().unwrap();
@@ -5012,22 +5227,23 @@ impl WgpuTextDecoder {
                         k: hd as u32,
                         ldc: slab_t as u32,
                         bsa: (mp * hd / 2) as u32,
-                        bsb: (nkv_rows * hd / 2) as u32,
+                        bsb: (self.cap * hd / 2) as u32,
                         bsc: (mp * slab_t) as u32,
                         beta: 0,
                         row0: t0 as u32,
                         lda: hd as u32,
                         q_off: kv_start as u32,
+                        gqa_group: (nqh / nkvh) as u32,
                     };
-                    let sgrid = ((slab_t / 128) as u32, (mp / 128) as u32, nqh as u32);
+                    let sgrid = ((slab_t / bn) as u32, (mp / bm) as u32, nqh as u32);
                     gemm_at!(
-                        &mut cp, &self.pipes.gemm_causal, &q_out, &k_rep, &scores,
+                        &mut cp, gemm_causal_pipe, &q_out, &layer.k_cache, &scores,
                         0u64, t, sg,
                         sgrid.0, sgrid.1, sgrid.2
                     );
                     if dup == "p_scores" {
                         gemm_at!(
-                            &mut cp, &self.pipes.gemm_causal, &q_out, &k_rep, &scores,
+                            &mut cp, gemm_causal_pipe, &q_out, &layer.k_cache, &scores,
                             0u64, t, sg,
                             sgrid.0, sgrid.1, sgrid.2
                         );
@@ -5082,23 +5298,25 @@ impl WgpuTextDecoder {
                         k: tl as u32,
                         ldc: (nqh * hd) as u32,
                         bsa: (mp * slab_t / 2) as u32,
-                        bsb: (nkv_rows * hd / 2) as u32,
+                        bsb: (self.cap * hd / 2) as u32,
                         bsc: hd as u32,
                         beta: 0,
                         row0: t0 as u32,
                         lda: slab_t as u32,
                         q_off: kv_start as u32,
+                        gqa_group: (nqh / nkvh) as u32,
                     };
+                    // Slab AV: `n = hd` is `hd/bn` tiles (never a hardcoded 1).
                     gemm_at!(
-                        &mut cp, &self.pipes.gemm_av_causal, &attn, &v_rep, spart,
+                        &mut cp, gemm_av_causal_pipe, &attn, &layer.v_cache, spart,
                         (t * mp * nqh * hd * 2) as u64, n_slab + t, ag,
-                        1, (mp / 128) as u32, nqh as u32
+                        (hd / bn) as u32, (mp / bm) as u32, nqh as u32
                     );
                     if dup == "p_av" {
                         gemm_at!(
-                            &mut cp, &self.pipes.gemm_av_causal, &attn, &v_rep, spart,
+                            &mut cp, gemm_av_causal_pipe, &attn, &layer.v_cache, spart,
                             (t * mp * nqh * hd * 2) as u64, n_slab + t, ag,
-                            1, (mp / 128) as u32, nqh as u32
+                            (hd / bn) as u32, (mp / bm) as u32, nqh as u32
                         );
                     }
                 }
@@ -5144,16 +5362,37 @@ impl WgpuTextDecoder {
                 cp.set_bind_group(0, &bg_m, &[]);
                 cp.dispatch_workgroups(slab_m_grid, nqh as u32, 1);
             } else {
-                gemm!(
-                    &mut cp, &self.pipes.gemm_causal, &q_out, &k_rep, &scores,
-                    s, cur, hd, np, mp * hd / 2, np * hd / 2, mp * np,
-                    (np / 128) as u32, (mp / 128) as u32, nqh as u32
+                // K is read in place: one KV head serves `nqh/nkvh` query heads
+                // (`gqa_group` divides the batch index into `bsb`), so the
+                // repeated [nqh, ...] copy `repeat_kv` used to build is gone.
+                let qk = GDims {
+                    m: s as u32,
+                    n: cur as u32,
+                    k: hd as u32,
+                    ldc: np as u32,
+                    bsa: (mp * hd / 2) as u32,
+                    bsb: (self.cap * hd / 2) as u32,
+                    bsc: (mp * np) as u32,
+                    beta: 0,
+                    row0: 0,
+                    lda: hd as u32,
+                    q_off: kv_start as u32,
+                    gqa_group: (nqh / nkvh) as u32,
+                };
+                let slot = gd_slot;
+                gd_slot += 1;
+                gemm_at!(
+                    &mut cp, gemm_causal_pipe, &q_out, &layer.k_cache, &scores,
+                    0u64, slot, qk,
+                    (np / bn) as u32, (mp / bm) as u32, nqh as u32
                 );
                 if dup == "p_scores" {
-                    gemm!(
-                        &mut cp, &self.pipes.gemm, &q_out, &k_rep, &scores,
-                        s, cur, hd, np, mp * hd / 2, np * hd / 2, mp * np,
-                        (np / 128) as u32, (mp / 128) as u32, nqh as u32
+                    let slot = gd_slot;
+                    gd_slot += 1;
+                    gemm_at!(
+                        &mut cp, gemm_pipe, &q_out, &layer.k_cache, &scores,
+                        0u64, slot, qk,
+                        (np / bn) as u32, (mp / bm) as u32, nqh as u32
                     );
                 }
 
@@ -5189,16 +5428,36 @@ impl WgpuTextDecoder {
                     cp.dispatch_workgroups(softmax_grid.0, softmax_grid.1, 1);
                 }
 
-                gemm!(
-                    &mut cp, &self.pipes.gemm_av_causal, &attn, &v_rep, &attn_flat,
-                    s, hd, cur16, nqh * hd, mp * cur16 / 2, np * hd / 2, hd,
-                    1, (mp / 128) as u32, nqh as u32
+                let av = GDims {
+                    m: s as u32,
+                    n: hd as u32,
+                    k: cur16 as u32,
+                    ldc: (nqh * hd) as u32,
+                    bsa: (mp * cur16 / 2) as u32,
+                    bsb: (self.cap * hd / 2) as u32,
+                    bsc: hd as u32,
+                    beta: 0,
+                    row0: 0,
+                    lda: cur16 as u32,
+                    q_off: kv_start as u32,
+                    gqa_group: (nqh / nkvh) as u32,
+                };
+                // `n = hd` is one 128- or two 64-wide tiles, so `gx` follows the
+                // tile width -- a hardcoded 1 leaves half of a 64x64 AV unwritten.
+                let slot = gd_slot;
+                gd_slot += 1;
+                gemm_at!(
+                    &mut cp, gemm_av_causal_pipe, &attn, &layer.v_cache, &attn_flat,
+                    0u64, slot, av,
+                    (hd / bn) as u32, (mp / bm) as u32, nqh as u32
                 );
                 if dup == "p_av" {
-                    gemm!(
-                        &mut cp, &self.pipes.gemm_av, &attn, &v_rep, &attn_flat,
-                        s, hd, cur16, nqh * hd, mp * cur16 / 2, np * hd / 2, hd,
-                        1, (mp / 128) as u32, nqh as u32
+                    let slot = gd_slot;
+                    gd_slot += 1;
+                    gemm_at!(
+                        &mut cp, gemm_av_pipe, &attn, &layer.v_cache, &attn_flat,
+                        0u64, slot, av,
+                        (hd / bn) as u32, (mp / bm) as u32, nqh as u32
                     );
                 }
             }
@@ -5206,16 +5465,16 @@ impl WgpuTextDecoder {
             if !sk("p_o") {
                 if self.int8 {
                     gemm_w8!(
-                        &mut cp, &self.pipes.gemm_w8_acc, &attn_flat, &layer.o_w,
+                        &mut cp, gemm_w8_acc_pipe, &attn_flat, &layer.o_w,
                         layer.o_s.as_ref().expect("int8 scale buffers"), &h_buf,
                         s, hs, nqh * hd, hs, 0, 0, 0,
-                        (hs / 128) as u32, (mp / 128) as u32, 1
+                        (hs / bn) as u32, (mp / bm) as u32, 1
                     );
                 } else {
                     gemm!(
-                        &mut cp, &self.pipes.gemm_acc, &attn_flat, &layer.o_w, &h_buf,
+                        &mut cp, gemm_acc_pipe, &attn_flat, &layer.o_w, &h_buf,
                         s, hs, nqh * hd, hs, 0, 0, 0,
-                        (hs / 128) as u32, (mp / 128) as u32, 1
+                        (hs / bn) as u32, (mp / bm) as u32, 1
                     );
                 }
             }
@@ -5240,16 +5499,16 @@ impl WgpuTextDecoder {
             if !sk("p_gu") {
                 if self.int8 {
                     gemm_w8!(
-                        &mut cp, &self.pipes.gemm_w8, &norm2, &layer.gu_w,
+                        &mut cp, gemm_w8_pipe, &norm2, &layer.gu_w,
                         layer.gu_s.as_ref().expect("int8 scale buffers"), &gu,
                         s, 2 * inter, hs, 2 * inter, 0, 0, 0,
-                        ((2 * inter) / 128) as u32, (mp / 128) as u32, 1
+                        ((2 * inter) / bn) as u32, (mp / bm) as u32, 1
                     );
                 } else {
                     gemm!(
-                        &mut cp, &self.pipes.gemm, &norm2, &layer.gu_w, &gu,
+                        &mut cp, gemm_pipe, &norm2, &layer.gu_w, &gu,
                         s, 2 * inter, hs, 2 * inter, 0, 0, 0,
-                        ((2 * inter) / 128) as u32, (mp / 128) as u32, 1
+                        ((2 * inter) / bn) as u32, (mp / bm) as u32, 1
                     );
                 }
             }
@@ -5273,16 +5532,16 @@ impl WgpuTextDecoder {
             if !sk("p_dp") {
                 if self.int8 {
                     gemm_w8!(
-                        &mut cp, &self.pipes.gemm_w8_acc, &activated, &layer.dp_w,
+                        &mut cp, gemm_w8_acc_pipe, &activated, &layer.dp_w,
                         layer.dp_s.as_ref().expect("int8 scale buffers"), &h_buf,
                         s, hs, inter, hs, 0, 0, 0,
-                        (hs / 128) as u32, (mp / 128) as u32, 1
+                        (hs / bn) as u32, (mp / bm) as u32, 1
                     );
                 } else {
                     gemm!(
-                        &mut cp, &self.pipes.gemm_acc, &activated, &layer.dp_w, &h_buf,
+                        &mut cp, gemm_acc_pipe, &activated, &layer.dp_w, &h_buf,
                         s, hs, inter, hs, 0, 0, 0,
-                        (hs / 128) as u32, (mp / 128) as u32, 1
+                        (hs / bn) as u32, (mp / bm) as u32, 1
                     );
                 }
             }
