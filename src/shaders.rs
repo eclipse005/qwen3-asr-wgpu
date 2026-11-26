@@ -20,6 +20,60 @@ pub enum SubgroupMode {
 
 pub const LOG2_E: f32 = std::f32::consts::LOG2_E;
 
+/// Reduction fragments shared by every 32-lane-per-row GEMV kernel.
+///
+/// `Warp32` and `Warp64` emit the legacy XOR tree verbatim: XOR deltas 16..1
+/// never cross a 32-lane boundary, even when the hardware subgroup is 64 wide.
+/// `Generic` reduces within each subgroup and folds those sums through one
+/// workgroup array; both barriers stay in uniform control flow at the top of
+/// `bfly` so Naga's uniformity analysis accepts them across repeated calls.
+/// `None` keeps the original `bt0`/`bt1` tree byte for byte.
+struct BflyFragments {
+    scratch: String,
+    signature: &'static str,
+    fn_tail: &'static str,
+    args: &'static str,
+    body: &'static str,
+}
+
+// These strings use explicit `\x20` for leading spaces because a Rust `\` line
+// continuation strips them; the generated WGSL must keep every indent.
+const XOR_BFLY_BODY: &str = "\x20\x20\x20\x20var t = v;\n\x20\x20\x20\x20t = t + subgroupShuffleXor(t, 16u);\n\x20\x20\x20\x20t = t + subgroupShuffleXor(t, 8u);\n\x20\x20\x20\x20t = t + subgroupShuffleXor(t, 4u);\n\x20\x20\x20\x20t = t + subgroupShuffleXor(t, 2u);\n\x20\x20\x20\x20t = t + subgroupShuffleXor(t, 1u);\n\x20\x20\x20\x20return t;";
+
+const SHARED_BFLY_BODY: &str = "\x20\x20\x20\x20let wb = lid & 0xFFFFFFE0u;\n\x20\x20\x20\x20bt0[lid] = v;\n\x20\x20\x20\x20workgroupBarrier();\n\x20\x20\x20\x20var t = bt0[lid] + bt0[wb + (lane ^ 16u)];\n\x20\x20\x20\x20bt1[lid] = t;\n\x20\x20\x20\x20workgroupBarrier();\n\x20\x20\x20\x20t = bt1[lid] + bt1[wb + (lane ^ 8u)];\n\x20\x20\x20\x20bt0[lid] = t;\n\x20\x20\x20\x20workgroupBarrier();\n\x20\x20\x20\x20t = bt0[lid] + bt0[wb + (lane ^ 4u)];\n\x20\x20\x20\x20bt1[lid] = t;\n\x20\x20\x20\x20workgroupBarrier();\n\x20\x20\x20\x20t = bt1[lid] + bt1[wb + (lane ^ 2u)];\n\x20\x20\x20\x20bt0[lid] = t;\n\x20\x20\x20\x20workgroupBarrier();\n\x20\x20\x20\x20t = bt0[lid] + bt0[wb + (lane ^ 1u)];\n\x20\x20\x20\x20return t;";
+
+const GENERIC_BFLY_BODY: &str = "\x20\x20\x20\x20let sg_sum = subgroupAdd(v);\n\x20\x20\x20\x20let sg_id = lid / sg_size;\n\x20\x20\x20\x20if (sg_lid == 0u) {\n\x20\x20\x20\x20\x20\x20\x20\x20sg_red[sg_id] = sg_sum;\n\x20\x20\x20\x20}\n\x20\x20\x20\x20workgroupBarrier();\n\x20\x20\x20\x20var total = 0.0;\n\x20\x20\x20\x20if (lane == 0u) {\n\x20\x20\x20\x20\x20\x20\x20\x20let sg_per_row = max(32u / sg_size, 1u);\n\x20\x20\x20\x20\x20\x20\x20\x20let base_sg = (lid >> 5u) * sg_per_row;\n\x20\x20\x20\x20\x20\x20\x20\x20for (var k = 0u; k < sg_per_row; k = k + 1u) {\n\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20total = total + sg_red[base_sg + k];\n\x20\x20\x20\x20\x20\x20\x20\x20}\n\x20\x20\x20\x20}\n\x20\x20\x20\x20workgroupBarrier();\n\x20\x20\x20\x20return total;";
+
+/// `scratch_kind` selects the shared-array declaration style: some kernels
+/// spell the workgroup size `THREADS`, the fixed-256 ones spell it as `256`.
+fn bfly_fragments(mode: SubgroupMode, threads: usize, scratch_kind: &str) -> BflyFragments {
+    match mode {
+        SubgroupMode::Warp32 | SubgroupMode::Warp64 => BflyFragments {
+            scratch: String::new(),
+            signature: "",
+            fn_tail: "",
+            args: "",
+            body: XOR_BFLY_BODY,
+        },
+        SubgroupMode::None => BflyFragments {
+            scratch: format!(
+                "var<workgroup> bt0: array<f32, {scratch_kind}>;\nvar<workgroup> bt1: array<f32, {scratch_kind}>;\n"
+            ),
+            signature: "",
+            fn_tail: "",
+            args: "",
+            body: SHARED_BFLY_BODY,
+        },
+        SubgroupMode::Generic => BflyFragments {
+            scratch: format!("var<workgroup> sg_red: array<f32, {threads}>;\n"),
+            signature: ",\n        @builtin(subgroup_invocation_id) sg_lid: u32,\n        @builtin(subgroup_size) sg_size: u32",
+            fn_tail: ", sg_lid: u32, sg_size: u32",
+            args: ", sg_lid, sg_size",
+            body: GENERIC_BFLY_BODY,
+        },
+    }
+}
+
 const HALF_AT: &str = "\
 fn half_at(v: vec2<f32>, i: u32) -> f32 { return select(v.y, v.x, (i & 1u) == 0u); }
 ";
@@ -152,6 +206,15 @@ fn rms_norm_slots(@builtin(workgroup_id) wgid: vec3<u32>,
 /// variant; do not wire it into the decoder.  (Also not bit-identical: the
 /// per-lane accumulator covers a sub-range of K.)
 pub fn gemv_split(n: usize, k: usize, subgroup: bool, splits: usize) -> String {
+    gemv_split_mode(
+        n,
+        k,
+        if subgroup { SubgroupMode::Warp32 } else { SubgroupMode::None },
+        splits,
+    )
+}
+
+pub fn gemv_split_mode(n: usize, k: usize, mode: SubgroupMode, splits: usize) -> String {
     assert_eq!(n % 8, 0, "gemv_split: rows must be a multiple of 8");
     assert_eq!(k % 8, 0, "gemv_split: k must be a multiple of 8");
     let kg = k / 8;
@@ -160,40 +223,12 @@ pub fn gemv_split(n: usize, k: usize, subgroup: bool, splits: usize) -> String {
     assert_eq!(granules_per_lane % splits, 0, "gemv_split: granules/lane must divide by splits");
     let gpt = granules_per_lane / splits;
 
-    let subgroup_body = if subgroup {
-        "    var t = v;
-    t = t + subgroupShuffleXor(t, 16u);
-    t = t + subgroupShuffleXor(t, 8u);
-    t = t + subgroupShuffleXor(t, 4u);
-    t = t + subgroupShuffleXor(t, 2u);
-    t = t + subgroupShuffleXor(t, 1u);
-    return t;"
-    } else {
-        "    let wb = lid & 0xFFFFFFE0u;
-    bt0[lid] = v;
-    workgroupBarrier();
-    var t = bt0[lid] + bt0[wb + (lane ^ 16u)];
-    bt1[lid] = t;
-    workgroupBarrier();
-    t = bt1[lid] + bt1[wb + (lane ^ 8u)];
-    bt0[lid] = t;
-    workgroupBarrier();
-    t = bt0[lid] + bt0[wb + (lane ^ 4u)];
-    bt1[lid] = t;
-    workgroupBarrier();
-    t = bt1[lid] + bt1[wb + (lane ^ 2u)];
-    bt0[lid] = t;
-    workgroupBarrier();
-    t = bt0[lid] + bt0[wb + (lane ^ 1u)];
-    return t;"
-    };
-    let bfly_scratch = if subgroup {
-        ""
-    } else {
-        "var<workgroup> bt0: array<f32, 256>;
-var<workgroup> bt1: array<f32, 256>;
-"
-    };
+    let bfly = bfly_fragments(mode, 256, "256");
+    let subgroup_body = bfly.body;
+    let bfly_scratch = bfly.scratch;
+    let builtins = bfly.signature;
+    let fn_tail = bfly.fn_tail;
+    let bfly_args = bfly.args;
     let mut body = String::new();
     for g in 0..gpt {
         body.push_str(&format!(
@@ -220,13 +255,13 @@ const SUBGROUP: u32 = {subgroup_lit}u;
 
 {bfly_scratch}var<workgroup> rows_out: array<f32, 8>;
 
-fn bfly(v: f32, lid: u32, lane: u32) -> f32 {{
+fn bfly(v: f32, lid: u32, lane: u32{fn_tail}) -> f32 {{
 {subgroup_body}
 }}
 
 @compute @workgroup_size(256)
 fn gemv(@builtin(workgroup_id) workgroup_id: vec3<u32>,
-        @builtin(local_invocation_id) lid: vec3<u32>) {{
+        @builtin(local_invocation_id) lid: vec3<u32>{builtins}) {{
     let lane = lid.x & 31u;
     let warp = lid.x >> 5u;
     let row = workgroup_id.x * 8u + warp;
@@ -236,7 +271,7 @@ fn gemv(@builtin(workgroup_id) workgroup_id: vec3<u32>,
     {{
 {body}    }}
     let acc = (a0 + a1) + (a2 + a3);
-    let r = bfly(acc, lid.x, lane);
+    let r = bfly(acc, lid.x, lane{bfly_args});
     if (lane == 0u) {{ rows_out[warp] = r; }}
     workgroupBarrier();
     if (lid.x < 8u) {{
@@ -244,7 +279,10 @@ fn gemv(@builtin(workgroup_id) workgroup_id: vec3<u32>,
     }}
 }}
 ",
-        subgroup_lit = u32::from(subgroup),
+        subgroup_lit = u32::from(mode != SubgroupMode::None),
+        builtins = builtins,
+        fn_tail = fn_tail,
+        bfly_args = bfly_args,
     )
 }
 
@@ -289,7 +327,11 @@ fn gemv_merge(@builtin(global_invocation_id) gid: vec3<u32>) {{
 /// `n` must be a multiple of 8 (all model shapes are) so no partial workgroup
 /// exists; `k/8` must be a multiple of 32 so the granule loop divides evenly.
 pub fn gemv(n: usize, k: usize, accum: bool, subgroup: bool, rows_per_wg: usize) -> String {
-    gemv_impl(n, k, accum, subgroup, rows_per_wg, 1, false)
+    gemv_mode(n, k, accum, if subgroup { SubgroupMode::Warp32 } else { SubgroupMode::None }, rows_per_wg)
+}
+
+pub fn gemv_mode(n: usize, k: usize, accum: bool, mode: SubgroupMode, rows_per_wg: usize) -> String {
+    gemv_impl(n, k, accum, mode, rows_per_wg, 1, false)
 }
 
 /// [`gemv`] with `rows_per_warp` rows per warp instead of one.
@@ -315,7 +357,18 @@ pub fn gemv_rpwr(
     rows_per_wg: usize,
     rows_per_warp: usize,
 ) -> String {
-    gemv_impl(n, k, accum, subgroup, rows_per_wg, rows_per_warp, false)
+    gemv_rpwr_mode(n, k, accum, if subgroup { SubgroupMode::Warp32 } else { SubgroupMode::None }, rows_per_wg, rows_per_warp)
+}
+
+pub fn gemv_rpwr_mode(
+    n: usize,
+    k: usize,
+    accum: bool,
+    mode: SubgroupMode,
+    rows_per_wg: usize,
+    rows_per_warp: usize,
+) -> String {
+    gemv_impl(n, k, accum, mode, rows_per_wg, rows_per_warp, false)
 }
 
 /// [`gemv`] reading an **int8-resident** weight (the M3 layout): the same
@@ -334,7 +387,11 @@ pub fn gemv_rpwr(
 /// `cols` being a multiple of 4 keeps rows word-aligned, and `k % 8 == 0` keeps
 /// the granule grid exact.
 pub fn gemv_w8(n: usize, k: usize, accum: bool, subgroup: bool, rows_per_wg: usize) -> String {
-    gemv_impl(n, k, accum, subgroup, rows_per_wg, 1, true)
+    gemv_w8_mode(n, k, accum, if subgroup { SubgroupMode::Warp32 } else { SubgroupMode::None }, rows_per_wg)
+}
+
+pub fn gemv_w8_mode(n: usize, k: usize, accum: bool, mode: SubgroupMode, rows_per_wg: usize) -> String {
+    gemv_impl(n, k, accum, mode, rows_per_wg, 1, true)
 }
 
 /// [`gemv_w8`] with `rows_per_warp` rows per warp — [`gemv_rpwr`]'s knob on the
@@ -347,7 +404,18 @@ pub fn gemv_w8_rpwr(
     rows_per_wg: usize,
     rows_per_warp: usize,
 ) -> String {
-    gemv_impl(n, k, accum, subgroup, rows_per_wg, rows_per_warp, true)
+    gemv_w8_rpwr_mode(n, k, accum, if subgroup { SubgroupMode::Warp32 } else { SubgroupMode::None }, rows_per_wg, rows_per_warp)
+}
+
+pub fn gemv_w8_rpwr_mode(
+    n: usize,
+    k: usize,
+    accum: bool,
+    mode: SubgroupMode,
+    rows_per_wg: usize,
+    rows_per_warp: usize,
+) -> String {
+    gemv_impl(n, k, accum, mode, rows_per_wg, rows_per_warp, true)
 }
 
 /// The shared GEMV tile body: the eight prefetch loads of one iteration come
@@ -400,7 +468,7 @@ fn gemv_impl(
     n: usize,
     k: usize,
     accum: bool,
-    subgroup: bool,
+    mode: SubgroupMode,
     rows_per_wg: usize,
     rows_per_warp: usize,
     w8: bool,
@@ -430,41 +498,13 @@ fn gemv_impl(
     let rows_per_wg_tot = rows_per_wg * rows_per_warp;
     let threads = rows_per_wg * 32;
     let accum_lit = if accum { 1u32 } else { 0u32 };
-    let subgroup_lit = if subgroup { 1u32 } else { 0u32 };
-    let subgroup_body = if subgroup {
-        "    var t = v;
-    t = t + subgroupShuffleXor(t, 16u);
-    t = t + subgroupShuffleXor(t, 8u);
-    t = t + subgroupShuffleXor(t, 4u);
-    t = t + subgroupShuffleXor(t, 2u);
-    t = t + subgroupShuffleXor(t, 1u);
-    return t;"
-    } else {
-        "    let wb = lid & 0xFFFFFFE0u;
-    bt0[lid] = v;
-    workgroupBarrier();
-    var t = bt0[lid] + bt0[wb + (lane ^ 16u)];
-    bt1[lid] = t;
-    workgroupBarrier();
-    t = bt1[lid] + bt1[wb + (lane ^ 8u)];
-    bt0[lid] = t;
-    workgroupBarrier();
-    t = bt0[lid] + bt0[wb + (lane ^ 4u)];
-    bt1[lid] = t;
-    workgroupBarrier();
-    t = bt1[lid] + bt1[wb + (lane ^ 2u)];
-    bt0[lid] = t;
-    workgroupBarrier();
-    t = bt0[lid] + bt0[wb + (lane ^ 1u)];
-    return t;"
-    };
-    let bfly_scratch = if subgroup {
-        ""
-    } else {
-        "var<workgroup> bt0: array<f32, THREADS>;
-var<workgroup> bt1: array<f32, THREADS>;
-"
-    };
+    let subgroup_lit = u32::from(mode != SubgroupMode::None);
+    let bfly = bfly_fragments(mode, threads, "THREADS");
+    let subgroup_body = bfly.body;
+    let bfly_scratch = bfly.scratch;
+    let builtins = bfly.signature;
+    let fn_tail = bfly.fn_tail;
+    let bfly_args = bfly.args;
     // The two weight forms share every structural constant — `KG` is `k/8`
     // granules of 8 values in both, so the lane map, the unroll, the
     // accumulators and the reduction tree are one shader; only the weight word
@@ -507,13 +547,13 @@ const ROWSW: u32 = {rowsw}u;
 /// bit of the result -- is preserved.  A/B measured 1.17-1.18x on both the
 /// 512-row and the 18992-row shape with 0 differing outputs
 /// (`cargo run --release --bin subgroup_bfly_bench`).
-fn bfly(v: f32, lid: u32, lane: u32) -> f32 {{
+fn bfly(v: f32, lid: u32, lane: u32{fn_tail}) -> f32 {{
 {subgroup_body}
 }}
 
 @compute @workgroup_size({threads})
 fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
-        @builtin(local_invocation_id) lid: vec3<u32>) {{
+        @builtin(local_invocation_id) lid: vec3<u32>{builtins}) {{
     let lane = lid.x & 31u;
     let warp = lid.x >> 5u;
     // `RPWR` rows per warp, walked in turn.  Each row keeps its own
@@ -533,7 +573,7 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
     for (var g = 0u; g < TILES; g = g + 4u) {{
 {body}    }}
     let acc = (a0 + a1) + (a2 + a3);
-    let r = bfly(acc, lid.x, lane);
+    let r = bfly(acc, lid.x, lane{bfly_args});
     if (lane == 0u) {{ rows_out[warp * RPWR + rr] = r; }}
     }}
     workgroupBarrier();
@@ -558,6 +598,9 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
         subgroup_lit = subgroup_lit,
         subgroup_body = subgroup_body,
         bfly_scratch = bfly_scratch,
+        builtins = builtins,
+        fn_tail = fn_tail,
+        bfly_args = bfly_args,
         rpw = rows_per_wg,
         rowsw = rows_per_wg_tot / 2,
         rowsn = rows_per_wg_tot,
@@ -749,6 +792,16 @@ fn gemv_batch(@builtin(workgroup_id) wgid: vec3<u32>,
 /// Bindings: `0` = W, `1..=batch` = each slot's activation, `1+batch..` = each
 /// slot's output.
 pub fn gemv_batch_slots(n: usize, k: usize, batch: usize, accum: bool) -> String {
+    gemv_batch_slots_mode(n, k, batch, accum, SubgroupMode::None)
+}
+
+pub fn gemv_batch_slots_mode(
+    n: usize,
+    k: usize,
+    batch: usize,
+    accum: bool,
+    mode: SubgroupMode,
+) -> String {
     const RPW: usize = 8;
     const THREADS: usize = RPW * 32;
     let kg = k / 8;
@@ -761,6 +814,12 @@ pub fn gemv_batch_slots(n: usize, k: usize, batch: usize, accum: bool) -> String
     let rowsw = RPW / 2;
     let rowsn = batch * THREADS;
     let accum_lit = if accum { 1u32 } else { 0u32 };
+    let bfly = bfly_fragments(mode, THREADS, "THREADS");
+    let subgroup_body = bfly.body;
+    let bfly_scratch = bfly.scratch;
+    let builtins = bfly.signature;
+    let fn_tail = bfly.fn_tail;
+    let bfly_args = bfly.args;
 
     // One binding covers every slot: the slot picks *which buffer*, not an offset
     // into a shared one.  `wgid.z` indexes the binding array, so a slot reads
@@ -814,8 +873,9 @@ pub fn gemv_batch_slots(n: usize, k: usize, batch: usize, accum: bool) -> String
     let mut reduce = String::new();
     for s in 0..batch {
         reduce.push_str(&format!(
-            "    let acc{s} = (a{s}_0 + a{s}_1) + (a{s}_2 + a{s}_3);\n    let r{s} = bfly(acc{s}, lid.x, lane);\n    if (lane == 0u) {{ rows_out[{o}u + warp] = r{s}; }}\n",
-            o = s * THREADS
+            "    let acc{s} = (a{s}_0 + a{s}_1) + (a{s}_2 + a{s}_3);\n    let r{s} = bfly(acc{s}, lid.x, lane{args});\n    if (lane == 0u) {{ rows_out[{o}u + warp] = r{s}; }}\n",
+            o = s * THREADS,
+            args = bfly_args
         ));
     }
     let mut epilogue = String::new();
@@ -849,35 +909,17 @@ const THREADS: u32 = {threads}u;
 const RPW: u32 = {rpw}u;
 const ACCUM: u32 = {accum}u;
 
-var<workgroup> bt0: array<f32, THREADS>;
-var<workgroup> bt1: array<f32, THREADS>;
-var<workgroup> rows_out: array<f32, {rowsn}>;
+{bfly_scratch}var<workgroup> rows_out: array<f32, {rowsn}>;
 
 /// [`gemv`]'s 5-round xor butterfly, through shared memory: the reduction tree
 /// is what makes a batched slot's sum bit-identical to its lone sum.
-fn bfly(v: f32, lid: u32, lane: u32) -> f32 {{
-    let wb = lid & 0xFFFFFFE0u;
-    bt0[lid] = v;
-    workgroupBarrier();
-    var t = bt0[lid] + bt0[wb + (lane ^ 16u)];
-    bt1[lid] = t;
-    workgroupBarrier();
-    t = bt1[lid] + bt1[wb + (lane ^ 8u)];
-    bt0[lid] = t;
-    workgroupBarrier();
-    t = bt0[lid] + bt0[wb + (lane ^ 4u)];
-    bt1[lid] = t;
-    workgroupBarrier();
-    t = bt1[lid] + bt1[wb + (lane ^ 2u)];
-    bt0[lid] = t;
-    workgroupBarrier();
-    t = bt0[lid] + bt0[wb + (lane ^ 1u)];
-    return t;
+fn bfly(v: f32, lid: u32, lane: u32{fn_tail}) -> f32 {{
+{subgroup_body}
 }}
 
 @compute @workgroup_size({threads})
 fn gemv_batch_slots(@builtin(workgroup_id) wgid: vec3<u32>,
-                    @builtin(local_invocation_id) lid: vec3<u32>) {{
+                    @builtin(local_invocation_id) lid: vec3<u32>{builtins}) {{
     let lane = lid.x & 31u;
     let warp = lid.x >> 5u;
     let row = wgid.x * RPW + warp;
@@ -899,6 +941,10 @@ fn gemv_batch_slots(@builtin(workgroup_id) wgid: vec3<u32>,
         accum = accum_lit,
         rowsn = rowsn,
         rowsw = rowsw,
+        subgroup_body = subgroup_body,
+        bfly_scratch = bfly_scratch,
+        builtins = builtins,
+        fn_tail = fn_tail,
         accs = accs,
         body = body,
         reduce = reduce,
@@ -936,7 +982,27 @@ pub fn gemv_norm(
     bs: usize,
     eps: f32,
 ) -> String {
-    gemv_norm_impl(n, k, accum, subgroup, last, bs, eps, false)
+    gemv_norm_mode(
+        n,
+        k,
+        accum,
+        if subgroup { SubgroupMode::Warp32 } else { SubgroupMode::None },
+        last,
+        bs,
+        eps,
+    )
+}
+
+pub fn gemv_norm_mode(
+    n: usize,
+    k: usize,
+    accum: bool,
+    mode: SubgroupMode,
+    last: usize,
+    bs: usize,
+    eps: f32,
+) -> String {
+    gemv_norm_impl(n, k, accum, mode, last, bs, eps, false)
 }
 
 /// [`gemv_norm`] on the int8-resident weights — [`gemv_w8`]'s weight form with
@@ -950,14 +1016,34 @@ pub fn gemv_norm_w8(
     bs: usize,
     eps: f32,
 ) -> String {
-    gemv_norm_impl(n, k, accum, subgroup, last, bs, eps, true)
+    gemv_norm_w8_mode(
+        n,
+        k,
+        accum,
+        if subgroup { SubgroupMode::Warp32 } else { SubgroupMode::None },
+        last,
+        bs,
+        eps,
+    )
+}
+
+pub fn gemv_norm_w8_mode(
+    n: usize,
+    k: usize,
+    accum: bool,
+    mode: SubgroupMode,
+    last: usize,
+    bs: usize,
+    eps: f32,
+) -> String {
+    gemv_norm_impl(n, k, accum, mode, last, bs, eps, true)
 }
 
 fn gemv_norm_impl(
     n: usize,
     k: usize,
     accum: bool,
-    subgroup: bool,
+    mode: SubgroupMode,
     last: usize,
     bs: usize,
     eps: f32,
@@ -977,7 +1063,13 @@ fn gemv_norm_impl(
         "gemv_norm: block size {bs} is not 256/512/1024"
     );
     let accum_lit = u32::from(accum);
-    let subgroup_lit = u32::from(subgroup);
+    let subgroup_lit = u32::from(mode != SubgroupMode::None);
+    let bfly = bfly_fragments(mode, 256, "256");
+    let subgroup_body = bfly.body;
+    let bfly_scratch = bfly.scratch;
+    let builtins = bfly.signature;
+    let fn_tail = bfly.fn_tail;
+    let bfly_args = bfly.args;
     let folded = match vc {
         1 => "l0".to_string(),
         2 => "l0 + l1".to_string(),
@@ -1001,40 +1093,6 @@ fn gemv_norm_impl(
              \x20   }}\n"
         ));
     }
-    let subgroup_body = if subgroup {
-        "    var t = v;
-    t = t + subgroupShuffleXor(t, 16u);
-    t = t + subgroupShuffleXor(t, 8u);
-    t = t + subgroupShuffleXor(t, 4u);
-    t = t + subgroupShuffleXor(t, 2u);
-    t = t + subgroupShuffleXor(t, 1u);
-    return t;"
-    } else {
-        "    let wb = lid & 0xFFFFFFE0u;
-    bt0[lid] = v;
-    workgroupBarrier();
-    var t = bt0[lid] + bt0[wb + (lane ^ 16u)];
-    bt1[lid] = t;
-    workgroupBarrier();
-    t = bt1[lid] + bt1[wb + (lane ^ 8u)];
-    bt0[lid] = t;
-    workgroupBarrier();
-    t = bt0[lid] + bt0[wb + (lane ^ 4u)];
-    bt1[lid] = t;
-    workgroupBarrier();
-    t = bt1[lid] + bt1[wb + (lane ^ 2u)];
-    bt0[lid] = t;
-    workgroupBarrier();
-    t = bt0[lid] + bt0[wb + (lane ^ 1u)];
-    return t;"
-    };
-    let bfly_scratch = if subgroup {
-        ""
-    } else {
-        "var<workgroup> bt0: array<f32, 256>;
-var<workgroup> bt1: array<f32, 256>;
-"
-    };
     let (wty, sbind, q8fn, sload) = if w8 {
         (
             "vec2<u32>",
@@ -1066,7 +1124,7 @@ var<workgroup> red: array<f32, 256>;
 /// The normalized row, f16-packed exactly as `rms_norm` would have written it.
 var<workgroup> xs: array<vec4<u32>, {kg}u>;
 
-fn bfly(v: f32, lid: u32, lane: u32) -> f32 {{
+fn bfly(v: f32, lid: u32, lane: u32{fn_tail}) -> f32 {{
 {subgroup_body}
 }}
 
@@ -1080,7 +1138,7 @@ fn norm_word(j: u32, inv_rms: f32) -> u32 {{
 
 @compute @workgroup_size(256)
 fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
-        @builtin(local_invocation_id) lid: vec3<u32>) {{
+        @builtin(local_invocation_id) lid: vec3<u32>{builtins}) {{
     let lane = lid.x & 31u;
     let warp = lid.x >> 5u;
     let row = wgid.x * 8u + warp;
@@ -1110,7 +1168,7 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
     for (var g = 0u; g < TILES; g = g + 4u) {{
 {body}    }}
     let acc = (a0 + a1) + (a2 + a3);
-    let r = bfly(acc, lid.x, lane);
+    let r = bfly(acc, lid.x, lane{bfly_args});
     if (lane == 0u) {{ rows_out[warp] = r; }}
     workgroupBarrier();
     if (lid.x == 0u) {{
@@ -1141,6 +1199,9 @@ fn gemv(@builtin(workgroup_id) wgid: vec3<u32>,
         folded = folded,
         subgroup_body = subgroup_body,
         bfly_scratch = bfly_scratch,
+        builtins = builtins,
+        fn_tail = fn_tail,
+        bfly_args = bfly_args,
         wty = wty,
         sbind = sbind,
         q8fn = q8fn,
@@ -1172,6 +1233,19 @@ pub fn gemv_norm_batch_slots(
     bs: usize,
     eps: f32,
 ) -> String {
+    gemv_norm_batch_slots_mode(n, k, batch, accum, last, bs, eps, SubgroupMode::None)
+}
+
+pub fn gemv_norm_batch_slots_mode(
+    n: usize,
+    k: usize,
+    batch: usize,
+    accum: bool,
+    last: usize,
+    bs: usize,
+    eps: f32,
+    mode: SubgroupMode,
+) -> String {
     assert_eq!(n % 8, 0, "gemv_norm_batch_slots: rows must be a multiple of 8");
     let kg = k / 8;
     assert_eq!(k % 256, 0, "gemv_norm_batch_slots: k must be a multiple of 256");
@@ -1184,6 +1258,12 @@ pub fn gemv_norm_batch_slots(
     assert_eq!(bs, vc * 256, "gemv_norm_batch_slots: block size must be 256/512/1024");
     assert!([1usize, 2, 4].contains(&vc), "gemv_norm_batch_slots: block size");
     let accum_lit = u32::from(accum);
+    let bfly = bfly_fragments(mode, 256, "256");
+    let subgroup_body = bfly.body;
+    let bfly_scratch = bfly.scratch;
+    let builtins = bfly.signature;
+    let fn_tail = bfly.fn_tail;
+    let bfly_args = bfly.args;
     let folded = match vc {
         1 => "l0".to_string(),
         2 => "l0 + l1".to_string(),
@@ -1291,8 +1371,9 @@ struct Arr32 { v: array<u32> };
     let mut reduce = String::new();
     for s in 0..batch {
         reduce.push_str(&format!(
-            "    let acc{s} = (a{s}_0 + a{s}_1) + (a{s}_2 + a{s}_3);\n    let r{s} = bfly(acc{s}, lid.x, lane);\n    if (lane == 0u) {{ rows_out[{o}u + warp] = r{s}; }}\n",
-            o = s * 8
+            "    let acc{s} = (a{s}_0 + a{s}_1) + (a{s}_2 + a{s}_3);\n    let r{s} = bfly(acc{s}, lid.x, lane{args});\n    if (lane == 0u) {{ rows_out[{o}u + warp] = r{s}; }}\n",
+            o = s * 8,
+            args = bfly_args
         ));
     }
     let mut epi = String::new();
@@ -1322,30 +1403,12 @@ const LAST2: u32 = {last2}u;
 const BS: u32 = {bs}u;
 const EPS: f32 = {eps:?}f;
 
-var<workgroup> bt0: array<f32, 256>;
-var<workgroup> bt1: array<f32, 256>;
-var<workgroup> rows_out: array<f32, {rowsn}>;
+{bfly_scratch}var<workgroup> rows_out: array<f32, {rowsn}>;
 var<workgroup> red: array<f32, 256>;
 {xs_decl}
 /// The same 5-round xor butterfly as `gemv_norm`, through shared memory.
-fn bfly(v: f32, lid: u32, lane: u32) -> f32 {{
-    let wb = lid & 0xFFFFFFE0u;
-    bt0[lid] = v;
-    workgroupBarrier();
-    var t = bt0[lid] + bt0[wb + (lane ^ 16u)];
-    bt1[lid] = t;
-    workgroupBarrier();
-    t = bt1[lid] + bt1[wb + (lane ^ 8u)];
-    bt0[lid] = t;
-    workgroupBarrier();
-    t = bt0[lid] + bt0[wb + (lane ^ 4u)];
-    bt1[lid] = t;
-    workgroupBarrier();
-    t = bt1[lid] + bt1[wb + (lane ^ 2u)];
-    bt0[lid] = t;
-    workgroupBarrier();
-    t = bt0[lid] + bt0[wb + (lane ^ 1u)];
-    return t;
+fn bfly(v: f32, lid: u32, lane: u32{fn_tail}) -> f32 {{
+{subgroup_body}
 }}
 
 /// `rms_norm`'s output word `j`, per slot: the same two multiplies in the same
@@ -1353,7 +1416,7 @@ fn bfly(v: f32, lid: u32, lane: u32) -> f32 {{
 {normfns}
 @compute @workgroup_size(256)
 fn gemv_norm_batch_slots(@builtin(workgroup_id) wgid: vec3<u32>,
-                         @builtin(local_invocation_id) lid: vec3<u32>) {{
+                         @builtin(local_invocation_id) lid: vec3<u32>{builtins}) {{
     let lane = lid.x & 31u;
     let warp = lid.x >> 5u;
     let row = wgid.x * 8u + warp;
@@ -1378,6 +1441,10 @@ fn gemv_norm_batch_slots(@builtin(workgroup_id) wgid: vec3<u32>,
         bs = bs,
         eps = eps,
         rowsn = batch * 8,
+        subgroup_body = subgroup_body,
+        bfly_scratch = bfly_scratch,
+        builtins = builtins,
+        fn_tail = fn_tail,
         xs_decl = xs_decl,
         normfns = normfns,
         pro = pro,
@@ -3776,7 +3843,179 @@ fn prefill_gemm_impl(
 /// The max fold is order-free (max is exact); the sum fold must place the
 /// parentheses exactly where the tree would: level 1 pairs lane `k` with lane
 /// `k + r/2`, level 2 with `k + r/4`, and so on, each as `left + right`.
+/// Compatibility wrapper: the legacy 32-lane shuffle / shared-memory tree.
 pub fn softmax_causal_tree(bp: usize, bt: usize, subgroup: bool) -> String {
+    softmax_causal_tree_legacy(bp, bt, subgroup)
+}
+
+/// Select the causal-softmax reduction path from device capabilities.
+pub fn softmax_causal_tree_mode(bp: usize, bt: usize, mode: SubgroupMode) -> String {
+    match mode {
+        SubgroupMode::Warp32 => softmax_causal_tree_legacy(bp, bt, true),
+        SubgroupMode::None => softmax_causal_tree_legacy(bp, bt, false),
+        SubgroupMode::Warp64 | SubgroupMode::Generic => {
+            softmax_causal_tree_generic(bp, bt)
+        }
+    }
+}
+
+/// Portable `subgroupMax` / `subgroupAdd` reduction for non-32-lane adapters.
+///
+/// Every subgroup builtin and barrier sits at the top level of the entry point
+/// (or in a workgroup-uniform branch), so Naga's uniformity analysis accepts it.
+/// The arithmetic that feeds the reductions — the lane loop, the `r = bt / bp`
+/// fold and the causal bound — is the same as the legacy tree's.
+fn softmax_causal_tree_generic(bp: usize, bt: usize) -> String {
+    assert!(bt >= bp && bt % bp == 0, "softmax_causal_tree: bt must be a multiple of bp");
+    let r = bt / bp;
+    assert!(r.is_power_of_two(), "softmax_causal_tree: the emulation factor must be a power of two");
+    assert!(bp >= 32, "softmax_causal_tree: the shuffle tail needs 32 lanes");
+    let n_sg = "(BP + SG - 1u) / SG";
+
+    let mut max_accs = String::new();
+    let mut max_body = String::new();
+    let mut sum_accs = String::new();
+    let mut sum_body = String::new();
+    if r == 1 {
+        max_body.push_str("    var lmax = bitcast<f32>(0xFF800000u);\n    for (var j = lid.x; j < valid; j = j + BT) {\n        let v = half_at(unpack2x16float(X[base_x + (j >> 1u)]), j);\n        let sc = v * scale;\n        if (sc > lmax) { lmax = sc; }\n    }\n");
+        sum_body.push_str("    var lsum = 0.0;\n    for (var j = lid.x; j < valid; j = j + BT) {\n        let v = half_at(unpack2x16float(X[base_x + (j >> 1u)]), j);\n        lsum = lsum + exp(v * scale - row_max);\n    }\n");
+    } else {
+        for k in 0..r {
+            max_accs.push_str(&format!("    var m{k} = bitcast<f32>(0xFF800000u);\n"));
+            sum_accs.push_str(&format!("    var s{k} = 0.0;\n"));
+            max_body.push_str(&format!(
+                "        let j{k} = base + lid.x + {}u;\n        if (j{k} < valid) {{\n            let v{k} = half_at(unpack2x16float(X[base_x + (j{k} >> 1u)]), j{k});\n            m{k} = max(m{k}, v{k} * scale);\n        }}\n",
+                k * bp
+            ));
+            sum_body.push_str(&format!(
+                "        let j{k} = base + lid.x + {}u;\n        if (j{k} < valid) {{\n            let v{k} = half_at(unpack2x16float(X[base_x + (j{k} >> 1u)]), j{k});\n            s{k} = s{k} + exp(v{k} * scale - row_max);\n        }}\n",
+                k * bp
+            ));
+        }
+        let fold = |pre: &str, op: &str| -> String {
+            let mut cur: Vec<String> = (0..r).map(|k| format!("{pre}{k}")).collect();
+            while cur.len() > 1 {
+                let half = cur.len() / 2;
+                let mut next = Vec::with_capacity(half);
+                for i in 0..half {
+                    next.push(if op == "max" {
+                        format!("max({}, {})", cur[i], cur[i + half])
+                    } else {
+                        format!("({} + {})", cur[i], cur[i + half])
+                    });
+                }
+                cur = next;
+            }
+            cur.pop().unwrap()
+        };
+        max_body.push_str(&format!(
+            "    }}\n    let lmax = {};\n",
+            fold("m", "max")
+        ));
+        sum_body.push_str(&format!(
+            "    }}\n    let lsum = {};\n",
+            fold("s", "sum")
+        ));
+        // The `for` opening is emitted here so the closing brace above lands
+        // in the right scope; the r==1 path has no fold loop.
+        max_body = format!(
+            "    for (var base = 0u; base < valid; base = base + BT) {{\n{max_body}"
+        );
+        sum_body = format!(
+            "    for (var base = 0u; base < valid; base = base + BT) {{\n{sum_body}"
+        );
+    }
+
+    format!(
+        "struct Cfg {{ n_w: u32, n_x: u32, valid: u32, m: u32, mp: u32, scale: f32, gx: u32, row0: u32, q_off: u32 }};
+
+@group(0) @binding(0) var<storage, read>       X:   array<u32>;
+@group(0) @binding(1) var<storage, read_write> Out: array<u32>;
+@group(0) @binding(2) var<uniform>             cfg: Cfg;
+
+const BP: u32 = {bp}u;
+const BT: u32 = {bt}u;
+
+{HALF_AT}
+var<workgroup> sg_red: array<f32, {bp}>;
+var<workgroup> pub_red: array<f32, 1>;
+
+@compute @workgroup_size({bp})
+fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
+           @builtin(local_invocation_id) lid: vec3<u32>,
+           @builtin(subgroup_invocation_id) sg_lid: u32,
+           @builtin(subgroup_size) sg_size: u32) {{
+    let row = wgid.x + wgid.y * cfg.gx;
+    let head = row / cfg.m;
+    let pos = row % cfg.m;
+    let base_x = (head * cfg.mp + pos) * cfg.n_x;
+    let base_o = (head * cfg.mp + pos) * cfg.n_w;
+    let row_in_head = pos;
+    let valid = min(cfg.valid, max(row_in_head + 1u + cfg.q_off, cfg.row0) - cfg.row0);
+    let scale = cfg.scale;
+
+    if (valid == 0u) {{
+        for (var w = lid.x; w < cfg.n_w; w = w + BP) {{
+            Out[base_o + w] = 0u;
+        }}
+        return;
+    }}
+
+    let SG: u32 = sg_size;
+    let sg_id = lid.x / sg_size;
+{max_accs}{max_body}    let sg_max = subgroupMax(lmax);
+    if (sg_lid == 0u) {{ sg_red[sg_id] = sg_max; }}
+    workgroupBarrier();
+    if (lid.x == 0u) {{
+        var gm = sg_red[0];
+        for (var k = 1u; k < {n_sg}; k = k + 1u) {{ gm = max(gm, sg_red[k]); }}
+        pub_red[0] = gm;
+    }}
+    workgroupBarrier();
+    let row_max = pub_red[0];
+    workgroupBarrier();
+
+{sum_accs}{sum_body}    let sg_sum = subgroupAdd(lsum);
+    if (sg_lid == 0u) {{ sg_red[sg_id] = sg_sum; }}
+    workgroupBarrier();
+    if (lid.x == 0u) {{
+        var gs = 0.0;
+        for (var k = 0u; k < {n_sg}; k = k + 1u) {{ gs = gs + sg_red[k]; }}
+        pub_red[0] = 1.0 / gs;
+    }}
+    workgroupBarrier();
+    let inv_sum = pub_red[0];
+    workgroupBarrier();
+
+    for (var w = lid.x; w < cfg.n_w; w = w + BP) {{
+        let j0 = w * 2u;
+        let j1 = j0 + 1u;
+        var e0 = 0.0;
+        var e1 = 0.0;
+        if (j0 < valid) {{
+            let v0 = half_at(unpack2x16float(X[base_x + w]), j0);
+            e0 = exp(v0 * scale - row_max) * inv_sum;
+        }}
+        if (j1 < valid) {{
+            let v1 = half_at(unpack2x16float(X[base_x + w]), j1);
+            e1 = exp(v1 * scale - row_max) * inv_sum;
+        }}
+        Out[base_o + w] = pack2x16float(vec2<f32>(e0, e1));
+    }}
+}}
+",
+        bp = bp,
+        bt = bt,
+        HALF_AT = HALF_AT,
+        n_sg = n_sg,
+        max_accs = max_accs,
+        max_body = max_body,
+        sum_accs = sum_accs,
+        sum_body = sum_body,
+    )
+}
+
+fn softmax_causal_tree_legacy(bp: usize, bt: usize, subgroup: bool) -> String {
     assert!(bt >= bp && bt % bp == 0, "softmax_causal_tree: bt must be a multiple of bp");
     let r = bt / bp;
     assert!(r.is_power_of_two(), "softmax_causal_tree: the emulation factor must be a power of two");
@@ -3980,7 +4219,14 @@ fn softmax(@builtin(workgroup_id) wgid: vec3<u32>,
 
 /// The shipped flat causal softmax: `bt == bp`, i.e. no lane emulation.
 pub fn softmax_causal(bs: usize, subgroup: bool) -> String {
-    softmax_causal_tree(bs, bs, subgroup)
+    softmax_causal_mode(
+        bs,
+        if subgroup { SubgroupMode::Warp32 } else { SubgroupMode::None },
+    )
+}
+
+pub fn softmax_causal_mode(bs: usize, mode: SubgroupMode) -> String {
+    softmax_causal_tree_mode(bs, bs, mode)
 }
 
 /// Per-*slab* softmax statistics for the tiled prefill attention: one
@@ -4780,3 +5026,185 @@ fn attn_flat(@builtin(global_invocation_id) gid: vec3<u32>) {
 "
     .to_string()
 }
+
+#[cfg(test)]
+mod stage2_subgroup_tests {
+    use super::*;
+
+    fn gemv_cases(mode: SubgroupMode) -> Vec<(&'static str, String)> {
+        vec![
+            ("gemv_split", gemv_split_mode(64, 1024, mode, 2)),
+            ("gemv", gemv_mode(64, 1024, true, mode, 8)),
+            ("gemv_rpwr", gemv_rpwr_mode(64, 1024, true, mode, 8, 2)),
+            ("gemv_w8", gemv_w8_mode(64, 1024, true, mode, 8)),
+            ("gemv_w8_rpwr", gemv_w8_rpwr_mode(64, 1024, true, mode, 8, 2)),
+            ("gemv_norm", gemv_norm_mode(64, 1024, true, mode, 1024, 1024, 1e-5)),
+            ("gemv_norm_w8", gemv_norm_w8_mode(64, 1024, true, mode, 1024, 1024, 1e-5)),
+            ("gemv_batch_slots", gemv_batch_slots_mode(64, 1024, 4, true, mode)),
+            (
+                "gemv_norm_batch_slots",
+                gemv_norm_batch_slots_mode(64, 1024, 4, true, 1024, 1024, 1e-5, mode),
+            ),
+        ]
+    }
+
+    #[test]
+    fn legacy_gemv_wrappers_are_byte_identical() {
+        assert_eq!(gemv_split(64, 1024, true, 2), gemv_split_mode(64, 1024, SubgroupMode::Warp32, 2));
+        assert_eq!(gemv_split(64, 1024, false, 2), gemv_split_mode(64, 1024, SubgroupMode::None, 2));
+        assert_eq!(gemv(64, 1024, true, true, 8), gemv_mode(64, 1024, true, SubgroupMode::Warp32, 8));
+        assert_eq!(gemv(64, 1024, true, false, 8), gemv_mode(64, 1024, true, SubgroupMode::None, 8));
+        assert_eq!(gemv_rpwr(64, 1024, true, true, 8, 2), gemv_rpwr_mode(64, 1024, true, SubgroupMode::Warp32, 8, 2));
+        assert_eq!(gemv_w8(64, 1024, true, true, 8), gemv_w8_mode(64, 1024, true, SubgroupMode::Warp32, 8));
+        assert_eq!(gemv_w8_rpwr(64, 1024, true, false, 8, 2), gemv_w8_rpwr_mode(64, 1024, true, SubgroupMode::None, 8, 2));
+        assert_eq!(
+            gemv_norm(64, 1024, true, true, 1024, 1024, 1e-5),
+            gemv_norm_mode(64, 1024, true, SubgroupMode::Warp32, 1024, 1024, 1e-5)
+        );
+        assert_eq!(
+            gemv_norm_w8(64, 1024, true, false, 1024, 1024, 1e-5),
+            gemv_norm_w8_mode(64, 1024, true, SubgroupMode::None, 1024, 1024, 1e-5)
+        );
+        assert_eq!(
+            gemv_batch_slots(64, 1024, 4, true),
+            gemv_batch_slots_mode(64, 1024, 4, true, SubgroupMode::None)
+        );
+        assert_eq!(
+            gemv_norm_batch_slots(64, 1024, 4, true, 1024, 1024, 1e-5),
+            gemv_norm_batch_slots_mode(64, 1024, 4, true, 1024, 1024, 1e-5, SubgroupMode::None)
+        );
+    }
+
+    #[test]
+    fn legacy_softmax_wrappers_are_byte_identical() {
+        assert_eq!(softmax_causal(256, true), softmax_causal_mode(256, SubgroupMode::Warp32));
+        assert_eq!(softmax_causal(256, false), softmax_causal_mode(256, SubgroupMode::None));
+        assert_eq!(softmax_causal_tree(64, 256, true), softmax_causal_tree_mode(64, 256, SubgroupMode::Warp32));
+        assert_eq!(softmax_causal_tree(64, 256, false), softmax_causal_tree_mode(64, 256, SubgroupMode::None));
+    }
+
+    #[test]
+    fn no_mode_emits_enable_subgroups() {
+        let modes = [
+            SubgroupMode::Warp32,
+            SubgroupMode::Warp64,
+            SubgroupMode::Generic,
+            SubgroupMode::None,
+        ];
+        for mode in modes {
+            for (name, wgsl) in gemv_cases(mode) {
+                assert!(!wgsl.contains("enable subgroups;"), "{name} {mode:?}");
+            }
+            for bs in [32usize, 256] {
+                let sm = softmax_causal_mode(bs, mode);
+                assert!(!sm.contains("enable subgroups;"), "softmax {bs} {mode:?}");
+                let tree = softmax_causal_tree_mode(64, 256, mode);
+                assert!(!tree.contains("enable subgroups;"), "tree {mode:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn warp64_uses_xor_shuffles_for_gemv() {
+        for mode in [SubgroupMode::Warp32, SubgroupMode::Warp64] {
+            for (name, wgsl) in gemv_cases(mode) {
+                assert!(wgsl.contains("subgroupShuffleXor"), "{name} {mode:?}");
+                assert!(!wgsl.contains("var<workgroup> bt0"), "{name} {mode:?}");
+                assert!(!wgsl.contains("@builtin(subgroup_size)"), "{name} {mode:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn generic_uses_subgroup_add_and_sg_red_for_gemv() {
+        for (name, src) in gemv_cases(SubgroupMode::Generic) {
+            assert!(src.contains("subgroupAdd(v)"), "{name}");
+            assert!(src.contains("var<workgroup> sg_red"), "{name}");
+            assert!(src.contains("@builtin(subgroup_size) sg_size"), "{name}");
+            assert!(!src.contains("var<workgroup> bt0"), "{name}");
+        }
+    }
+
+    #[test]
+    fn portable_softmax_uses_subgroup_max_and_add() {
+        for mode in [SubgroupMode::Warp64, SubgroupMode::Generic] {
+            for bs in [32usize, 64, 128, 256, 512, 1024] {
+                let src = softmax_causal_mode(bs, mode);
+                assert!(src.contains("subgroupMax(lmax)"), "bs={bs} {mode:?}");
+                assert!(src.contains("subgroupAdd(lsum)"), "bs={bs} {mode:?}");
+                assert!(src.contains("row_in_head + 1u + cfg.q_off"), "bs={bs}");
+                assert!(src.contains("q_off: u32"), "bs={bs}");
+                assert!(!src.contains("subgroupShuffleXor"), "bs={bs}");
+            }
+            let tree = softmax_causal_tree_mode(64, 256, mode);
+            assert!(tree.contains("subgroupMax(lmax)"));
+            assert!(tree.contains("subgroupAdd(lsum)"));
+        }
+    }
+
+    #[test]
+    fn vulkan_validates_all_stage2_modes() {
+        let gpu = match pollster::block_on(
+            crate::gpu::Gpu::new_with(crate::gpu::DeviceSelector::parse("vulkan").unwrap()),
+        ) {
+            Ok(gpu) => gpu,
+            Err(e) => {
+                eprintln!("skip Vulkan WGSL validation test: {e}");
+                return;
+            }
+        };
+        if !gpu.has_subgroups() {
+            eprintln!("skip Vulkan WGSL validation test: adapter lacks SUBGROUP");
+            return;
+        }
+        let modes = [
+            SubgroupMode::Warp32,
+            SubgroupMode::Warp64,
+            SubgroupMode::Generic,
+            SubgroupMode::None,
+        ];
+        for (i, mode) in modes.iter().enumerate() {
+            let label = |name: &str| format!("stage2_{i}_{name}");
+            let jobs: Vec<(&str, String, &str)> = vec![
+                ("gemv", gemv_mode(64, 1024, true, *mode, 8), "gemv"),
+                ("gemv_w8", gemv_w8_mode(64, 1024, true, *mode, 8), "gemv"),
+                ("gemv_split", gemv_split_mode(64, 1024, *mode, 2), "gemv"),
+                ("gemv_norm", gemv_norm_mode(64, 1024, true, *mode, 1024, 1024, 1e-5), "gemv"),
+                ("gemv_norm_w8", gemv_norm_w8_mode(64, 1024, true, *mode, 1024, 1024, 1e-5), "gemv"),
+            ];
+            for (name, src, entry) in jobs {
+                gpu.pipeline(&label(name), &src, entry, None)
+                    .unwrap_or_else(|e| panic!("{name} {mode:?} failed: {e}"));
+            }
+            if gpu.supports_binding_array() {
+                let batch = [
+                    (
+                        "gemv_batch_slots",
+                        gemv_batch_slots_mode(64, 1024, 4, true, *mode),
+                        "gemv_batch_slots",
+                    ),
+                    (
+                        "gemv_norm_batch_slots",
+                        gemv_norm_batch_slots_mode(64, 1024, 4, true, 1024, 1024, 1e-5, *mode),
+                        "gemv_norm_batch_slots",
+                    ),
+                ];
+                for (name, src, entry) in batch {
+                    gpu.pipeline(&label(name), &src, entry, None)
+                        .unwrap_or_else(|e| panic!("{name} {mode:?} failed: {e}"));
+                }
+            }
+            for bs in [32usize, 64, 128, 256, 512, 1024] {
+                let src = softmax_causal_mode(bs, *mode);
+                gpu.pipeline(&label(&format!("softmax{bs}")), &src, "softmax", None)
+                    .unwrap_or_else(|e| panic!("softmax bs={bs} {mode:?} failed: {e}"));
+            }
+            for (bp, bt) in [(64usize, 256usize), (128, 512), (256, 1024)] {
+                let src = softmax_causal_tree_mode(bp, bt, *mode);
+                gpu.pipeline(&label(&format!("tree{bp}x{bt}")), &src, "softmax", None)
+                    .unwrap_or_else(|e| panic!("tree {bp}x{bt} {mode:?} failed: {e}"));
+            }
+        }
+    }
+}
+

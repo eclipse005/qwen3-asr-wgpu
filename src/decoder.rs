@@ -7,6 +7,7 @@ use safetensors::Dtype;
 
 use crate::gpu::{BulkUpload, Gpu, PipeJob};
 use crate::shaders;
+use crate::shaders::SubgroupMode;
 use crate::weights::{self, PackedWeight};
 
 /// Rows per workgroup for the plain-[`shaders::gemv`] pipelines.
@@ -1048,6 +1049,8 @@ impl WgpuTextDecoder {
 
         let rms_bs = block_for_reduction(hs) as usize;
         let subgroup = gpu.subgroup32();
+        let sg_mode = gpu.subgroup_mode();
+        let sm_mode = if sg_reduce() { sg_mode } else { SubgroupMode::None };
         // The three `slab_*` layouts are named here rather than inline in the
         // batch below: a job outlives the expression that made it.
         let slab_stats_pl =
@@ -1058,59 +1061,59 @@ impl WgpuTextDecoder {
         // One list, built on every core (see [`Gpu::pipelines`]): on DX12 this
         // stage is the driver compiling 48 pipelines and it dominates the load.
         let jobs = [
-            PipeJob::new("gemv_qkv", shaders::gemv(cfg.fused_qkv_cols(), hs, false, subgroup, gemv_rpw()), "gemv", None),
-            PipeJob::new("gemv_o", shaders::gemv(hs, q_dim, true, subgroup, gemv_rpw()), "gemv", None),
-            PipeJob::new("gemv_o_rpwr2", shaders::gemv_rpwr(hs, q_dim, true, subgroup, gemv_rpw(), 2), "gemv", None),
-            PipeJob::new("gemv_gu", shaders::gemv(2 * inter, hs, false, subgroup, gemv_rpw()), "gemv", None),
-            PipeJob::new("gemv_dp", shaders::gemv(hs, inter, true, subgroup, gemv_rpw()), "gemv", None),
-            PipeJob::new("gemv_dp_rpwr2", shaders::gemv_rpwr(hs, inter, true, subgroup, gemv_rpw(), 2), "gemv", None),
-            PipeJob::new("gemv_lm", shaders::gemv(vocab, hs, false, subgroup, gemv_rpw()), "gemv", None),
+            PipeJob::new("gemv_qkv", shaders::gemv_mode(cfg.fused_qkv_cols(), hs, false, sg_mode, gemv_rpw()), "gemv", None),
+            PipeJob::new("gemv_o", shaders::gemv_mode(hs, q_dim, true, sg_mode, gemv_rpw()), "gemv", None),
+            PipeJob::new("gemv_o_rpwr2", shaders::gemv_rpwr_mode(hs, q_dim, true, sg_mode, gemv_rpw(), 2), "gemv", None),
+            PipeJob::new("gemv_gu", shaders::gemv_mode(2 * inter, hs, false, sg_mode, gemv_rpw()), "gemv", None),
+            PipeJob::new("gemv_dp", shaders::gemv_mode(hs, inter, true, sg_mode, gemv_rpw()), "gemv", None),
+            PipeJob::new("gemv_dp_rpwr2", shaders::gemv_rpwr_mode(hs, inter, true, sg_mode, gemv_rpw(), 2), "gemv", None),
+            PipeJob::new("gemv_lm", shaders::gemv_mode(vocab, hs, false, sg_mode, gemv_rpw()), "gemv", None),
             PipeJob::new(
                 "gemv_qkv_norm",
-                shaders::gemv_norm(cfg.fused_qkv_cols(), hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
+                shaders::gemv_norm_mode(cfg.fused_qkv_cols(), hs, false, sg_mode, hs, rms_bs, cfg.rms_norm_eps),
                 "gemv",
                 None,
             ),
             PipeJob::new(
                 "gemv_gu_norm",
-                shaders::gemv_norm(2 * inter, hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
+                shaders::gemv_norm_mode(2 * inter, hs, false, sg_mode, hs, rms_bs, cfg.rms_norm_eps),
                 "gemv",
                 None,
             ),
             PipeJob::new(
                 "gemv_lm_norm",
-                shaders::gemv_norm(vocab, hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
+                shaders::gemv_norm_mode(vocab, hs, false, sg_mode, hs, rms_bs, cfg.rms_norm_eps),
                 "gemv",
                 None,
             ),
-            PipeJob::new("gemv_w8_o", shaders::gemv_w8(hs, q_dim, true, subgroup, gemv_rpw()), "gemv", None),
+            PipeJob::new("gemv_w8_o", shaders::gemv_w8_mode(hs, q_dim, true, sg_mode, gemv_rpw()), "gemv", None),
             PipeJob::new(
                 "gemv_w8_o_rpwr2",
-                shaders::gemv_w8_rpwr(hs, q_dim, true, subgroup, gemv_rpw(), 2),
+                shaders::gemv_w8_rpwr_mode(hs, q_dim, true, sg_mode, gemv_rpw(), 2),
                 "gemv",
                 None,
             ),
-            PipeJob::new("gemv_w8_dp", shaders::gemv_w8(hs, inter, true, subgroup, gemv_rpw()), "gemv", None),
+            PipeJob::new("gemv_w8_dp", shaders::gemv_w8_mode(hs, inter, true, sg_mode, gemv_rpw()), "gemv", None),
             PipeJob::new(
                 "gemv_w8_dp_rpwr2",
-                shaders::gemv_w8_rpwr(hs, inter, true, subgroup, gemv_rpw(), 2),
+                shaders::gemv_w8_rpwr_mode(hs, inter, true, sg_mode, gemv_rpw(), 2),
                 "gemv",
                 None,
             ),
             // The plain (norm-not-folded) qkv/gu forms exist only so the
             // per-op debug probes keep their exact f16 shape on an int8 model;
             // the shipped decode loop uses the `_norm` fused forms above.
-            PipeJob::new("gemv_w8_qkv", shaders::gemv_w8(cfg.fused_qkv_cols(), hs, false, subgroup, gemv_rpw()), "gemv", None),
-            PipeJob::new("gemv_w8_gu", shaders::gemv_w8(2 * inter, hs, false, subgroup, gemv_rpw()), "gemv", None),
+            PipeJob::new("gemv_w8_qkv", shaders::gemv_w8_mode(cfg.fused_qkv_cols(), hs, false, sg_mode, gemv_rpw()), "gemv", None),
+            PipeJob::new("gemv_w8_gu", shaders::gemv_w8_mode(2 * inter, hs, false, sg_mode, gemv_rpw()), "gemv", None),
             PipeJob::new(
                 "gemv_w8_qkv_norm",
-                shaders::gemv_norm_w8(cfg.fused_qkv_cols(), hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
+                shaders::gemv_norm_w8_mode(cfg.fused_qkv_cols(), hs, false, sg_mode, hs, rms_bs, cfg.rms_norm_eps),
                 "gemv",
                 None,
             ),
             PipeJob::new(
                 "gemv_w8_gu_norm",
-                shaders::gemv_norm_w8(2 * inter, hs, false, subgroup, hs, rms_bs as usize, cfg.rms_norm_eps),
+                shaders::gemv_norm_w8_mode(2 * inter, hs, false, sg_mode, hs, rms_bs, cfg.rms_norm_eps),
                 "gemv",
                 None,
             ),
@@ -1136,20 +1139,20 @@ impl WgpuTextDecoder {
             PipeJob::new("gemm_av", shaders::prefill_gemm(true, false), "gemm", Some(&gemm_pl)),
             PipeJob::new("gemm_causal", shaders::prefill_gemm_causal(), "gemm", Some(&gemm_pl)),
             PipeJob::new("gemm_av_causal", shaders::prefill_gemm_causal_av(), "gemm", Some(&gemm_pl)),
-            PipeJob::new("softmax32", shaders::softmax_causal(32, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
-            PipeJob::new("softmax64", shaders::softmax_causal(64, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
-            PipeJob::new("softmax128", shaders::softmax_causal(128, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
-            PipeJob::new("softmax256", shaders::softmax_causal(256, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
-            PipeJob::new("softmax512", shaders::softmax_causal(512, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
-            PipeJob::new("softmax1024", shaders::softmax_causal(1024, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
-            PipeJob::new("softmax64x256", shaders::softmax_causal_tree(64, 256, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
-            PipeJob::new("softmax64x512", shaders::softmax_causal_tree(64, 512, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
-            PipeJob::new("softmax64x1024", shaders::softmax_causal_tree(64, 1024, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
-            PipeJob::new("softmax128x256", shaders::softmax_causal_tree(128, 256, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
-            PipeJob::new("softmax128x512", shaders::softmax_causal_tree(128, 512, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
-            PipeJob::new("softmax128x1024", shaders::softmax_causal_tree(128, 1024, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
-            PipeJob::new("softmax256x512", shaders::softmax_causal_tree(256, 512, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
-            PipeJob::new("softmax256x1024", shaders::softmax_causal_tree(256, 1024, subgroup && sg_reduce()), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax32", shaders::softmax_causal_mode(32, sm_mode), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax64", shaders::softmax_causal_mode(64, sm_mode), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax128", shaders::softmax_causal_mode(128, sm_mode), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax256", shaders::softmax_causal_mode(256, sm_mode), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax512", shaders::softmax_causal_mode(512, sm_mode), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax1024", shaders::softmax_causal_mode(1024, sm_mode), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax64x256", shaders::softmax_causal_tree_mode(64, 256, sm_mode), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax64x512", shaders::softmax_causal_tree_mode(64, 512, sm_mode), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax64x1024", shaders::softmax_causal_tree_mode(64, 1024, sm_mode), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax128x256", shaders::softmax_causal_tree_mode(128, 256, sm_mode), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax128x512", shaders::softmax_causal_tree_mode(128, 512, sm_mode), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax128x1024", shaders::softmax_causal_tree_mode(128, 1024, sm_mode), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax256x512", shaders::softmax_causal_tree_mode(256, 512, sm_mode), "softmax", Some(&sm_pl)),
+            PipeJob::new("softmax256x1024", shaders::softmax_causal_tree_mode(256, 1024, sm_mode), "softmax", Some(&sm_pl)),
             PipeJob::new("repeat_kv", shaders::repeat_kv(nqh / nkvh), "repeat_kv", Some(&rk_pl)),
             PipeJob::new("slab_stats", shaders::slab_stats(SLAB_BS, SLAB_T), "slab_stats", Some(&slab_stats_pl)),
             PipeJob::new("slab_weights", shaders::slab_weights(256), "slab_weights", Some(&slab_weights_pl)),
@@ -3018,6 +3021,19 @@ fn bind_array<'a>(buffers: &[&'a wgpu::Buffer]) -> Vec<wgpu::BufferBinding<'a>> 
         .collect()
 }
 
+fn batch_subgroup_mode(gpu: &Gpu) -> SubgroupMode {
+    match std::env::var("QASR_BATCH_SUBGROUP")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("0" | "off" | "no" | "false") => SubgroupMode::None,
+        _ => gpu.subgroup_mode(),
+    }
+}
+
 impl BatchProjections {
     /// Build the batched dispatches for `slots`.
     ///
@@ -3032,6 +3048,7 @@ impl BatchProjections {
         );
         let base = &slots[0];
         let gpu = &base.gpu;
+        let sg_mode = batch_subgroup_mode(gpu);
         anyhow::ensure!(
             gpu.supports_binding_array(),
             "BatchProjections requires wgpu_binding_array support"
@@ -3056,31 +3073,31 @@ impl BatchProjections {
         );
         let o = gpu.pipeline(
             "batch_o",
-            &shaders::gemv_batch_slots(hs, q_dim, batch, true),
+            &shaders::gemv_batch_slots_mode(hs, q_dim, batch, true, sg_mode),
             "gemv_batch_slots",
             Some(&gemv_pl),
         )?;
         let qkv = gpu.pipeline(
             "batch_qkv",
-            &shaders::gemv_batch_slots(cfg.fused_qkv_cols(), hs, batch, false),
+            &shaders::gemv_batch_slots_mode(cfg.fused_qkv_cols(), hs, batch, false, sg_mode),
             "gemv_batch_slots",
             Some(&gemv_pl),
         )?;
         let gu = gpu.pipeline(
             "batch_gu",
-            &shaders::gemv_batch_slots(2 * inter, hs, batch, false),
+            &shaders::gemv_batch_slots_mode(2 * inter, hs, batch, false, sg_mode),
             "gemv_batch_slots",
             Some(&gemv_pl),
         )?;
         let lm = gpu.pipeline(
             "batch_lm",
-            &shaders::gemv_batch_slots(vocab, hs, batch, false),
+            &shaders::gemv_batch_slots_mode(vocab, hs, batch, false, sg_mode),
             "gemv_batch_slots",
             Some(&gemv_pl),
         )?;
         let dp = gpu.pipeline(
             "batch_dp",
-            &shaders::gemv_batch_slots(hs, inter, batch, true),
+            &shaders::gemv_batch_slots_mode(hs, inter, batch, true, sg_mode),
             "gemv_batch_slots",
             Some(&gemv_pl),
         )?;
