@@ -1047,9 +1047,7 @@ impl WgpuTextDecoder {
         let rk_pl = family_layout(&gpu, "repeat_kv", &[(0, true), (1, false)], 2);
 
         let rms_bs = block_for_reduction(hs) as usize;
-        let subgroup = gpu.features.contains(wgpu::Features::SUBGROUP)
-            && gpu.info.subgroup_min_size == 32
-            && gpu.info.subgroup_max_size == 32;
+        let subgroup = gpu.subgroup32();
         // The three `slab_*` layouts are named here rather than inline in the
         // batch below: a job outlives the expression that made it.
         let slab_stats_pl =
@@ -1868,8 +1866,8 @@ impl WgpuTextDecoder {
             }
             if want(LayerBlock::Gqa) && d("gqa") {
                 if want(LayerBlock::Gqa) && !k("gqa") {
-                self.encode_gqa(cp, l, cur_len);
-            }
+                    self.encode_gqa(cp, l, cur_len);
+                }
             }
 
             let rpwr = gemv_rpwr_o_dp(cfg.hidden_size);
@@ -3034,6 +3032,10 @@ impl BatchProjections {
         );
         let base = &slots[0];
         let gpu = &base.gpu;
+        anyhow::ensure!(
+            gpu.supports_binding_array(),
+            "BatchProjections requires wgpu_binding_array support"
+        );
         let cfg = &base.cfg;
         let hs = cfg.hidden_size;
         let q_dim = cfg.q_dim();
@@ -3382,7 +3384,7 @@ impl BatchProjections {
             "batch_silu_cfg",
         );
 
-        Ok(Self {
+        let out = Self {
             g_qkv: (cfg.fused_qkv_cols() / 8) as u32,
             g_o: (hs / 8) as u32,
             g_gu: (2 * inter / 8) as u32,
@@ -3414,7 +3416,11 @@ impl BatchProjections {
             gqa256,
             gqa512,
             batch,
-        })
+        };
+        if let Err(e) = gpu.save_pipeline_cache() {
+            eprintln!("[pipeline cache] save skipped: {e:#}");
+        }
+        Ok(out)
     }
 
     /// One step for every slot: five weight streams once, everything else per

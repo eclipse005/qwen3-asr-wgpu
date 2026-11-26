@@ -6,7 +6,12 @@ pub struct Gpu {
     pub queue: wgpu::Queue,
     pub info: wgpu::AdapterInfo,
     pub limits: wgpu::Limits,
+    /// Features actually enabled on the device (a subset of the adapter's).
     pub features: wgpu::Features,
+    /// Compiled-pipeline cache, when the adapter supports and offers it.
+    pub pipeline_cache: Option<wgpu::PipelineCache>,
+    /// Where that cache is persisted.
+    pub pipeline_cache_path: Option<std::path::PathBuf>,
 }
 
 /// A handle clone, not a second device: `wgpu::Device`/`Queue` are `Arc` inside,
@@ -20,6 +25,8 @@ impl Clone for Gpu {
             info: self.info.clone(),
             limits: self.limits.clone(),
             features: self.features,
+            pipeline_cache: self.pipeline_cache.clone(),
+            pipeline_cache_path: self.pipeline_cache_path.clone(),
         }
     }
 }
@@ -493,7 +500,9 @@ impl Gpu {
                             | wgpu::Features::SUBGROUP
                             | wgpu::Features::BUFFER_BINDING_ARRAY
                             | wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY
-                            | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING),
+                            | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
+                            | wgpu::Features::SHADER_F16
+                            | wgpu::Features::PIPELINE_CACHE),
                     required_limits: limits.clone(),
                     ..Default::default()
                 })
@@ -515,7 +524,7 @@ impl Gpu {
             }
         }
         crate::load_trace::note("gpu: request_device", t);
-        let Some((info, features, limits, device, queue)) = opened else {
+        let Some((info, _adapter_features, limits, device, queue)) = opened else {
             return Err(skipped.context("request_device")?);
         };
 
@@ -523,13 +532,115 @@ impl Gpu {
             eprintln!("[wgpu uncaptured error] {e}");
         }));
 
+        // Only use the features the device actually granted.  `fallback: true`
+        // makes a stale or foreign cache blob a miss rather than a failure.
+        let enabled_features = device.features();
+        let (pipeline_cache, pipeline_cache_path) =
+            match pipeline_cache_path(&info).filter(|_| enabled_features.contains(wgpu::Features::PIPELINE_CACHE)) {
+                Some(path) => {
+                    let seed = std::fs::read(&path).ok();
+                    // SAFETY: the blob is driver-produced opaque data from our
+                    // own adapter-keyed cache.  `fallback: true` means an old
+                    // or incompatible blob is ignored, not trusted as-is.
+                    let cache = unsafe {
+                        device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                            label: Some("pipeline_cache"),
+                            data: seed.as_deref(),
+                            fallback: true,
+                        })
+                    };
+                    (Some(cache), Some(path))
+                }
+                None => (None, None),
+            };
+
         Ok(Self {
             device,
             queue,
             info,
             limits,
-            features,
+            features: enabled_features,
+            pipeline_cache,
+            pipeline_cache_path,
         })
+    }
+
+    /// Persist compiled pipelines so the next process starts warm.
+    ///
+    /// Silent on success: only `QASR_LOAD_TRACE=1` prints the timing.  Callers
+    /// treat an error as best-effort and continue.
+    pub fn save_pipeline_cache(&self) -> Result<()> {
+        let t = std::time::Instant::now();
+        let result = (|| {
+            let (Some(cache), Some(path)) = (&self.pipeline_cache, &self.pipeline_cache_path) else {
+                return Ok(());
+            };
+            let Some(data) = cache.get_data() else { return Ok(()) };
+            if data.is_empty() || std::fs::read(path).ok().as_deref() == Some(data.as_slice()) {
+                return Ok(());
+            }
+            let file_name = path.file_name().context("pipeline cache path has no file name")?;
+            let dir = path.parent().context("pipeline cache path has no parent")?;
+            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+            let mut tmp = path.clone();
+            let name = format!(
+                "{}.tmp-{}-{:?}",
+                file_name.to_string_lossy(),
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            );
+            tmp.set_file_name(name);
+            std::fs::write(&tmp, &data).with_context(|| format!("write {}", tmp.display()))?;
+            if std::fs::rename(&tmp, path).is_err() {
+                // Windows rename cannot replace an existing file; a direct
+                // write is still better than losing the cache.
+                std::fs::write(path, &data).with_context(|| format!("write {}", path.display()))?;
+                let _ = std::fs::remove_file(&tmp);
+            }
+            Ok(())
+        })();
+        crate::load_trace::note("gpu: save_pipeline_cache", t);
+        result
+    }
+
+    /// Whether the device supports native f16 arithmetic in shaders.
+    pub fn has_f16(&self) -> bool {
+        self.features.contains(wgpu::Features::SHADER_F16)
+    }
+
+    /// Whether the device supports WGSL subgroup builtins.
+    pub fn has_subgroups(&self) -> bool {
+        self.features.contains(wgpu::Features::SUBGROUP)
+    }
+
+    /// Whether the shipped 32-lane XOR-butterfly reductions are valid.
+    pub fn subgroup32(&self) -> bool {
+        self.has_subgroups()
+            && self.info.subgroup_min_size == 32
+            && self.info.subgroup_max_size == 32
+    }
+
+    /// Which subgroup reduction shape this device can use.
+    pub fn subgroup_mode(&self) -> crate::shaders::SubgroupMode {
+        subgroup_mode(self.has_subgroups(), self.info.subgroup_min_size, self.info.subgroup_max_size)
+    }
+
+    /// Whether to build native-f16 GEMMs.  `QASR_F16_KERNEL=0` disables them.
+    pub fn use_f16_kernel(&self) -> bool {
+        f16_kernel_enabled(self.has_f16(), std::env::var("QASR_F16_KERNEL").ok())
+    }
+
+    /// Whether the device can run the binding-array batch decode kernels.
+    /// `QASR_BINDING_ARRAY=0` disables them for A/B testing.
+    pub fn supports_binding_array(&self) -> bool {
+        binding_array_supported(
+            self.features,
+            self.limits.max_binding_array_elements_per_shader_stage,
+            std::env::var("QASR_BINDING_ARRAY").ok(),
+        )
     }
 
     /// One-line description for logs and reports.
@@ -683,10 +794,11 @@ impl Gpu {
         entry: &str,
         layout: Option<&wgpu::PipelineLayout>,
     ) -> Result<wgpu::ComputePipeline> {
+        let source = assemble_wgsl("", wgsl);
         let guard = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(label),
-            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
         });
         let pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(label),
@@ -694,7 +806,7 @@ impl Gpu {
             module: &module,
             entry_point: Some(entry),
             compilation_options: Default::default(),
-            cache: None,
+            cache: self.pipeline_cache.as_ref(),
         });
         let err = pollster::block_on(guard.pop());
         if let Some(e) = err {
@@ -756,6 +868,106 @@ impl Gpu {
         }
         Ok(out)
     }
+}
+
+/// Where the pipeline cache for this adapter lives: one file per
+/// (vendor, device, backend, driver) under the user's cache directory.
+fn pipeline_cache_path(info: &wgpu::AdapterInfo) -> Option<std::path::PathBuf> {
+    let root = std::env::var_os("QASR_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from))
+        .or_else(|| std::env::var_os("XDG_CACHE_HOME").map(std::path::PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        .or_else(|| Some(std::env::temp_dir()))?;
+    let field = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+                    || c.is_whitespace()
+                {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .collect()
+    };
+    let key = format!(
+        "{:04x}-{:04x}-{:?}-{}-{}",
+        info.vendor,
+        info.device,
+        info.backend,
+        field(&info.driver),
+        field(&info.driver_info)
+    );
+    Some(root.join("qwen3-asr-wgpu").join(format!("{key}.pipeline_cache")))
+}
+
+/// Classify subgroup width without touching a GPU.
+fn subgroup_mode(has_subgroups: bool, min: u32, max: u32) -> crate::shaders::SubgroupMode {
+    use crate::shaders::SubgroupMode;
+    if !has_subgroups {
+        SubgroupMode::None
+    } else if min == 32 && max == 32 {
+        SubgroupMode::Warp32
+    } else if min >= 32 && min % 32 == 0 && max >= min && max % 32 == 0 {
+        SubgroupMode::Warp64
+    } else {
+        SubgroupMode::Generic
+    }
+}
+
+/// Whether the f16 kernels are enabled, for a capability value and env override.
+fn f16_kernel_enabled(has_f16: bool, override_value: Option<String>) -> bool {
+    match override_value
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("0" | "off" | "no" | "false") => false,
+        _ => has_f16,
+    }
+}
+
+/// Whether binding-array batch decode is usable, for pure capability values.
+fn binding_array_supported(
+    features: wgpu::Features,
+    max_elements: u32,
+    override_value: Option<String>,
+) -> bool {
+    if let Some("0" | "off" | "no" | "false") = override_value
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref() { return false }
+    features.contains(
+        wgpu::Features::BUFFER_BINDING_ARRAY
+            | wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY
+            | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING,
+    ) && max_elements >= crate::decoder::MAX_BATCH as u32
+}
+
+/// Put WGSL `enable` directives ahead of the prelude.
+///
+/// WGSL requires module-scope `enable` directives before declarations; a
+/// shader generator may emit them at the top of its own source while a prelude
+/// begins with a function definition.
+pub(crate) fn assemble_wgsl(prelude: &str, wgsl: &str) -> String {
+    let mut rest = wgsl;
+    let mut enables = String::new();
+    loop {
+        let trim = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+        if !trim.starts_with("enable ") {
+            break;
+        }
+        let Some(end) = trim.find(';') else { break };
+        let (directive, tail) = trim.split_at(end + 1);
+        enables.push_str(directive.trim());
+        enables.push('\n');
+        rest = tail;
+    }
+    format!("{enables}{prelude}{rest}")
 }
 
 /// One compute pipeline for [`Gpu::pipelines`].
@@ -897,6 +1109,103 @@ impl<'a> BulkUpload<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shaders::SubgroupMode;
+
+    fn binding_features() -> wgpu::Features {
+        wgpu::Features::BUFFER_BINDING_ARRAY
+            | wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY
+            | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
+    }
+
+    #[test]
+    fn assemble_wgsl_hoists_single_enable_above_prelude() {
+        let out = assemble_wgsl("fn prelude() {}\n", "enable f16;\nfn main() {}\n");
+        assert_eq!(out, "enable f16;\nfn prelude() {}\n\nfn main() {}\n");
+    }
+
+    #[test]
+    fn assemble_wgsl_hoists_multiple_enables_above_prelude() {
+        let out = assemble_wgsl(
+            "fn prelude() {}\n",
+            "\n  enable f16;\n enable wgpu_binding_array;\n\nfn main() {}\n",
+        );
+        assert_eq!(
+            out,
+            "enable f16;\nenable wgpu_binding_array;\nfn prelude() {}\n\n\nfn main() {}\n"
+        );
+    }
+
+    #[test]
+    fn assemble_wgsl_leaves_plain_wgsl_unchanged() {
+        let out = assemble_wgsl("fn prelude() {}\n", "fn main() {}\n");
+        assert_eq!(out, "fn prelude() {}\nfn main() {}\n");
+    }
+
+    #[test]
+    fn assemble_wgsl_works_with_empty_prelude() {
+        let out = assemble_wgsl("", "enable f16;\nfn main() {}\n");
+        assert_eq!(out, "enable f16;\n\nfn main() {}\n");
+    }
+
+    #[test]
+    fn subgroup_mode_classifies_widths() {
+        assert_eq!(subgroup_mode(false, 8, 16), SubgroupMode::None);
+        assert_eq!(subgroup_mode(true, 32, 32), SubgroupMode::Warp32);
+        assert_eq!(subgroup_mode(true, 64, 64), SubgroupMode::Warp64);
+        assert_eq!(subgroup_mode(true, 32, 64), SubgroupMode::Warp64);
+        assert_eq!(subgroup_mode(true, 8, 16), SubgroupMode::Generic);
+        assert_eq!(subgroup_mode(true, 16, 32), SubgroupMode::Generic);
+        assert_eq!(subgroup_mode(true, 8, 32), SubgroupMode::Generic);
+    }
+
+    #[test]
+    fn supports_binding_array_requires_all_features_and_limit() {
+        let n = crate::decoder::MAX_BATCH as u32;
+        assert!(!binding_array_supported(
+            wgpu::Features::empty(),
+            n,
+            None
+        ));
+        assert!(!binding_array_supported(
+            wgpu::Features::BUFFER_BINDING_ARRAY
+                | wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY,
+            n,
+            None
+        ));
+        assert!(!binding_array_supported(
+            binding_features() - wgpu::Features::BUFFER_BINDING_ARRAY,
+            n,
+            None
+        ));
+        assert!(!binding_array_supported(
+            binding_features() - wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY,
+            n,
+            None
+        ));
+        assert!(!binding_array_supported(
+            binding_features()
+                - wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING,
+            n,
+            None
+        ));
+        assert!(!binding_array_supported(binding_features(), n - 1, None));
+        assert!(binding_array_supported(binding_features(), n, None));
+        assert!(!binding_array_supported(
+            binding_features(),
+            n,
+            Some(" 0 ".to_string())
+        ));
+    }
+
+    #[test]
+    fn use_f16_kernel_respects_capability_and_override() {
+        assert!(!f16_kernel_enabled(false, None));
+        assert!(f16_kernel_enabled(true, None));
+        assert!(!f16_kernel_enabled(true, Some("0".to_string())));
+        assert!(!f16_kernel_enabled(true, Some(" OFF ".to_string())));
+        assert!(f16_kernel_enabled(true, Some("1".to_string())));
+        assert!(!f16_kernel_enabled(false, Some("1".to_string())));
+    }
 
     #[test]
     fn auto_orders_discrete_before_integrated() {

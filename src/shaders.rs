@@ -1,5 +1,23 @@
 #![allow(dead_code)]
 
+/// Which subgroup (warp) shape the adapter exposes.
+///
+/// Stage 1 only classifies the device; the shipped 32-lane shuffles stay
+/// unchanged. Future kernels can select a reduction path from this value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubgroupMode {
+    /// Exactly 32 lanes: the existing XOR-butterfly shuffles are valid.
+    Warp32,
+    /// Subgroups are a multiple of 32 (64..=64 or RDNA's 32..=64): a
+    /// portable subgroup reduction covering more than one warp.
+    Warp64,
+    /// Subgroups exist but in some other width range: use portable
+    /// subgroup builtins rather than 32-lane XOR shuffles.
+    Generic,
+    /// No subgroup feature: fall back to the shared-memory tree.
+    None,
+}
+
 pub const LOG2_E: f32 = std::f32::consts::LOG2_E;
 
 const HALF_AT: &str = "\

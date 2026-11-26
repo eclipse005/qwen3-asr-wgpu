@@ -1053,6 +1053,11 @@ impl Inner {
         };
         crate::load_trace::note("text decoder (incl. pipelines)", t);
         crate::load_trace::transfer::note("text decoder: transfer");
+        if let TextBackend::Gpu(d) = &decoder {
+            if let Err(e) = d.gpu.save_pipeline_cache() {
+                eprintln!("[pipeline cache] save skipped: {e:#}");
+            }
+        }
         let t = Instant::now();
         let text = &config.thinker_config.text_config;
         let (cos, sin) = compute_mrope_cos_sin(
@@ -2194,24 +2199,52 @@ impl Inner {
         if active.iter().any(Option::is_some) {
             // Built once for the whole run: the slots keep their buffers for the
             // entire job, so their bind groups stay valid across admissions.
-            let proj = match BatchProjections::new(&slots) {
-                Ok(p) => p,
-                Err(e) => {
-                    t.decode += t0.elapsed();
-                    return Attempt::Failed(e);
+            let can_batch_decode = slots.len() >= 2 && slots[0].gpu.supports_binding_array();
+            let proj = if can_batch_decode {
+                match BatchProjections::new(&slots) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        t.decode += t0.elapsed();
+                        return Attempt::Failed(e);
+                    }
                 }
+            } else {
+                if slots.len() >= 2 {
+                    eprintln!(
+                        "[batch] wgpu_binding_array unavailable (or QASR_BINDING_ARRAY=0); \
+                         falling back to per-slot decode step (encode/prefill batching stays active)"
+                    );
+                }
+                None
             };
             loop {
                 if ev.should_stop() {
                     t.decode += t0.elapsed();
                     return Attempt::Stopped;
                 }
-                let toks = match proj.step(&mut slots) {
-                    Ok(toks) => toks,
-                    Err(e) => {
-                        t.decode += t0.elapsed();
-                        return Attempt::Failed(e);
+                let toks: Vec<i32> = if let Some(proj) = &proj {
+                    match proj.step(&mut slots) {
+                        Ok(toks) => toks,
+                        Err(e) => {
+                            t.decode += t0.elapsed();
+                            return Attempt::Failed(e);
+                        }
                     }
+                } else {
+                    let mut toks = vec![0i32; nslots];
+                    for s in 0..nslots {
+                        if active[s].is_none() {
+                            continue;
+                        }
+                        match slots[s].step() {
+                            Ok(tok) => toks[s] = tok,
+                            Err(e) => {
+                                t.decode += t0.elapsed();
+                                return Attempt::Failed(e);
+                            }
+                        }
+                    }
+                    toks
                 };
                 for s in 0..nslots {
                     let Some(seg) = active[s] else { continue };
