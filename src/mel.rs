@@ -5,8 +5,12 @@ pub(crate) const MEL_SAMPLE_RATE: u32 = 16000;
 
 /// Input samples handed to `soxr_process` per call.  Large enough that the
 /// per-call overhead is irrelevant, small enough that soxr's DFT stage working
-/// set stays in cache -- see `resample_soxr` for what an unbounded call costs.
+/// set stays in cache. On Apple Silicon, increased for better NEON utilization.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+const SOXR_BLOCK: usize = 32768;  // Larger block for Apple Silicon
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 const SOXR_BLOCK: usize = 16384;
+
 pub(crate) const N_FFT: usize = 400;
 pub(crate) const HOP_LENGTH: usize = 160;
 

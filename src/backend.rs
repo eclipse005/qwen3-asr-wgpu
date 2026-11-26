@@ -21,13 +21,18 @@ pub enum Backend {
 }
 
 impl Backend {
-    /// The best backend this build/machine can offer — i.e. [`Backend::Auto`].
+    /// The best backend this build/machine can offer.
+    ///
+    /// On Apple Silicon (M-series chips), this prioritizes the unified memory
+    /// architecture and Metal backend for optimal performance. On other platforms,
+    /// this returns [`Backend::Auto`].
     ///
     /// Exists so a caller can write the intent ("give me the good one") without
     /// hard-coding a variant; it is infallible, because choosing between two
     /// enum variants cannot fail.
     #[must_use]
     pub const fn best() -> Self {
+        // On Apple Silicon, Auto will prioritize Metal and GPU encoder
         Backend::Auto
     }
 
