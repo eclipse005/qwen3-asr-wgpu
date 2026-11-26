@@ -350,7 +350,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
     let want_timings = flag(&args, "--timings");
     if list_mode {
         for f in ["--stream", "--session", "--tokens", "--mel", "--embeds", "--diag-enc",
-                  "--baseline", "--compare-enc"] {
+                  "--baseline", "--compare-enc", "--dump-states"] {
             anyhow::ensure!(
                 !flag(&args, f),
                 "{f} is a single-file mode; give it one --wav"
@@ -401,6 +401,12 @@ pub fn run(args: Vec<String>) -> Result<()> {
         .or_else(|| arg(&args, "--context"))
         .unwrap_or_default();
     opts.language = arg(&args, "--language").or_else(|| arg(&args, "--lang"));
+    // `--dump-states <dir>`: the decoder's per-step last-layer hidden states and
+    // the host `lm_head` check that ties row `k` to generated token `k + 1`.  One
+    // buffer copy per step, no extra dispatch — the transcript is the same one.
+    if let Some(d) = arg(&args, "--dump-states") {
+        opts = opts.with_dump_states(PathBuf::from(d));
+    }
     let dump = arg(&args, "--dump").map(PathBuf::from);
     let compare_enc = flag(&args, "--compare-enc");
     if flag(&args, "--diag-enc") {

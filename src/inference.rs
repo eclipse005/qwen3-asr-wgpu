@@ -116,6 +116,13 @@ pub struct TranscribeOptions {
     /// Upper bound on generated tokens (the stop is EOS, as in HF `generate`).
     /// The default matches common product / transformers use (2048).
     pub max_new_tokens: usize,
+    /// `Some(dir)` also dumps every decode step's last-layer hidden state into
+    /// `dir`, together with a host-side `lm_head` check of the mapping from a
+    /// step's state to the token it predicted.  It reads `scratch.h` with one
+    /// extra buffer copy per step and changes no dispatch -- the tokens are the
+    /// ones the run would produce anyway.  Needs the GPU text decoder and the
+    /// single-sequence (b=1) path.
+    pub dump_states: Option<std::path::PathBuf>,
 }
 
 impl Default for TranscribeOptions {
@@ -124,6 +131,7 @@ impl Default for TranscribeOptions {
             context: String::new(),
             language: None,
             max_new_tokens: 2048,
+            dump_states: None,
         }
     }
 }
@@ -153,6 +161,14 @@ impl TranscribeOptions {
     #[must_use]
     pub fn with_max_new_tokens(mut self, n: usize) -> Self {
         self.max_new_tokens = n;
+        self
+    }
+
+    /// Also write the per-step hidden states (and their `lm_head` self-check)
+    /// into `dir` — see [`TranscribeOptions::dump_states`].
+    #[must_use]
+    pub fn with_dump_states(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.dump_states = Some(dir.into());
         self
     }
 
@@ -276,6 +292,10 @@ pub(crate) struct Inner {
     pub(crate) gpu_encoder: Option<GpuAudioEncoder>,
     pub(crate) mel: MelExtractor,
     pub(crate) tensors: std::collections::HashMap<String, weights::RawTensor>,
+    /// The checkpoint directory: only the state dump's provenance reads it (the
+    /// shard names and mtimes that `meta.json` records), so this is the load
+    /// path kept rather than a second scan of the disk.
+    pub(crate) model_dir: std::path::PathBuf,
     pub(crate) decoder: TextBackend,
 }
 
@@ -1058,6 +1078,7 @@ impl Inner {
             gpu_encoder,
             mel: MelExtractor::new(N_FFT, HOP_LENGTH, n_mels, MEL_SAMPLE_RATE),
             tensors,
+            model_dir: model_dir.to_path_buf(),
             decoder,
         })
     }
@@ -2298,6 +2319,19 @@ impl Inner {
         }
 
         let eos = [ENDOFTEXT_TOKEN_ID as i32, IM_END_TOKEN_ID as i32];
+        // Arm the per-step state dump here, not earlier: row 0 is the first
+        // *decode* step, whose `scratch.h` is the hidden state that predicts
+        // generated token 1.  `pos` is the prompt length now, which is what makes
+        // `decode_h_base_pos` the right origin.
+        if opts.dump_states.is_some() {
+            match &mut self.decoder {
+                TextBackend::Gpu(d) => d.start_decode_state_dump(max_new_tokens)?,
+                TextBackend::Cpu(_) => anyhow::bail!(
+                    "dump_states: the per-step hidden states come from the GPU decoder's \
+                     scratch buffers; the CPU text backend has no such buffer"
+                ),
+            }
+        }
         let mut generated: Vec<u32> = Vec::new();
         // Stop reason: start from "the ceiling cut it off" and downgrade on
         // every EOS exit below.  Reporting only — no path changes.
@@ -2379,6 +2413,13 @@ impl Inner {
             stop_reason = StopReason::Eos;
         }
         let t_decode = t3.elapsed();
+        if let Some(dir) = opts.dump_states.as_deref() {
+            let states = match &mut self.decoder {
+                TextBackend::Gpu(d) => d.take_decode_states()?,
+                TextBackend::Cpu(_) => None,
+            };
+            self.write_decode_states(dir, states, &generated, stop_reason, seq_len)?;
+        }
         Ok(Generation {
             ids: generated,
             seq_len,
@@ -2387,6 +2428,228 @@ impl Inner {
             stop_reason,
         })
     }
+
+    /// Write one decode run's per-step hidden states, plus the `lm_head` check
+    /// that ties row `k` to generated token `k + 1`.
+    ///
+    /// `states.f16` is the raw dump: `[rows, hidden]`, row `k` = `scratch.h` at
+    /// the end of decode step `k`.  `states_norm.f32` is that row after the final
+    /// RMSNorm — `x * (1/sqrt(mean(x*x) + eps)) * w`, `w` = `thinker.model.norm.weight`,
+    /// `eps` from `config.json` — because the shipped tail fuses that norm into
+    /// `bg_gemv_lm_norm` and never materializes it in `final_norm`, so this is the
+    /// first place it exists as a buffer.
+    ///
+    /// The check is the point of the dump: `lm_head` (= the tied
+    /// `model.embed_tokens.weight`) run over each normalized row on the host, its
+    /// argmax against `gen_ids[k + 1]`.  A row that matches the wrong token means
+    /// the copy is off by a step or the norm is not the one the GPU applied, and
+    /// the run fails instead of leaving `states.f16` looking trustworthy.
+    fn write_decode_states(
+        &self,
+        dir: &Path,
+        states: Option<crate::decoder::DecodeStates>,
+        gen: &[u32],
+        stop_reason: StopReason,
+        seq_len: usize,
+    ) -> Result<()> {
+        use rayon::prelude::*;
+        let tc = &self.config.thinker_config.text_config;
+        let hidden = tc.hidden_size;
+        let eps = tc.rms_norm_eps as f32;
+        let vocab = tc.vocab_size;
+        let st = match states {
+            Some(s) => s,
+            None => anyhow::bail!("dump_states: no state buffer was armed"),
+        };
+        anyhow::ensure!(st.hidden == hidden, "dump hidden {} != config {hidden}", st.hidden);
+        anyhow::ensure!(st.states.len() == st.rows * hidden * 2, "dump byte length");
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join("states.f16"), &st.states)?;
+
+        let nw_name = "thinker.model.norm.weight";
+        let nw = self.tensors.get(nw_name).ok_or_else(|| anyhow::anyhow!("missing {nw_name}"))?;
+        let nw = nw.to_f16_vec()?;
+        anyhow::ensure!(nw.len() == hidden, "norm weight {} != {hidden}", nw.len());
+        let nw: Vec<f32> = nw.iter().map(|v| v.to_f32()).collect();
+        let mut normed = vec![0f32; st.rows * hidden];
+        for r in 0..st.rows {
+            let src = &st.states[r * hidden * 2..(r + 1) * hidden * 2];
+            let dst = &mut normed[r * hidden..(r + 1) * hidden];
+            let mut ss = 0f32;
+            for (j, dst_j) in dst.iter_mut().enumerate() {
+                let x = f16::from_le_bytes([src[2 * j], src[2 * j + 1]]).to_f32();
+                *dst_j = x;
+                ss += x * x;
+            }
+            let inv = 1.0f32 / (ss / hidden as f32 + eps).sqrt();
+            for (j, v) in dst.iter_mut().enumerate() {
+                *v = *v * inv * nw[j];
+            }
+        }
+        let mut bytes = Vec::with_capacity(normed.len() * 4);
+        for v in &normed {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(dir.join("states_norm.f32"), &bytes)?;
+
+        // `tie_word_embeddings: true` and the decoder binds `embed_tokens` as both
+        // the embedding table and `lm_head`, so this is the matrix the GPU used.
+        let lm_name = "thinker.model.embed_tokens.weight";
+        let lm = self.tensors.get(lm_name).ok_or_else(|| anyhow::anyhow!("missing {lm_name}"))?;
+        anyhow::ensure!(
+            lm.shape.len() == 2 && lm.shape[0] == vocab && lm.shape[1] == hidden,
+            "{lm_name} is {:?}, expected [{vocab}x{hidden}]",
+            lm.shape
+        );
+        anyhow::ensure!(
+            matches!(lm.dtype, safetensors::Dtype::F16 | safetensors::Dtype::BF16 | safetensors::Dtype::F32),
+            "{lm_name}: unsupported dtype {:?}",
+            lm.dtype
+        );
+        let preds: Vec<u32> = (0..st.rows)
+            .into_par_iter()
+            .map(|k| lm_head_argmax(lm, &normed[k * hidden..(k + 1) * hidden]))
+            .collect();
+
+        // Row `k` pinned the token after row `k`'s own: `gen[0]` comes from the
+        // prefill's last row, which is not in this dump.  A run that stopped on an
+        // EOS has one more row than differences to check — that row predicted the
+        // EOS, and it is reported separately rather than counted here.
+        let checked = st.rows.min(gen.len().saturating_sub(1));
+        let matched = (0..checked).filter(|&k| preds[k] == gen[k + 1]).count();
+        let ratio = if checked == 0 { 0.0 } else { matched as f64 / checked as f64 };
+        let last_is_eos = preds.last().map(|&p| {
+            p == ENDOFTEXT_TOKEN_ID as u32 || p == IM_END_TOKEN_ID as u32
+        });
+        let ok = checked > 0 && ratio >= 0.99;
+        println!(
+            "states: rows={} hidden={} lm_head argmax {matched}/{checked} ({:.4}) last_row_is_eos={}",
+            st.rows,
+            hidden,
+            ratio,
+            last_is_eos.map(|b| b.to_string()).unwrap_or_else(|| "n/a".into()),
+        );
+
+        std::fs::write(
+            dir.join("gen_ids.json"),
+            serde_json::to_string(&gen)?,
+        )?;
+        let weights = weight_files(&self.model_dir)?;
+        let meta = serde_json::json!({
+            "hidden": hidden,
+            "layers": tc.num_hidden_layers,
+            "vocab": vocab,
+            "stop_reason": match stop_reason {
+                StopReason::Eos => "eos",
+                StopReason::MaxTokens => "max-tokens",
+            },
+            "seq_len": seq_len,
+            "base_pos": st.base_pos,
+            "rows": st.rows,
+            "gen_tokens": gen.len(),
+            "rms_norm_eps": eps,
+            "states_layout": "f16 [rows, hidden], row k = the decode step at base_pos + k, little-endian",
+            "lm_head": lm_name,
+            "norm_weight": nw_name,
+            "weights": weights,
+            "self_check": {
+                "what": "argmax(lm_head(states_norm[k])) == gen_ids[k + 1]",
+                "checked": checked,
+                "matched": matched,
+                "ratio": ratio,
+                "threshold": 0.99,
+                "ok": ok,
+                "last_row_is_eos": last_is_eos,
+            },
+        });
+        std::fs::write(dir.join("meta.json"), serde_json::to_string_pretty(&meta)?)?;
+        anyhow::ensure!(
+            ok,
+            "dump_states: lm_head argmax matched {matched}/{checked} ({ratio:.4}) of the \
+             generated tokens, below 0.99 — the states do not line up with gen_ids"
+        );
+        Ok(())
+    }
+}
+
+/// `lm_head` row `v` · `x`, in f32, from the checkpoint's own bytes.
+///
+/// The kernels see f16 weights (bf16 narrowed at load); widening bf16 to f32 is
+/// exact, so this reads the same values without a 300 MB f32 copy of the table.
+fn weight_row_dot(t: &weights::RawTensor, row: usize, x: &[f32]) -> f32 {
+    let cols = x.len();
+    let off = row * cols;
+    match t.dtype {
+        safetensors::Dtype::F16 => {
+            let mut a = 0f32;
+            for (j, c) in t.data[off * 2..(off + cols) * 2].chunks_exact(2).enumerate() {
+                a += f16::from_le_bytes([c[0], c[1]]).to_f32() * x[j];
+            }
+            a
+        }
+        safetensors::Dtype::BF16 => {
+            let mut a = 0f32;
+            for (j, c) in t.data[off * 2..(off + cols) * 2].chunks_exact(2).enumerate() {
+                let f = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+                a += f * x[j];
+            }
+            a
+        }
+        _ => {
+            let mut a = 0f32;
+            for (j, c) in t.data[off * 4..(off + cols) * 4].chunks_exact(4).enumerate() {
+                a += f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * x[j];
+            }
+            a
+        }
+    }
+}
+
+/// The `vocab`-wide argmax of `lm_head · x` (see [`weight_row_dot`]).
+fn lm_head_argmax(t: &weights::RawTensor, x: &[f32]) -> u32 {
+    let vocab = t.shape[0];
+    let mut best = 0usize;
+    let mut best_score = f32::NEG_INFINITY;
+    for v in 0..vocab {
+        let s = weight_row_dot(t, v, x);
+        if s > best_score {
+            best_score = s;
+            best = v;
+        }
+    }
+    best as u32
+}
+
+/// The checkpoint's safetensors shards with their size and mtime — the
+/// fingerprint `meta.json` records so a dump can be traced to the weights that
+/// produced it without hashing 1.5 GB.
+fn weight_files(model_dir: &Path) -> Result<serde_json::Value> {
+    use std::time::UNIX_EPOCH;
+    let mut files = Vec::new();
+    for e in std::fs::read_dir(model_dir)? {
+        let e = e?;
+        let p = e.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("safetensors") {
+            continue;
+        }
+        let md = e.metadata()?;
+        let modified = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        files.push(serde_json::json!({
+            "name": p.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
+            "bytes": md.len(),
+            "mtime_unix": modified,
+        }));
+    }
+    files.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Ok(serde_json::json!({
+        "model_dir": model_dir.display().to_string(),
+        "files": files,
+    }))
 }
 
 pub(crate) struct Generation {
@@ -2752,5 +3015,43 @@ mod outcomes_tests {
         o = item_options(&call, &own, None);
         assert_eq!(o.context, "own");
         assert_eq!(o.language, None, "a None language is not a silent English");
+    }
+}
+
+#[cfg(test)]
+mod state_dump_tests {
+    use super::*;
+    use bytes::Bytes;
+    use safetensors::Dtype;
+
+    /// `2 x 4` weight whose row 1 is the one that aligns with `x = [1,0,0,0]`.
+    fn tensor(dtype: Dtype) -> weights::RawTensor {
+        let v = [[0f32, 0., 0., 0.], [2., 0., 0., 0.]];
+        let mut data = Vec::new();
+        for row in v {
+            for x in row {
+                match dtype {
+                    Dtype::F16 => data.extend_from_slice(&f16::from_f32(x).to_le_bytes()),
+                    Dtype::BF16 => {
+                        data.extend_from_slice(&((x.to_bits() >> 16) as u16).to_le_bytes());
+                    }
+                    _ => data.extend_from_slice(&x.to_le_bytes()),
+                }
+            }
+        }
+        weights::RawTensor { data: Bytes::from(data), shape: vec![2, 4], dtype }
+    }
+
+    /// The host `lm_head` check the dump is gated on: row `v`'s dot with `x`,
+    /// and the argmax over those dots, for every dtype a checkpoint can be in.
+    #[test]
+    fn host_lm_head_dot_and_argmax_read_each_checkpoint_dtype() {
+        let x = [1f32, 0., 0., 0.];
+        for dtype in [Dtype::F16, Dtype::BF16, Dtype::F32] {
+            let t = tensor(dtype);
+            assert_eq!(weight_row_dot(&t, 0, &x), 0.0, "{dtype:?} row 0");
+            assert_eq!(weight_row_dot(&t, 1, &x), 2.0, "{dtype:?} row 1");
+            assert_eq!(lm_head_argmax(&t, &x), 1, "{dtype:?} argmax");
+        }
     }
 }

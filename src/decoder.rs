@@ -915,6 +915,16 @@ fn gqa_split_chunk(cur_len: usize) -> usize {
     }
 }
 
+/// One decode run's per-step hidden states, read back as raw little-endian f16.
+pub struct DecodeStates {
+    /// `[rows, hidden]`, row `k` = `scratch.h` at the end of step `k`.
+    pub states: Vec<u8>,
+    pub rows: usize,
+    pub hidden: usize,
+    /// `pos` of row 0 (the prompt length): row `k` ran at `base_pos + k`.
+    pub base_pos: usize,
+}
+
 pub struct WgpuTextDecoder {
     pub gpu: Gpu,
     pub cfg: TextConfig,
@@ -966,6 +976,17 @@ pub struct WgpuTextDecoder {
     pub debug_prefill_h: Option<wgpu::Buffer>,
     /// port-time scaffolding: layer-0 row-0 hidden state after the layer
     pub debug_l0_h: Option<wgpu::Buffer>,
+    /// `[max_new, hidden]` f16: row `pos - decode_h_base_pos` receives
+    /// `scratch.h` at the end of that step's tail, i.e. the last layer's
+    /// pre-norm residual -- what the fused `bg_gemv_lm_norm` normalizes on its
+    /// way to that step's logits.  `Some` only between
+    /// [`Self::start_decode_state_dump`] and [`Self::take_decode_states`]; the
+    /// copy is one `copy_buffer_to_buffer` in the step's encoder and touches no
+    /// dispatch, no binding and no arithmetic.
+    pub decode_h_buf: Option<wgpu::Buffer>,
+    /// `pos` of row 0 of `decode_h_buf`, so a row is an address and not a
+    /// counter the caller has to keep.
+    pub decode_h_base_pos: usize,
 }
 
 impl WgpuTextDecoder {
@@ -1569,6 +1590,8 @@ impl WgpuTextDecoder {
             norm_buf,
             debug_prefill_h: None,
             debug_l0_h: None,
+            decode_h_buf: None,
+            decode_h_base_pos: 0,
         })
     }
 
@@ -1755,7 +1778,28 @@ impl WgpuTextDecoder {
         }
         if tail {
             enc.copy_buffer_to_buffer(&self.scratch.token, 0, &self.scratch.token_staging, 0, 4);
+            self.encode_state_row(enc, pos);
         }
+    }
+
+    /// Copy this step's `scratch.h` into its row of [`Self::decode_h_buf`], when a
+    /// state dump is armed.
+    ///
+    /// `scratch.h` is the residual stream *after* the last layer, which is what a
+    /// standalone `rms_norm` + `gemv_lm` tail would read; the shipped tail fuses
+    /// that norm into `bg_gemv_lm_norm` (so `scratch.final_norm` is never written
+    /// on the b=1 path), and this copy is the only way to see it without adding a
+    /// dispatch.
+    fn encode_state_row(&self, enc: &mut wgpu::CommandEncoder, pos: usize) {
+        let Some(dst) = &self.decode_h_buf else { return };
+        let bytes = (self.cfg.hidden_size * 2) as u64;
+        let off = (pos.saturating_sub(self.decode_h_base_pos) as u64) * bytes;
+        debug_assert_eq!(bytes % 4, 0, "a state row must be 4-byte aligned");
+        debug_assert!(off + bytes <= dst.size(), "state row past the dump buffer");
+        if off + bytes > dst.size() {
+            return;
+        }
+        enc.copy_buffer_to_buffer(&self.scratch.h, 0, dst, off, bytes);
     }
 
     /// This slice's dispatches into an already-open compute pass.
@@ -2377,6 +2421,43 @@ impl WgpuTextDecoder {
             .collect())
     }
 
+    /// Arm the per-step hidden-state dump: `max_rows` rows of `hidden` f16, one
+    /// per decode step from here on (see [`Self::decode_h_buf`]).
+    ///
+    /// Rows are addressed by `pos`, so the caller only has to keep `self.pos`
+    /// honest -- which it already is: `step` and `submit_step` advance it once per
+    /// executed step and nothing else touches it.
+    pub fn start_decode_state_dump(&mut self, max_rows: usize) -> Result<()> {
+        let bytes = max_rows.max(1) as u64 * (self.cfg.hidden_size * 2) as u64;
+        self.decode_h_base_pos = self.pos;
+        self.decode_h_buf = Some(self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("decode_h"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        Ok(())
+    }
+
+    /// Read the armed dump back and disarm it.
+    ///
+    /// `rows` is `pos - base`, i.e. the steps that actually executed (a
+    /// `discard_step`'d record wrote no row and advanced nothing), and row `k` is
+    /// the hidden state whose logits predicted the token *after* the first one.
+    pub fn take_decode_states(&mut self) -> Result<Option<DecodeStates>> {
+        let Some(buf) = self.decode_h_buf.take() else {
+            return Ok(None);
+        };
+        let hidden = self.cfg.hidden_size;
+        let rows = self.pos.saturating_sub(self.decode_h_base_pos);
+        let states = if rows == 0 {
+            Vec::new()
+        } else {
+            self.gpu.readback_at(&buf, 0, (rows * hidden * 2) as u64)?
+        };
+        Ok(Some(DecodeStates { states, rows, hidden, base_pos: self.decode_h_base_pos }))
+    }
+
     /// Timed decode without per-step host synchronisation: the token stays on the
     /// GPU (embed reads `token_buf`), so this measures pure GPU-bound ms/token.
     pub fn bench_steps(&mut self, steps: usize, warmup: usize) -> Result<f64> {
@@ -2774,6 +2855,8 @@ impl WgpuTextDecoder {
             norm_buf,
             debug_prefill_h: None,
             debug_l0_h: None,
+            decode_h_buf: None,
+            decode_h_base_pos: 0,
         })
     }
 
